@@ -1,0 +1,18 @@
+# Extra Python deps for converting Pocket TTS to LiteRT (scripts/build_pockettts.py).
+#
+# Linux/macOS only: litert-converter (pulled by litert-torch) has no Windows wheel,
+# so on a Windows host run this inside WSL2. Python 3.10.
+#
+# pocket-tts itself is installed from its git clone (`uv pip install -e <clone>`),
+# which pulls its own runtime deps. Install CPU torch first from the PyTorch CPU
+# index and pass a constraint pinning it so uv does not swap in the CUDA wheel:
+#
+#   uv venv --python 3.10 .venv && source .venv/bin/activate
+#   uv pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
+#   printf 'torch==2.12.1+cpu\n' > constraints.txt
+#   uv pip install -c constraints.txt --extra-index-url https://download.pytorch.org/whl/cpu \
+#       -e <pocket-tts clone> -r requirements-convert.txt
+
+litert-torch==0.9.3
+ai-edge-litert==2.1.6
+ai-edge-quantizer==0.8.0
