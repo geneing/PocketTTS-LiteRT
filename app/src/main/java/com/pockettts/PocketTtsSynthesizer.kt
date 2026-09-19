@@ -42,7 +42,15 @@ import kotlin.math.sqrt
  * [SpTokenizer]. Host-vs-reference parity of every graph and of the full
  * pipeline is checked in scripts/build_pockettts.py.
  */
-class PocketTtsSynthesizer(context: Context) : Closeable {
+class PocketTtsSynthesizer(
+    context: Context,
+    /** Per-graph accelerator choice; defaults to the device policy + force_* files. */
+    val placement: Placement = Placement.default(context),
+    /** When set, every [synthesize] reseeds the noise RNG so repeats are identical. */
+    private val noiseSeed: Long? = null,
+    /** When set, GPU graphs serialize their compiled program cache here (load-time studies). */
+    private val gpuCache: File? = null,
+) : Closeable {
 
     companion object {
         const val H = 1024               // flow-LM width
@@ -99,60 +107,55 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         return f
     }
 
-    // Debug overrides, read from the files dir (comma/newline-separated keys:
-    // lm, dectx, dec). `force_cpu.txt` pins graphs to CPU; `force_fp32.txt`
-    // keeps them on the GPU but at FP32 compute precision (the delegate's
-    // default is fp16). Placement experiments only; absent in normal use.
-    private fun overrideSet(file: String): Set<String> =
-        File(modelDir, file).takeIf { it.exists() }
-            ?.readText()?.split(',', '\n')?.map { it.trim() }?.filter { it.isNotEmpty() }
-            ?.toSet() ?: emptySet()
+    // Per-graph compile time (ms), keyed lm/dectx/dec. Populated as graphs load.
+    val loadMs = LinkedHashMap<String, Long>()
 
-    private val forceCpu = overrideSet("force_cpu.txt")
-    private val forceFp32 = overrideSet("force_fp32.txt")
-
-    /** Compile on GPU; fall back to CPU (fp16 weights dequantize to fp32 there). */
-    private fun load(name: String, key: String): Pair<CompiledModel, String> {
+    /**
+     * Compile one graph on its accelerator. GPU loads fall back to CPU on
+     * failure (fp16 weights dequantize to fp32 there); load time is recorded
+     * either way. `gpuCache`, when set, enables the delegate's serialized
+     * program cache so a reload skips kernel compilation.
+     */
+    private fun load(name: String, key: String, accel: Accel): CompiledModel {
         val p = path(name).absolutePath
-        if (key in forceCpu) {
-            return CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null) to "CPU*"
-        }
-        return try {
-            if (key in forceFp32) {
-                val opts = CompiledModel.Options(Accelerator.GPU)
-                opts.gpuOptions =
-                    CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
-                CompiledModel.create(p, opts, null) to "GPU32"
-            } else {
-                CompiledModel.create(p, CompiledModel.Options(Accelerator.GPU), null) to "GPU"
+        val t = System.nanoTime()
+        val model = try {
+            when (accel) {
+                Accel.CPU -> CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null)
+                Accel.GPU, Accel.GPU32 -> {
+                    val opts = CompiledModel.Options(Accelerator.GPU)
+                    val gpu = if (accel == Accel.GPU32) {
+                        CompiledModel.GpuOptions(
+                            precision = CompiledModel.GpuOptions.Precision.FP32,
+                        )
+                    } else {
+                        CompiledModel.GpuOptions()
+                    }
+                    opts.gpuOptions = if (gpuCache != null) {
+                        gpu.copy(
+                            serializationDir = gpuCache.absolutePath,
+                            modelCacheKey = name,
+                            serializeProgramCache = true,
+                        )
+                    } else {
+                        gpu
+                    }
+                    CompiledModel.create(p, opts, null)
+                }
             }
         } catch (e: Throwable) {
-            CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null) to "CPU"
+            CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null)
         }
+        loadMs[key] = (System.nanoTime() - t) / 1_000_000
+        return model
     }
 
-    // The Mimi decoder transformer runs on CPU BY DEFAULT: on Mali its GPU
-    // output is audibly degraded (alba HNR 2.8 dB on CPU vs 0.9 dB on GPU,
-    // recovered exactly to the fp32 eager level by this one move), and GPU
-    // FP32 precision does NOT fix it — the same delegate behavior the Mimi
-    // zoo module documents for its decoder transformer. It is 7 small calls
-    // per utterance, so the speed cost is ~2% (1.03x -> 1.01x on a Pixel 8a).
-    // `force_gpu.txt` with "dectx" re-enables GPU for experiments.
-    private val forceGpu = overrideSet("force_gpu.txt")
+    val lm = load(LM, "lm", placement.lm)
+    val dectx = load(DEC_TX, "dectx", placement.dectx)
+    val deconly = load(DECONLY, "dec", placement.deconly)
 
-    private val lmP = load(LM, "lm")
-    private val dectxP =
-        if ("dectx" in forceGpu) load(DEC_TX, "dectx")
-        else CompiledModel.create(
-            path(DEC_TX).absolutePath, CompiledModel.Options(Accelerator.CPU), null) to "CPU"
-    private val deconlyP = load(DECONLY, "dec")
-    private val lm = lmP.first
-    private val dectx = dectxP.first
-    private val deconly = deconlyP.first
-
-    /** e.g. "lm:GPU dectx:GPU dec:GPU" — shown in the UI status line. */
-    val placements =
-        "lm:${lmP.second} dectx:${dectxP.second} dec:${deconlyP.second}"
+    /** e.g. "lm:GPU dectx:CPU dec:GPU" — shown in the UI status line. */
+    val placements = placement.label
 
     private val lmIn = lm.createInputBuffers()
     private val lmOut = lm.createOutputBuffers()
@@ -176,6 +179,7 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     init {
         endTokens = tokenizer.encode(".!...?").drop(1).toSet()
         fallbackTokens = tokenizer.encode(",;:").drop(1).toSet()
+        android.util.Log.i("PocketTTS", "placement ${placement.label} @ ${Placement.renderer()}")
     }
 
     // ---- host state -------------------------------------------------------
@@ -183,6 +187,16 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     private val pv = FloatArray(G * PMAX * HD)
     private val mask = FloatArray(NH * (PMAX + 1))
     private var pos = 0
+    // Per-utterance stage accumulators (ns / counts), reset by each synthesize.
+    private var sLmIn = 0L
+    private var sLmRun = 0L
+    private var sLmRead = 0L
+    private var sLmSteps = 0
+    private var sPrompt = 0
+    private var sFrames = 0
+    private var sDecTx = 0L
+    private var sSeanet = 0L
+    private var sChunks = 0
 
     private var voiceName = ""
     private var voiceK = FloatArray(0)
@@ -192,9 +206,22 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
     private val cosArr = FloatArray(HD)
     private val sinArr = FloatArray(HD)
     private val invFreq = DoubleArray(HD / 2) { 1.0 / Math.pow(THETA, it / 32.0) }
-    private val rnd = Random()
+    private val rnd = Random(noiseSeed ?: System.nanoTime())
 
-    data class Result(val audio: FloatArray, val frames: Int, val ms: Long)
+    /** Stage timings for one [synthesize] call (ms unless noted). */
+    data class Profile(
+        val lmSteps: Int,
+        val promptSteps: Int,
+        val genFrames: Int,
+        val lmInMs: Long,
+        val lmRunMs: Long,
+        val lmReadMs: Long,
+        val decTxMs: Long,
+        val seanetMs: Long,
+        val chunks: Int,
+    )
+
+    data class Result(val audio: FloatArray, val frames: Int, val ms: Long, val profile: Profile)
 
     /** Load a repacked voice state: int32 T, then k and v as fp16 `[96][T][64]`. */
     fun loadVoice(name: String) {
@@ -262,6 +289,7 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
      */
     private fun step(emb: FloatArray, noise: FloatArray): Pair<FloatArray, Float> {
         check(pos < PMAX) { "KV cache overflow at $pos" }
+        val t0 = System.nanoTime()
         ropeFill(pos)
         lmIn[0].writeFloat(emb)
         lmIn[1].writeFloat(cosArr)
@@ -270,7 +298,9 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         lmIn[4].writeFloat(pk)
         lmIn[5].writeFloat(pv)
         lmIn[6].writeFloat(noise)
+        val t1 = System.nanoTime()
         lm.run(lmIn, lmOut)
+        val t2 = System.nanoTime()
         val out = lmOut[0].readFloat()
         val eos = out[0]
         val latent = out.copyOfRange(1, 1 + LDIM)
@@ -281,12 +311,17 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
         }
         for (h in 0 until NH) mask[h * (PMAX + 1) + pos] = 0f
         pos++
+        val t3 = System.nanoTime()
+        sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2; sLmSteps++
         return latent to eos
     }
 
     /** Generate speech for `text` with the currently loaded voice. */
     fun synthesize(text: String, voice: String): Result {
         val t0 = System.nanoTime()
+        noiseSeed?.let { rnd.setSeed(it) }
+        sLmIn = 0; sLmRun = 0; sLmRead = 0; sLmSteps = 0
+        sPrompt = 0; sFrames = 0; sDecTx = 0; sSeanet = 0; sChunks = 0
         loadVoice(voice)
         val audio = ArrayList<FloatArray>()
         var frames = 0
@@ -300,13 +335,25 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
                 "chunk: ${ids.size} tokens -> ${latents.size} frames",
             )
             frames += latents.size
+            sPrompt += ids.size; sFrames += latents.size; sChunks++
             if (latents.isNotEmpty()) audio.add(decode(latents))
         }
         val total = audio.sumOf { it.size }
         val out = FloatArray(total)
         var o = 0
         for (a in audio) { System.arraycopy(a, 0, out, o, a.size); o += a.size }
-        return Result(out, frames, (System.nanoTime() - t0) / 1_000_000)
+        val profile = Profile(
+            lmSteps = sLmSteps,
+            promptSteps = sPrompt,
+            genFrames = sFrames,
+            lmInMs = sLmIn / 1_000_000,
+            lmRunMs = sLmRun / 1_000_000,
+            lmReadMs = sLmRead / 1_000_000,
+            decTxMs = sDecTx / 1_000_000,
+            seanetMs = sSeanet / 1_000_000,
+            chunks = sChunks,
+        )
+        return Result(out, frames, (System.nanoTime() - t0) / 1_000_000, profile)
     }
 
     /** The reference autoregressive loop for one <=50-token chunk. */
@@ -333,6 +380,7 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
 
     /** Mimi decode: overlapped dec_tx blocks -> one-shot SEANet window. */
     private fun decode(latents: List<FloatArray>): FloatArray {
+        val tDec = System.nanoTime()
         val t = minOf(latents.size, DEC_FRAMES)
         val feat = FloatArray(MIMI_D * S_DEC)
         val blk = FloatArray((1 + F_BLK) * LDIM)
@@ -363,9 +411,12 @@ class PocketTtsSynthesizer(context: Context) : Closeable {
             kept += n - F_HOP
         }
 
+        val tSeanet = System.nanoTime()
         deconlyIn[0].writeFloat(feat)
         deconly.run(deconlyIn, deconlyOut)
         val wav = deconlyOut[0].readFloat()
+        sDecTx += tSeanet - tDec
+        sSeanet += System.nanoTime() - tSeanet
         return FloatArray(t * SPF) { wav[it].coerceIn(-1f, 1f) }
     }
 

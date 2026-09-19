@@ -13,6 +13,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
+import java.io.File
 import java.util.concurrent.Executors
 
 /**
@@ -29,7 +30,9 @@ class MainActivity : Activity() {
     private lateinit var input: EditText
     private lateinit var voices: Spinner
     private lateinit var button: Button
+    private lateinit var benchButton: Button
     private lateinit var waveform: WaveformView
+    private var benchRuns = 3
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -55,10 +58,11 @@ class MainActivity : Activity() {
             )
         }
         button = Button(this).apply { text = "Generate"; isEnabled = false }
+        benchButton = Button(this).apply { text = "Benchmark"; isEnabled = false }
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
         waveform = WaveformView(this)
-        val topMargins = intArrayOf(0, 24, 32, 24)
-        for ((index, view) in listOf(input, voices, button, status).withIndex()) {
+        val topMargins = intArrayOf(0, 24, 32, 8, 24)
+        for ((index, view) in listOf(input, voices, button, benchButton, status).withIndex()) {
             val params = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             params.topMargin = topMargins[index]
@@ -81,6 +85,7 @@ class MainActivity : Activity() {
             runOnUiThread {
                 status.text = "Ready (${s.placements})."
                 button.isEnabled = true
+                benchButton.isEnabled = true
                 runFromIntent(intent)
             }
         }
@@ -112,18 +117,57 @@ class MainActivity : Activity() {
                 }
             }
         }
+        benchButton.setOnClickListener {
+            val text = input.text.toString().ifBlank { return@setOnClickListener }
+            val voice = voices.selectedItem as String
+            button.isEnabled = false
+            benchButton.isEnabled = false
+            status.text = "Benchmarking… (logcat tag PocketTTSBench)"
+            val runs = benchRuns
+            bg.execute {
+                // Free the UI model first: each Benchmarker placement loads its own.
+                synth?.close(); synth = null
+                try {
+                    Benchmarker(this).run(text, voice, runs)
+                } catch (e: Throwable) {
+                    android.util.Log.e("PocketTTS", "benchmark failed", e)
+                }
+                val s = try { PocketTtsSynthesizer(this) } catch (e: Throwable) { null }
+                synth = s
+                runOnUiThread {
+                    status.text = if (s != null) {
+                        "Benchmark done — see benchmark.txt / logcat. Ready (${s.placements})."
+                    } else {
+                        "Benchmark done, but model reload failed."
+                    }
+                    button.isEnabled = s != null
+                    benchButton.isEnabled = true
+                }
+            }
+        }
     }
 
-    /** Headless driving: adb shell am start ... --es text "..." --es voice alba
-     *  (singleTop, so a second am start generates again without reloading). */
+    /**
+     * Headless driving:
+     *   adb shell am start -n com.pockettts/.MainActivity --es text "hi" --es voice alba
+     *   adb shell am start -n com.pockettts/.MainActivity --ez bench true --ei runs 3
+     * (singleTop, so a second am start re-runs without reloading the model.)
+     */
     private fun runFromIntent(i: android.content.Intent?) {
-        val t = i?.getStringExtra("text") ?: return
-        input.setText(t)
-        i.getStringExtra("voice")?.let { v ->
-            val idx = PocketTtsSynthesizer.VOICES.indexOf(v)
-            if (idx >= 0) voices.setSelection(idx)
+        if (i == null) return
+        i.getStringExtra("text")?.let { t ->
+            input.setText(t)
+            i.getStringExtra("voice")?.let { v ->
+                val idx = PocketTtsSynthesizer.VOICES.indexOf(v)
+                if (idx >= 0) voices.setSelection(idx)
+            }
         }
-        if (button.isEnabled) button.performClick()
+        if (i.getBooleanExtra("bench", false)) {
+            benchRuns = i.getIntExtra("runs", 3)
+            if (benchButton.isEnabled) benchButton.performClick()
+            return
+        }
+        if (i.hasExtra("text") && button.isEnabled) button.performClick()
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
@@ -133,16 +177,8 @@ class MainActivity : Activity() {
 
     /** Save the last output as a 24 kHz mono 16-bit WAV in filesDir (adb-pullable). */
     private fun saveWav(audio: FloatArray, voice: String) {
-        val sr = PocketTtsSynthesizer.SAMPLE_RATE
-        val data = audio.size * 2
-        val bb = java.nio.ByteBuffer.allocate(44 + data).order(java.nio.ByteOrder.LITTLE_ENDIAN)
-        bb.put("RIFF".toByteArray()); bb.putInt(36 + data); bb.put("WAVE".toByteArray())
-        bb.put("fmt ".toByteArray()); bb.putInt(16); bb.putShort(1); bb.putShort(1)
-        bb.putInt(sr); bb.putInt(sr * 2); bb.putShort(2); bb.putShort(16)
-        bb.put("data".toByteArray()); bb.putInt(data)
-        for (v in audio) bb.putShort((v.coerceIn(-1f, 1f) * 32767f).toInt().toShort())
-        java.io.File(filesDir, "output.wav").writeBytes(bb.array())
-        java.io.File(filesDir, "output_$voice.wav").writeBytes(bb.array())
+        Wav.write(File(filesDir, "output.wav"), audio)
+        Wav.write(File(filesDir, "output_$voice.wav"), audio)
     }
 
     private fun play(audio: FloatArray) {

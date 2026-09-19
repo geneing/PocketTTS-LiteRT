@@ -29,8 +29,8 @@ android {
     }
 }
 dependencies {
-    // 2.1.6: the Mali delegate on 2.1.3 rejects the KV-step FULLY_CONNECTED
-    // weight shapes ("Unsupported weights shape"); 2.1.5+ accepts them.
-    implementation("com.google.ai.edge.litert:litert:2.1.6")
+    // 2.2.0: latest on Google Maven (2.1.6 pinned earlier for Mali; 2.1.5+
+    // accepts the KV-step FULLY_CONNECTED weight shapes).
+    implementation("com.google.ai.edge.litert:litert:2.2.0")
     implementation("androidx.core:core-ktx:1.15.0")
 }
