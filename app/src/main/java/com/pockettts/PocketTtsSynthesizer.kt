@@ -51,6 +51,13 @@ class PocketTtsSynthesizer(
     private val noiseSeed: Long? = null,
     /** When set, GPU graphs serialize their compiled program cache here (load-time studies). */
     private val gpuCache: File? = null,
+    /**
+     * Frames per LM invocation. 1 = the shipped single-step fused graph. >1 loads
+     * `pt_flowlm_ms{N}_fp16.tflite` in addition to the 1-step graph (and uses it
+     * for the prompt/tail), which amortizes the per-invocation upload + readback
+     * sync over N frames. See docs/multistep_lm_plan.md.
+     */
+    private val lmSteps: Int = 1,
 ) : Closeable {
 
     companion object {
@@ -86,6 +93,8 @@ class PocketTtsSynthesizer(
         // Mali the per-frame cost is dispatch/sync-bound, and two invocations
         // plus four readbacks per frame cost more than the math itself.
         const val LM = "pt_flowlm_fused_fp16.tflite"
+        /** N-step fused decode graph: N frames per invocation (see docs/multistep_lm_plan.md). */
+        fun msGraph(n: Int) = "pt_flowlm_ms${n}_fp16.tflite"
         const val DEC_TX = "pt_mimi_dec_tx_fp16.tflite"
         const val DECONLY = "pt_mimi_deconly_fp16.tflite"
         const val EMBED = "pt_embed_f16.bin"
@@ -196,14 +205,21 @@ class PocketTtsSynthesizer(
     }
 
     val lm = load(LM, "lm", placement.lm)
+
+    /** N-step decode graph; null when [lmSteps] == 1. Prompt/tail still use [lm]. */
+    private val lmMs: CompiledModel? =
+        if (lmSteps > 1) load(msGraph(lmSteps), "lm_ms", placement.lm) else null
+
     val dectx = load(DEC_TX, "dectx", placement.dectx)
     val deconly = load(DECONLY, "dec", placement.deconly)
 
     /** e.g. "lm:GPU dectx:CPU dec:GPU" — shown in the UI status line. */
-    val placements = placement.label
+    val placements = if (lmSteps > 1) "${placement.label} ms$lmSteps" else placement.label
 
     private val lmIn = lm.createInputBuffers()
     private val lmOut = lm.createOutputBuffers()
+    private val lmMsIn = lmMs?.createInputBuffers()
+    private val lmMsOut = lmMs?.createOutputBuffers()
     private val dectxIn = dectx.createInputBuffers()
     private val dectxOut = dectx.createOutputBuffers()
     private val deconlyIn = deconly.createInputBuffers()
@@ -335,6 +351,17 @@ class PocketTtsSynthesizer(
 
     private val zeroNoise = FloatArray(LDIM)
 
+    private fun gaussNoise(): FloatArray = FloatArray(LDIM) {
+        (rnd.nextGaussian() * sqrt(TEMP.toDouble())).toFloat()
+    }
+
+    // Multi-step decode graph scratch (sized for [lmSteps] frames).
+    private val msCos = FloatArray(lmSteps * HD)
+    private val msSin = FloatArray(lmSteps * HD)
+    private val msMask = FloatArray(lmSteps * (PMAX + 1))
+    private val msWrite = FloatArray(lmSteps * PMAX)
+    private val msNoise = FloatArray(lmSteps * LDIM)
+
     /**
      * One fused frame: flow-LM step + flow head in a single invocation.
      * Output layout: eos(1) | latent(32) | new-k(96*64) | new-v(96*64).
@@ -372,6 +399,77 @@ class PocketTtsSynthesizer(
             pk.size + pv.size + noise.size).toLong() * Float.SIZE_BYTES
         sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
         return latent to eos
+    }
+
+    /**
+     * [lmSteps] frames in one invocation of the multi-step graph. Input `emb` is
+     * frame 0's embedding; frames 1..N-1 are fed in-graph from the projected
+     * latent. The graph uploads the packed KV once, appends all N new rows
+     * internally with the one-hot `msWrite` mask, and returns only the new rows;
+     * this splices them into the host mirror so the 25 MB cache is never read back.
+     * Output layout: eos[N] | latent[N,32] | new-k[N,G,64] | new-v[N,G,64].
+     */
+    private fun stepMulti(emb: FloatArray, noises: Array<FloatArray>): Pair<Array<FloatArray>, FloatArray> {
+        val n = lmSteps
+        check(pos + n <= PMAX) { "multi-step KV cache overflow at $pos + $n" }
+        val t0 = System.nanoTime()
+        java.util.Arrays.fill(msWrite, 0f)
+        for (i in 0 until n) {
+            ropeFill(pos + i)
+            System.arraycopy(cosArr, 0, msCos, i * HD, HD)
+            System.arraycopy(sinArr, 0, msSin, i * HD, HD)
+            val mb = i * (PMAX + 1)
+            for (p in 0..PMAX) msMask[mb + p] = if (p < pos + i || p == PMAX) 0f else MASK_NEG
+            msWrite[i * PMAX + (pos + i)] = 1f
+            System.arraycopy(noises[i], 0, msNoise, i * LDIM, LDIM)
+        }
+        val ins = requireNotNull(lmMsIn) { "multi-step graph not loaded" }
+        val outs = requireNotNull(lmMsOut)
+        val model = requireNotNull(lmMs)
+        ins[0].writeFloat(emb)
+        ins[1].writeFloat(msCos)
+        ins[2].writeFloat(msSin)
+        ins[3].writeFloat(msMask)
+        ins[4].writeFloat(msWrite)
+        ins[5].writeFloat(pk)
+        ins[6].writeFloat(pv)
+        ins[7].writeFloat(msNoise)
+        val t1 = System.nanoTime()
+        model.run(ins, outs)
+        val t2 = System.nanoTime()
+        val out = outs[0].readFloat()
+        val eos = FloatArray(n)
+        val lats = Array(n) { FloatArray(LDIM) }
+        for (i in 0 until n) {
+            eos[i] = out[i]
+            System.arraycopy(out, n + i * LDIM, lats[i], 0, LDIM)
+        }
+        var o = n * (1 + LDIM)
+        for (i in 0 until n) {
+            val p = pos + i
+            for (g in 0 until G) {
+                System.arraycopy(out, o, pk, g * PMAX * HD + p * HD, HD)
+                o += HD
+            }
+        }
+        for (i in 0 until n) {
+            val p = pos + i
+            for (g in 0 until G) {
+                System.arraycopy(out, o, pv, g * PMAX * HD + p * HD, HD)
+                o += HD
+            }
+        }
+        for (h in 0 until NH) {
+            val base = h * (PMAX + 1)
+            for (i in 0 until n) mask[base + pos + i] = 0f
+        }
+        pos += n
+        val t3 = System.nanoTime()
+        sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2; sLmSteps += n; sLmInv++
+        sLmInBytes += (H + 2 * n * HD + n * (PMAX + 1) + n * PMAX +
+            2 * G * PMAX * HD + n * LDIM).toLong() * Float.SIZE_BYTES
+        sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
+        return lats to eos
     }
 
     /** Generate speech for `text` with the currently loaded voice. */
@@ -437,11 +535,16 @@ class PocketTtsSynthesizer(
         resetToVoice()
         val n = minOf(steps, PMAX - pos - 1).coerceAtLeast(0)
         var emb = bosInput
-        for (g in 0 until n) {
-            val noise = FloatArray(LDIM) {
-                (rnd.nextGaussian() * sqrt(TEMP.toDouble())).toFloat()
+        var g = 0
+        while (g < n) {
+            if (lmSteps > 1 && g + lmSteps <= n && pos + lmSteps <= PMAX) {
+                val (lats, _) = stepMulti(emb, Array(lmSteps) { gaussNoise() })
+                emb = projectLatent(lats[lmSteps - 1])
+                g += lmSteps
+            } else {
+                emb = projectLatent(step(emb, gaussNoise()).first)
+                g++
             }
-            emb = projectLatent(step(emb, noise).first)
         }
         sFrames = n
         return snapshotProfile()
@@ -456,15 +559,27 @@ class PocketTtsSynthesizer(
         val latents = ArrayList<FloatArray>(maxGen)
         var emb = bosInput
         var eosStep = -1
-        for (g in 0 until maxGen) {
-            val noise = FloatArray(LDIM) {
-                (rnd.nextGaussian() * sqrt(TEMP.toDouble())).toFloat()
+        var g = 0
+        while (g < maxGen) {
+            if (lmSteps > 1 && g + lmSteps <= maxGen && pos + lmSteps <= PMAX) {
+                val (lats, eoses) = stepMulti(emb, Array(lmSteps) { gaussNoise() })
+                var stop = false
+                for (i in 0 until lmSteps) {
+                    if (eoses[i] > EOS_THRESHOLD && eosStep < 0) eosStep = g + i
+                    if (eosStep >= 0 && g + i >= eosStep + framesAfterEos) { stop = true; break }
+                    latents.add(lats[i])
+                }
+                if (stop) break
+                emb = projectLatent(lats[lmSteps - 1])
+                g += lmSteps
+            } else {
+                val (lat, eosLogit) = step(emb, gaussNoise())
+                if (eosLogit > EOS_THRESHOLD && eosStep < 0) eosStep = g
+                if (eosStep >= 0 && g >= eosStep + framesAfterEos) break
+                latents.add(lat)
+                emb = projectLatent(lat)
+                g++
             }
-            val (lat, eosLogit) = step(emb, noise)
-            if (eosLogit > EOS_THRESHOLD && eosStep < 0) eosStep = g
-            if (eosStep >= 0 && g >= eosStep + framesAfterEos) break
-            latents.add(lat)
-            emb = projectLatent(lat)
         }
         return latents
     }
@@ -579,7 +694,9 @@ class PocketTtsSynthesizer(
     override fun close() {
         listOf(lmIn, lmOut, dectxIn, dectxOut, deconlyIn, deconlyOut)
             .forEach { l -> l.forEach { it.close() } }
-        lm.close(); dectx.close(); deconly.close(); embChannel.close()
+        lmMsIn?.forEach { it.close() }
+        lmMsOut?.forEach { it.close() }
+        lm.close(); lmMs?.close(); dectx.close(); deconly.close(); embChannel.close()
         npuEnvironment?.close()
     }
 

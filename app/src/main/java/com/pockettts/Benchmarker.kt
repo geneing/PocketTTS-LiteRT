@@ -16,21 +16,32 @@ class Benchmarker(private val context: Context) {
     private val seed = 20260919L
     private val lmBenchSteps = 128
 
+    /** One benchmark scenario: a placement plus how many LM frames per invocation. */
+    private data class Cfg(val p: Placement, val name: String, val lmSteps: Int = 1)
+
     fun run(text: String, voice: String, repeats: Int): String {
         val sb = StringBuilder()
         // gold first (it is the audio reference), then the NPU cases: LiteRT's
         // environment is process-global and the *first* load fixes dispatch
         // options, so an NPU load must not come after a CPU/GPU one.
         val placements = listOf(
-            Placement.GOLD to "gold_cpu",
-            Placement(Accel.NPU, Accel.CPU, Accel.GPU) to "lm_npu",
-            Placement(Accel.NPU, Accel.NPU, Accel.GPU) to "lm_npu_dectx_npu",
-            Placement(Accel.CPU, Accel.NPU, Accel.GPU) to "lm_cpu_dectx_npu",
-            Placement(Accel.CPU, Accel.CPU, Accel.GPU) to "lm_cpu_dec_gpu",
-            Placement(Accel.CPU, Accel.GPU, Accel.GPU) to "lm_cpu_all_gpu",
-            Placement(Accel.GPU, Accel.CPU, Accel.GPU) to "shipped_gpu_lm",
-            Placement(Accel.GPU32, Accel.CPU, Accel.GPU) to "lm_gpu32",
-            Placement(Accel.GPU, Accel.GPU, Accel.GPU) to "all_gpu",
+            Cfg(Placement.GOLD, "gold_cpu"),
+            // NPU (Tensor G5 AOT) first: LiteRT's environment is process-global
+            // and the first load fixes dispatch options, so an NPU load must not
+            // come after a CPU/GPU one.
+            Cfg(Placement(Accel.NPU, Accel.CPU, Accel.GPU), "lm_npu"),
+            Cfg(Placement(Accel.NPU, Accel.CPU, Accel.GPU), "lm_npu_ms4", 4),
+            Cfg(Placement(Accel.NPU, Accel.CPU, Accel.GPU), "lm_npu_ms8", 8),
+            Cfg(Placement(Accel.NPU, Accel.NPU, Accel.GPU), "lm_npu_ms4_dectx_npu", 4),
+            Cfg(Placement(Accel.CPU, Accel.NPU, Accel.GPU), "lm_cpu_dectx_npu"),
+            // controls
+            Cfg(Placement(Accel.CPU, Accel.CPU, Accel.GPU), "lm_cpu_dec_gpu"),
+            Cfg(Placement(Accel.CPU, Accel.GPU, Accel.GPU), "lm_cpu_all_gpu"),
+            Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "shipped_gpu_lm"),
+            Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "lm_gpu_ms4", 4),
+            Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "lm_gpu_ms8", 8),
+            Cfg(Placement(Accel.GPU32, Accel.CPU, Accel.GPU), "lm_gpu32"),
+            Cfg(Placement(Accel.GPU, Accel.GPU, Accel.GPU), "all_gpu"),
         )
 
         sb.appendLine("Pocket TTS benchmark")
@@ -45,10 +56,12 @@ class Benchmarker(private val context: Context) {
         var gold: FloatArray? = null
 
         sb.appendLine("== placements ==")
-        for ((p, name) in placements) {
+        for (cfg in placements) {
+            val p = cfg.p
+            val name = cfg.name
             val tLoad = System.nanoTime()
             val s = try {
-                PocketTtsSynthesizer(context, p, seed)
+                PocketTtsSynthesizer(context, p, seed, lmSteps = cfg.lmSteps)
             } catch (e: Throwable) {
                 sb.appendLine("[$name] ${p.label}: LOAD FAILED: ${e.message}")
                 continue
@@ -56,7 +69,7 @@ class Benchmarker(private val context: Context) {
             val loadTotal = (System.nanoTime() - tLoad) / 1_000_000
             try {
                 sb.appendLine()
-                sb.appendLine("[$name] ${p.label}")
+                sb.appendLine("[$name] ${s.placements}")
                 sb.appendLine(
                     "  load: lm ${s.loadMs["lm"]} dectx ${s.loadMs["dectx"]} dec ${s.loadMs["dec"]} ms " +
                         "(graph sum ${s.loadMs.values.sum()} ms, incl. assets/ctx $loadTotal ms)",

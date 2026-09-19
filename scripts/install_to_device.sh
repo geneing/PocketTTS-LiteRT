@@ -23,12 +23,16 @@ FILES=(
   pt_voice_eve.bin
 )
 
-# AOT-compiled Tensor G5 (NPU) variants, if scripts/aot_tensor_g5.py has run.
-# Pushed alongside rather than instead of the stock graphs: the app picks the
-# `*_g5.tflite` file only for an Accel.NPU placement.
+# Optional graphs, pushed only when present:
+#  * multi-step decode (`build_pockettts.py multistep`)
+#  * AOT-compiled Tensor G5 variants (`aot_tensor_g5.py`), which the app picks
+#    instead of the stock graph for an Accel.NPU placement.
 EXTRA=(
+  pt_flowlm_ms4_fp16.tflite
+  pt_flowlm_ms8_fp16.tflite
   pt_flowlm_fused_fp16_g5.tflite
   pt_flowlm_ms4_fp16_g5.tflite
+  pt_flowlm_ms8_fp16_g5.tflite
   pt_mimi_dec_tx_fp16_g5.tflite
 )
 
@@ -39,9 +43,8 @@ for f in "${FILES[@]}"; do
   adb push "$SRC/$f" "$DST/$f" >/dev/null
 done
 for f in "${EXTRA[@]}"; do
-  if [ -f "$SRC/$f" ]; then
-    echo "push $f"
-    adb push "$SRC/$f" "$DST/$f" >/dev/null
-  fi
+  [ -f "$SRC/$f" ] || continue
+  echo "push $f"
+  adb push "$SRC/$f" "$DST/$f" >/dev/null
 done
 echo "done: $(adb shell ls "$DST" | wc -l | tr -d ' ') files in $DST"
