@@ -198,6 +198,36 @@ Open before M2: the graph is decode-only (frame 0 from the host, frames 1..N−1
 in-graph), so the text prompt still runs step-by-step; and the host must cap N at
 `PMAX − pos`.
 
+### M2 result (`optim/multistep`)
+
+`docs/bench/2026-09-19-pixel10-optim-multistep-d2ac47a.txt`. LM cost per frame (ms,
+in/run/read) and full-pipeline RTF on the Pixel 10:
+
+| LM config | in | run | read | total/frame | RTF | corr vs gold |
+|---|---|---|---|---|---|---|
+| CPU (gold) | 1.6 | 19.2 | 0.1 | 20.9 | 0.84× | gold |
+| 1-step GPU | 12.4 | 1.2 | 37.4 | 51.0 | 0.80× | 0.767 |
+| ms4 GPU | 3.4 | 0.5 | 28.9 | 32.8 | 0.96× | **0.8334** |
+| ms8 GPU | 1.7 | 0.3 | 27.2 | 29.2 | 1.02× | 0.6235 |
+| 1-step GPU32 | 12.7 | 1.3 | 52.6 | 66.7 | 0.66× | 1.0000 |
+
+Multi-step does what it was built for: the 25.2 MB upload amortizes (12.4 → 1.7 ms/frame)
+and the ~14 ms/invocation sync disappears (51.0 → 29.2 ms/frame, 1.75×). Quality at N=4 is
+*better* than the accepted N=1 (0.8334 vs 0.767); N=8 drifts (0.6235) as the in-graph fp16
+latent projection compounds.
+
+It does not reach the goal on this device. Fitting read against N gives ≈ 25 ms/frame of GPU
+execution (the ~500 dispatches) plus ≈ 14 ms/invocation overhead, and 25 > the CPU LM's 20.9
+ms/frame, so GPU+ms still loses to the shipped `lm_cpu_dec_gpu` (1.44×). Two further costs:
+the ms graphs load slowly on the GPU delegate (4.2 s at N=4, 14.4 s at N=8 — the serialized
+program cache is mandatory once this is default), and the app must hold both the 1-step and
+ms graphs.
+
+Conclusion for this spike: keep N=4, but PowerVR stays LM-on-CPU. The multi-step win is a
+per-invocation-overhead fix, so it should be re-measured on Mali/Adreno, where the 1-step LM
+already beats CPU — and the remaining 25 ms/frame of GPU dispatch is what option B
+(persistent KV / no re-upload) would have to attack next.
+
 Commit at every checkpoint (and at any surprising intermediate result); each committed
 benchmark report is immutable — new runs add a file rather than editing an old one.
 
