@@ -35,8 +35,9 @@ Numerics: the only non-exact rewrite is erf-GELU -> fitted tanh-polynomial
 (|gelu err| <= 7.1e-5, measured below); everything else is bit-exact.
 
 Run:  PYTHONPATH=<pocket-tts clone> python build_pockettts.py [stage]
-      stage in {flowlm, head, fused, dectx, deconly, assets, pipeline, all}
+      stage in {flowlm, head, fused, dectx, deconly, assets, pipeline, multistep, all}
       PT_OUT=<dir> redirects the output (default: scripts/out/)
+      PT_MS_STEPS=<n,n,..> sets the multistep stage's N list (default 4,8)
 """
 import math
 import os
@@ -457,6 +458,145 @@ def stage_fused(model):
 
 
 G_KV = N_LAYERS * N_HEADS * HD
+
+
+class MultiStepFused(nn.Module):
+    """N fused frames in ONE invocation: per frame flow-LM step + flow head.
+
+    Motivation (see docs/multistep_lm_plan.md): the per-frame cost on the phone
+    GPU is the host<->GPU round trip, not the math -- ~12 ms to upload the
+    25.2 MB packed KV and ~37 ms to read the result back, against ~1.2 ms of
+    actual dispatch. Running N frames per invocation pays that once per N.
+
+    The KV cache lives in-graph and is appended to with a host-supplied one-hot
+    write mask: ``kv = kv*(1-m) + new*m`` (MUL/SUB/ADD only -- no GATHER/SELECT/
+    WHERE/CAST, which the GPU delegate rejects). Only the N new K/V rows come
+    back, so the host splices them into its own mirror and the 25 MB KV is never
+    read back. Frame i>0's input is ``input_linear @ latent[i-1]`` computed
+    in-graph; only frame 0's input comes from the host.
+
+    I/O (all fixed shape):
+      emb   [1,1,1024]      frame-0 input (BOS or project(prev latent))
+      cos   [1,N,1,64]      per-frame RoPE, positions off..off+N-1
+      sin   [1,N,1,64]
+      mask  [1,N,PMAX+1]    per-frame additive attention mask
+      write [1,N,PMAX,1]    one-hot at off+i (fp32, exactly 0/1)
+      pk/pv [1,96,PMAX,64]  packed KV before the run
+      noise [1,N,32]
+    ->  one flat [1, N*12321] = eos[1,N] | latent[1,N,32] |
+        new-k[1,N,96,64] | new-v[1,N,96,64], step-major (single readback).
+    """
+
+    def __init__(self, flow_lm, steps):
+        super().__init__()
+        self.steps = steps
+        self.step = FlowLMStep(flow_lm)
+        self.head = FlowHead(flow_lm)
+        self.register_buffer("in_lin", flow_lm.input_linear.weight.detach().clone())
+
+    def forward(self, emb, cos, sin, mask, write, pk, pv, noise):
+        eoses, lats, nks, nvs = [], [], [], []
+        pkv, pvv = pk, pv
+        x = emb
+        for i in range(self.steps):
+            ci = cos[:, i:i + 1]
+            si = sin[:, i:i + 1]
+            mi = mask[:, i:i + 1].unsqueeze(2)              # [1,1,1,PMAX+1]
+            wi = write[:, i:i + 1]                          # [1,1,PMAX,1]
+            cond, eos, nk, nv = self.step(x, ci, si, mi, pkv, pvv)
+            lat = self.head(cond, noise[:, i])              # [1,32]
+            pkv = pkv * (1.0 - wi) + nk * wi
+            pvv = pvv * (1.0 - wi) + nv * wi
+            eoses.append(eos)
+            lats.append(lat)
+            nks.append(nk)
+            nvs.append(nv)
+            x = F.linear(lat, self.in_lin).unsqueeze(1)     # [1,1,1024]
+        eos_all = torch.cat(eoses, dim=1)                   # [1,N]
+        lat_all = torch.stack(lats, dim=1)                  # [1,N,32]
+        nk_all = torch.cat(nks, dim=1).permute(0, 2, 1, 3)  # [1,N,96,64]
+        nv_all = torch.cat(nvs, dim=1).permute(0, 2, 1, 3)
+        return torch.cat(
+            [eos_all.reshape(1, -1), lat_all.reshape(1, -1),
+             nk_all.reshape(1, -1), nv_all.reshape(1, -1)], dim=-1)
+
+
+def stage_multistep(model, steps_list):
+    """Export the N-step fused decode graph and check it against the 1-step
+    graphs. Two checks per N: the eager N-step unroll vs an eager sequential
+    1-step loop (proves the unroll is equivalent), then tflite vs eager
+    (proves the conversion)."""
+    print(f"\n=== multi-step fused decode graph (N={steps_list}) ===")
+    flm = model.flow_lm
+    fused = FusedStep(flm).eval()
+    ks, vs, off0 = load_voice_state("alba")
+    pk0, pv0 = pack_voice(ks, vs, off0)
+    in_w = flm.input_linear.weight.detach()
+    bos_in = (flm.bos_emb.detach() @ in_w.T)                 # [1024]
+    torch.manual_seed(5)
+
+    for N in steps_list:
+        assert off0 + N <= PMAX, f"N={N} overflows the KV cache at off={off0}"
+        ms = MultiStepFused(flm, N).eval()
+        noise = torch.randn(1, N, LDIM) * math.sqrt(0.3)
+        cos = torch.zeros(1, N, 1, HD)
+        sin = torch.zeros(1, N, 1, HD)
+        mask = torch.zeros(1, N, PMAX + 1)
+        write = torch.zeros(1, N, PMAX, 1)
+        for i in range(N):
+            c, s = rope_cos_sin_deint(off0 + i)
+            cos[0, i, 0] = torch.from_numpy(c)
+            sin[0, i, 0] = torch.from_numpy(s)
+            mask[0, i] = torch.from_numpy(make_mask(off0 + i)[0, 0, 0])
+            write[0, i, off0 + i, 0] = 1.0
+
+        # eager sequential 1-step reference: same noises, host KV + projection
+        pk_a, pv_a = pk0.clone(), pv0.clone()
+        x = bos_in.view(1, 1, -1)
+        seq_lat, seq_eos = [], []
+        with torch.no_grad():
+            for i in range(N):
+                c, s = rope_cos_sin_deint(off0 + i)
+                out = fused(x, torch.from_numpy(c).view(1, 1, 1, HD),
+                            torch.from_numpy(s).view(1, 1, 1, HD),
+                            torch.from_numpy(make_mask(off0 + i)), pk_a, pv_a,
+                            noise[0, i].view(1, LDIM))
+                lat = out[:, 1:1 + LDIM]
+                nk = out[:, 1 + LDIM:1 + LDIM + G_KV].reshape(1, N_LAYERS * N_HEADS, 1, HD)
+                nv = out[:, 1 + LDIM + G_KV:].reshape(1, N_LAYERS * N_HEADS, 1, HD)
+                pk_a[0, :, off0 + i] = nk[0, :, 0]
+                pv_a[0, :, off0 + i] = nv[0, :, 0]
+                seq_lat.append(lat)
+                seq_eos.append(out[:, 0:1])
+                x = (lat[0] @ in_w.T).view(1, 1, -1)
+        seq_lat = torch.stack(seq_lat, dim=1)                # [1,N,32]
+        seq_eos = torch.cat(seq_eos, dim=1)                  # [1,N]
+
+        args = (bos_in.view(1, 1, -1), cos, sin, mask, write, pk0, pv0, noise)
+        with torch.no_grad():
+            out3 = ms(*args)
+        ms_lat = out3[:, N:N + N * LDIM].reshape(1, N, LDIM)
+        ms_eos = out3[:, :N]
+        print(f"N={N}: eager unroll vs sequential fused  latent max|d| "
+              f"{maxd(ms_lat.numpy(), seq_lat.numpy()):.2e}  eos max|d| "
+              f"{maxd(ms_eos.numpy(), seq_eos.numpy()):.2e}")
+
+        p = convert(ms, args, os.path.join(OUT, f"pt_flowlm_ms{N}.tflite"))
+        opcheck(p, f"flowlm_ms{N}")
+        to_fp16(p, os.path.join(OUT, f"pt_flowlm_ms{N}_fp16.tflite"))
+        opcheck(os.path.join(OUT, f"pt_flowlm_ms{N}_fp16.tflite"), f"flowlm_ms{N}_fp16")
+
+        cm = CM(p)
+        outs = cm(*[a.numpy() for a in args])
+        print(f"N={N}: tflite vs eager  whole-output corr "
+              f"{corr(outs[0], out3.numpy()):.6f}  max|d| "
+              f"{maxd(outs[0], out3.numpy()):.2e}")
+        cm16 = CM(os.path.join(OUT, f"pt_flowlm_ms{N}_fp16.tflite"))
+        outs16 = cm16(*[a.numpy() for a in args])
+        print(f"N={N}: fp16 tflite vs eager  whole-output corr "
+              f"{corr(outs16[0], out3.numpy()):.6f}  max|d| "
+              f"{maxd(outs16[0], out3.numpy()):.2e}")
+        del ms
 
 
 # ============================================================ mimi dec graphs
@@ -1125,6 +1265,9 @@ def main():
         stage_assets(model)
     if stage in ("pipeline", "all"):
         stage_pipeline(model)
+    if stage == "multistep":
+        steps = [int(s) for s in os.environ.get("PT_MS_STEPS", "4,8").split(",")]
+        stage_multistep(model, steps)
 
 
 if __name__ == "__main__":

@@ -185,6 +185,19 @@ whole prefill/decode loop in C++, with no host round trip per step, using named
 5. **M4** — winning variant hardened (N chosen, placement updated), merged to
    `optim/multistep_lm`; results appended to the index.
 
+### M1 result (`optim/multistep`)
+
+`pt_flowlm_ms{4,8}{,_fp16}.tflite` exported with the one-hot write-mask KV append and
+new-K/V-only output. GPU-clean (no banned ops, all tensors rank ≤ 4); fp16 size 169.7 /
+170.2 MB — essentially the single-step graph's 169.2 MB, because the weights are shared
+across the unrolled steps. Parity: the eager N-step unroll is **bit-identical** to the
+sequential 1-step loop (latent and eos max|d| `0.0`), and both tflite variants match eager
+with corr 1.000000 (max|d| 1.5e-05 / 1.6e-05 at N=4, 2.2e-05 / 1.5e-05 at N=8).
+
+Open before M2: the graph is decode-only (frame 0 from the host, frames 1..N−1 fed back
+in-graph), so the text prompt still runs step-by-step; and the host must cap N at
+`PMAX − pos`.
+
 Commit at every checkpoint (and at any surprising intermediate result); each committed
 benchmark report is immutable — new runs add a file rather than editing an old one.
 
