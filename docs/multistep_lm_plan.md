@@ -24,6 +24,33 @@ dominate; `lmReadMs` is already small after fusion.
 Goal: make the LM **faster on GPU than the CPU fallback on PowerVR**, without moving audio
 quality away from the gold standard.
 
+## Baseline (M0, Pixel 10)
+
+Committed record: `docs/bench/2026-09-19-pixel10-optim-multistep_lm-bdd161a.txt`. LM micro,
+ms per frame (`in` = host writes, `run` = invocation submit, `read` = output readback/sync):
+
+| LM placement | in | run | read | total/frame | RTF | audio corr vs gold |
+|---|---|---|---|---|---|---|
+| CPU (gold) | 1.5 | **19.7** | 0.1 | 21.3 | 0.83× | gold |
+| GPU (fp16 compute) | 12.1 | 1.2 | **37.0** | 50.2 | 0.84× | **0.767** |
+| GPU32 (fp32 compute) | 12.5 | 1.3 | **52.6** | 66.4 | 0.65× | **1.0000** |
+
+Two findings that revise the premise:
+
+1. **The bottleneck is the readback/sync, not the upload.** `run()` returns after ~1 ms
+   because submission is async; the GPU work is hidden inside the reads. Reading back the
+   0.05 MB output costs 37 ms — more than uploading the 25.2 MB KV (12 ms). Amortizing
+   *invocations* (option A) is therefore the main lever, ahead of shrinking the upload
+   (option A's dynamic-KV variant, option B).
+2. **fp16 compute on PowerVR fails the quality gate.** `lm:GPU` scores corr 0.767 vs gold;
+   `lm:GPU32` (fp32 compute, same fp16 weights) is exact. On this device the LM must run at
+   fp32 compute to be quality-clean, ~30 % slower per frame — so the spikes target **GPU32**
+   and the fp16 speed number is not a usable target.
+
+Cost to beat: **21.3 ms/frame** (LM on CPU). With fp32 on GPU, amortizing needs
+`(12.5 + 52.6)/N + 1.3 < 21.3` ⇒ **N ≥ 4**; N = 8 gives ≈ 9.4 ms/frame (~2.3× the CPU LM),
+which is option A's target.
+
 ## Success criteria
 
 1. **Quality gate (non-negotiable).** On the same text/voice/seed, the candidate's audio
