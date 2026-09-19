@@ -14,6 +14,7 @@ import java.util.Locale
 class Benchmarker(private val context: Context) {
 
     private val seed = 20260919L
+    private val lmBenchSteps = 128
 
     fun run(text: String, voice: String, repeats: Int): String {
         val sb = StringBuilder()
@@ -22,10 +23,15 @@ class Benchmarker(private val context: Context) {
             Placement(Accel.CPU, Accel.CPU, Accel.GPU) to "lm_cpu_dec_gpu",
             Placement(Accel.CPU, Accel.GPU, Accel.GPU) to "lm_cpu_all_gpu",
             Placement(Accel.GPU, Accel.CPU, Accel.GPU) to "shipped_gpu_lm",
+            Placement(Accel.GPU32, Accel.CPU, Accel.GPU) to "lm_gpu32",
             Placement(Accel.GPU, Accel.GPU, Accel.GPU) to "all_gpu",
         )
 
         sb.appendLine("Pocket TTS benchmark")
+        sb.appendLine(
+            "device   : ${android.os.Build.MODEL} (${android.os.Build.DEVICE}), " +
+                "Android ${android.os.Build.VERSION.RELEASE}",
+        )
         sb.appendLine("renderer : ${Placement.renderer()}")
         sb.appendLine("text     : ${text.length} chars, voice=$voice, repeats=$repeats, seed=$seed")
         sb.appendLine()
@@ -88,6 +94,17 @@ class Benchmarker(private val context: Context) {
                             "SNR ${f("%.1f", m.snrDb)} dB | high-band err ${f("%.1f", m.highBandErrDb)} dB | " +
                             "HNR gold ${f("%.1f", m.refHnrDb)} / cand ${f("%.1f", m.candHnrDb)} dB | " +
                             "len gold ${m.refSamples} cand ${m.candSamples}",
+                    )
+                }
+                val mb = s.microBenchLm(lmBenchSteps, voice)
+                if (mb.lmSteps > 0) {
+                    val st = mb.lmSteps.toDouble()
+                    sb.appendLine(
+                        "  lm micro: ${mb.lmSteps} frames / ${mb.lmInvocations} inv | " +
+                            "in ${f("%.2f", mb.lmInMs / st)} run ${f("%.2f", mb.lmRunMs / st)} " +
+                            "read ${f("%.2f", mb.lmReadMs / st)} ms/frame | " +
+                            "${f("%.1f", mb.lmInBytes / 1e6 / st)} MB in + " +
+                            "${f("%.2f", mb.lmOutBytes / 1e6 / st)} MB out per invocation",
                     )
                 }
             } catch (e: Throwable) {

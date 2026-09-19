@@ -192,6 +192,9 @@ class PocketTtsSynthesizer(
     private var sLmRun = 0L
     private var sLmRead = 0L
     private var sLmSteps = 0
+    private var sLmInv = 0
+    private var sLmInBytes = 0L
+    private var sLmOutBytes = 0L
     private var sPrompt = 0
     private var sFrames = 0
     private var sDecTx = 0L
@@ -219,6 +222,12 @@ class PocketTtsSynthesizer(
         val decTxMs: Long,
         val seanetMs: Long,
         val chunks: Int,
+        /** LM graph invocations: == [lmSteps] for the 1-step graph, fewer for an N-step graph. */
+        val lmInvocations: Int = 0,
+        /** Bytes written to the LM input buffers this call (packed KV dominates). */
+        val lmInBytes: Long = 0,
+        /** Bytes read from the LM output buffer this call. */
+        val lmOutBytes: Long = 0,
     )
 
     data class Result(val audio: FloatArray, val frames: Int, val ms: Long, val profile: Profile)
@@ -313,6 +322,10 @@ class PocketTtsSynthesizer(
         pos++
         val t3 = System.nanoTime()
         sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2; sLmSteps++
+        sLmInv++
+        sLmInBytes += (emb.size + cosArr.size + sinArr.size + mask.size +
+            pk.size + pv.size + noise.size).toLong() * Float.SIZE_BYTES
+        sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
         return latent to eos
     }
 
@@ -320,8 +333,7 @@ class PocketTtsSynthesizer(
     fun synthesize(text: String, voice: String): Result {
         val t0 = System.nanoTime()
         noiseSeed?.let { rnd.setSeed(it) }
-        sLmIn = 0; sLmRun = 0; sLmRead = 0; sLmSteps = 0
-        sPrompt = 0; sFrames = 0; sDecTx = 0; sSeanet = 0; sChunks = 0
+        resetProfile()
         loadVoice(voice)
         val audio = ArrayList<FloatArray>()
         var frames = 0
@@ -342,18 +354,52 @@ class PocketTtsSynthesizer(
         val out = FloatArray(total)
         var o = 0
         for (a in audio) { System.arraycopy(a, 0, out, o, a.size); o += a.size }
-        val profile = Profile(
-            lmSteps = sLmSteps,
-            promptSteps = sPrompt,
-            genFrames = sFrames,
-            lmInMs = sLmIn / 1_000_000,
-            lmRunMs = sLmRun / 1_000_000,
-            lmReadMs = sLmRead / 1_000_000,
-            decTxMs = sDecTx / 1_000_000,
-            seanetMs = sSeanet / 1_000_000,
-            chunks = sChunks,
-        )
-        return Result(out, frames, (System.nanoTime() - t0) / 1_000_000, profile)
+        return Result(out, frames, (System.nanoTime() - t0) / 1_000_000, snapshotProfile())
+    }
+
+    /** Zero the per-call stage accumulators. */
+    private fun resetProfile() {
+        sLmIn = 0; sLmRun = 0; sLmRead = 0; sLmSteps = 0; sLmInv = 0
+        sLmInBytes = 0; sLmOutBytes = 0
+        sPrompt = 0; sFrames = 0; sDecTx = 0; sSeanet = 0; sChunks = 0
+    }
+
+    private fun snapshotProfile() = Profile(
+        lmSteps = sLmSteps,
+        promptSteps = sPrompt,
+        genFrames = sFrames,
+        lmInMs = sLmIn / 1_000_000,
+        lmRunMs = sLmRun / 1_000_000,
+        lmReadMs = sLmRead / 1_000_000,
+        decTxMs = sDecTx / 1_000_000,
+        seanetMs = sSeanet / 1_000_000,
+        chunks = sChunks,
+        lmInvocations = sLmInv,
+        lmInBytes = sLmInBytes,
+        lmOutBytes = sLmOutBytes,
+    )
+
+    /**
+     * LM-only micro-benchmark: [steps] autoregressive frames from the voice
+     * prompt with no Mimi decode, so the LM's per-invocation input/run/read
+     * cost can be compared across placements without decoder noise. When
+     * [noiseSeed] is set every repeat is identical.
+     */
+    fun microBenchLm(steps: Int, voice: String = VOICES.first()): Profile {
+        noiseSeed?.let { rnd.setSeed(it) }
+        resetProfile()
+        loadVoice(voice)
+        resetToVoice()
+        val n = minOf(steps, PMAX - pos - 1).coerceAtLeast(0)
+        var emb = bosInput
+        for (g in 0 until n) {
+            val noise = FloatArray(LDIM) {
+                (rnd.nextGaussian() * sqrt(TEMP.toDouble())).toFloat()
+            }
+            emb = projectLatent(step(emb, noise).first)
+        }
+        sFrames = n
+        return snapshotProfile()
     }
 
     /** The reference autoregressive loop for one <=50-token chunk. */
