@@ -7,7 +7,9 @@ android {
     compileSdk = 35
     defaultConfig {
         applicationId = "com.pockettts"
-        minSdk = 26
+        // 31+ because the NPU dispatch runtime requires it; only arm64-v8a has
+        // an NPU dispatch shim at all.
+        minSdk = 31
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
@@ -20,6 +22,12 @@ android {
     kotlinOptions { jvmTarget = "17" }
     packaging {
         jniLibs {
+            // The NPU dispatch shim is dlopen'ed by absolute path out of the
+            // installed package's lib/arm64/ directory, so the .so has to be
+            // extracted at install time rather than left compressed in the APK.
+            // Without this the dispatch lookup finds nothing and the model never
+            // reaches the NPU.
+            useLegacyPackaging = true
             pickFirsts += setOf(
                 "**/libc++_shared.so",
                 "**/libtensorflowlite_jni.so",

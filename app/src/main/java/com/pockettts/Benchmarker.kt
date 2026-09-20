@@ -18,8 +18,14 @@ class Benchmarker(private val context: Context) {
 
     fun run(text: String, voice: String, repeats: Int): String {
         val sb = StringBuilder()
+        // gold first (it is the audio reference), then the NPU cases: LiteRT's
+        // environment is process-global and the *first* load fixes dispatch
+        // options, so an NPU load must not come after a CPU/GPU one.
         val placements = listOf(
             Placement.GOLD to "gold_cpu",
+            Placement(Accel.NPU, Accel.CPU, Accel.GPU) to "lm_npu",
+            Placement(Accel.NPU, Accel.NPU, Accel.GPU) to "lm_npu_dectx_npu",
+            Placement(Accel.CPU, Accel.NPU, Accel.GPU) to "lm_cpu_dectx_npu",
             Placement(Accel.CPU, Accel.CPU, Accel.GPU) to "lm_cpu_dec_gpu",
             Placement(Accel.CPU, Accel.GPU, Accel.GPU) to "lm_cpu_all_gpu",
             Placement(Accel.GPU, Accel.CPU, Accel.GPU) to "shipped_gpu_lm",

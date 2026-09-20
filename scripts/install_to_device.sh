@@ -23,10 +23,25 @@ FILES=(
   pt_voice_eve.bin
 )
 
+# AOT-compiled Tensor G5 (NPU) variants, if scripts/aot_tensor_g5.py has run.
+# Pushed alongside rather than instead of the stock graphs: the app picks the
+# `*_g5.tflite` file only for an Accel.NPU placement.
+EXTRA=(
+  pt_flowlm_fused_fp16_g5.tflite
+  pt_flowlm_ms4_fp16_g5.tflite
+  pt_mimi_dec_tx_fp16_g5.tflite
+)
+
 # The app must have run once so Android creates its external files dir.
 adb shell mkdir -p "$DST"
 for f in "${FILES[@]}"; do
   echo "push $f"
   adb push "$SRC/$f" "$DST/$f" >/dev/null
+done
+for f in "${EXTRA[@]}"; do
+  if [ -f "$SRC/$f" ]; then
+    echo "push $f"
+    adb push "$SRC/$f" "$DST/$f" >/dev/null
+  fi
 done
 echo "done: $(adb shell ls "$DST" | wc -l | tr -d ' ') files in $DST"

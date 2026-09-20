@@ -13,3 +13,6 @@ local.properties
 
 # build outputs of the conversion scripts (models, assets, wavs)
 scripts/out/
+
+# Google Tensor SDK compiler plugin bundle (360 MB, downloaded not committed)
+litert_plugin_compiler.tar.gz

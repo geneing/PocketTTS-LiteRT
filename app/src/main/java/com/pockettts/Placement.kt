@@ -6,11 +6,15 @@ import android.opengl.EGLConfig
 import android.opengl.GLES20
 import java.io.File
 
-/** Where one graph runs: GPU (fp16 weights/compute), GPU at fp32 compute, or CPU (XNNPACK). */
+/**
+ * Where one graph runs: GPU (fp16 weights/compute), GPU at fp32 compute, CPU
+ * (XNNPACK), or the Tensor G5 NPU (an AOT-compiled `*_g5.tflite` variant).
+ */
 enum class Accel(val tag: String) {
     GPU("GPU"),
     CPU("CPU"),
     GPU32("GPU32"),
+    NPU("NPU"),
 }
 
 /**

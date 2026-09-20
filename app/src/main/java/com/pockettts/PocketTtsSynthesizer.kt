@@ -4,6 +4,7 @@ import android.content.Context
 import android.util.Half
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
+import com.google.ai.edge.litert.Environment
 import java.io.Closeable
 import java.io.File
 import java.io.RandomAccessFile
@@ -101,6 +102,38 @@ class PocketTtsSynthesizer(
     private val modelDir =
         requireNotNull(context.getExternalFilesDir(null)) { "External storage unavailable" }
 
+    private val appCtx = context.applicationContext
+
+    /**
+     * AOT-compiled Tensor G5 model name for a stock graph, e.g.
+     * `pt_flowlm_fused_fp16.tflite` -> `pt_flowlm_fused_fp16_g5.tflite`. The
+     * compiled artifact is a *different file*: it holds a Google Tensor
+     * dispatch partition in place of the original ops, so it cannot be produced
+     * by asking the stock graph for the NPU accelerator.
+     */
+    private fun g5Variant(name: String) = name.replace(".tflite", "_g5.tflite")
+
+    private var npuEnvironment: Environment? = null
+
+    /**
+     * The LiteRT environment the NPU needs. The Google Tensor dispatch shim is
+     * `dlopen`ed by absolute path from the app's native library directory, so
+     * that directory has to be handed over explicitly -- an unset value only
+     * logs a warning and the model quietly never reaches the NPU.
+     */
+    private fun npuEnv(): Environment {
+        npuEnvironment?.let { return it }
+        val env = Environment.create(
+            appCtx,
+            mapOf(
+                Environment.Option.DispatchLibraryDir to
+                    appCtx.applicationInfo.nativeLibraryDir,
+            ),
+        )
+        npuEnvironment = env
+        return env
+    }
+
     private fun path(name: String): File {
         val f = File(modelDir, name)
         check(f.exists()) { "Missing $name — push files first: scripts/install_to_device.sh" }
@@ -115,9 +148,15 @@ class PocketTtsSynthesizer(
      * failure (fp16 weights dequantize to fp32 there); load time is recorded
      * either way. `gpuCache`, when set, enables the delegate's serialized
      * program cache so a reload skips kernel compilation.
+     *
+     * NPU loads the `*_g5.tflite` AOT-compiled variant and does *not* fall back:
+     * the compiled partition only has a dispatch kernel, so a CPU retry of the
+     * same file cannot work, and a silent fallback is exactly how a mis-wired
+     * NPU ends up reporting a CPU-speed number.
      */
     private fun load(name: String, key: String, accel: Accel): CompiledModel {
-        val p = path(name).absolutePath
+        val file = if (accel == Accel.NPU) g5Variant(name) else name
+        val p = path(file).absolutePath
         val t = System.nanoTime()
         val model = try {
             when (accel) {
@@ -142,8 +181,14 @@ class PocketTtsSynthesizer(
                     }
                     CompiledModel.create(p, opts, null)
                 }
+                Accel.NPU -> CompiledModel.create(
+                    p,
+                    CompiledModel.Options(Accelerator.NPU),
+                    npuEnv(),
+                )
             }
         } catch (e: Throwable) {
+            if (accel == Accel.NPU) throw e
             CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null)
         }
         loadMs[key] = (System.nanoTime() - t) / 1_000_000
@@ -535,6 +580,7 @@ class PocketTtsSynthesizer(
         listOf(lmIn, lmOut, dectxIn, dectxOut, deconlyIn, deconlyOut)
             .forEach { l -> l.forEach { it.close() } }
         lm.close(); dectx.close(); deconly.close(); embChannel.close()
+        npuEnvironment?.close()
     }
 
     private fun readF32(f: File): FloatArray {
