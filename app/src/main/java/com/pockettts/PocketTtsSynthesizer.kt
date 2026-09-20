@@ -57,6 +57,14 @@ class PocketTtsSynthesizer(
      * sync over N frames. See docs/multistep_lm_plan.md.
      */
     private val lmSteps: Int = 1,
+    /**
+     * Prompt tokens per prefill invocation. 0 keeps the shipped per-token
+     * prompt path. >0 loads `pt_flowlm_prefill{N}_fp16.tflite` and runs the
+     * text prompt as ONE parallel causal pass over the packed KV, so a single
+     * invocation covers N prompt tokens instead of N upload+sync round trips
+     * (the prompt is not autoregressive: every embedding is known up front).
+     */
+    private val prefillSteps: Int = 0,
 ) : Closeable {
 
     companion object {
@@ -94,6 +102,8 @@ class PocketTtsSynthesizer(
         const val LM = "pt_flowlm_fused_fp16.tflite"
         /** N-step fused decode graph: N frames per invocation (see docs/multistep_lm_plan.md). */
         fun msGraph(n: Int) = "pt_flowlm_ms${n}_fp16.tflite"
+        /** P-token parallel prompt-prefill graph (see docs/multistep_lm_plan.md). */
+        fun pfGraph(p: Int) = "pt_flowlm_prefill${p}_fp16.tflite"
         const val DEC_TX = "pt_mimi_dec_tx_fp16.tflite"
         const val DECONLY = "pt_mimi_deconly_fp16.tflite"
         const val EMBED = "pt_embed_f16.bin"
@@ -165,16 +175,26 @@ class PocketTtsSynthesizer(
     private val lmMs: CompiledModel? =
         if (lmSteps > 1) load(msGraph(lmSteps), "lm_ms", placement.lm) else null
 
+    /** Parallel prompt-prefill graph; null when [prefillSteps] == 0. */
+    private val lmPf: CompiledModel? =
+        if (prefillSteps > 0) load(pfGraph(prefillSteps), "lm_pf", placement.lm) else null
+
     val dectx = load(DEC_TX, "dectx", placement.dectx)
     val deconly = load(DECONLY, "dec", placement.deconly)
 
     /** e.g. "lm:GPU dectx:CPU dec:GPU" — shown in the UI status line. */
-    val placements = if (lmSteps > 1) "${placement.label} ms$lmSteps" else placement.label
+    val placements = buildString {
+        append(placement.label)
+        if (lmSteps > 1) append(" ms$lmSteps")
+        if (prefillSteps > 0) append(" pf$prefillSteps")
+    }
 
     private val lmIn = lm.createInputBuffers()
     private val lmOut = lm.createOutputBuffers()
     private val lmMsIn = lmMs?.createInputBuffers()
     private val lmMsOut = lmMs?.createOutputBuffers()
+    private val lmPfIn = lmPf?.createInputBuffers()
+    private val lmPfOut = lmPf?.createOutputBuffers()
     private val dectxIn = dectx.createInputBuffers()
     private val dectxOut = dectx.createOutputBuffers()
     private val deconlyIn = deconly.createInputBuffers()
@@ -317,6 +337,12 @@ class PocketTtsSynthesizer(
     private val msWrite = FloatArray(lmSteps * PMAX)
     private val msNoise = FloatArray(lmSteps * LDIM)
 
+    // Parallel-prefill scratch (sized for [prefillSteps] prompt tokens).
+    private val pEmb = FloatArray(prefillSteps * H)
+    private val pCos = FloatArray(prefillSteps * HD)
+    private val pSin = FloatArray(prefillSteps * HD)
+    private val pMask = FloatArray(prefillSteps * (PMAX + prefillSteps))
+
     /**
      * One fused frame: flow-LM step + flow head in a single invocation.
      * Output layout: eos(1) | latent(32) | new-k(96*64) | new-v(96*64).
@@ -427,6 +453,99 @@ class PocketTtsSynthesizer(
         return lats to eos
     }
 
+    /**
+     * [prefillSteps] prompt tokens in ONE parallel pass: the graph runs the
+     * whole slice as a causal forward over `packed-kv ++ new rows`, appends the
+     * returned K/V at [pos], and returns nothing else — the prompt's latents are
+     * unused (generation restarts from BOS). One upload plus one sync covers
+     * [n] tokens instead of n.
+     */
+    private fun stepPrefill(ids: IntArray, from: Int, n: Int) {
+        val p = prefillSteps
+        val ins = requireNotNull(lmPfIn) { "prefill graph not loaded" }
+        val outs = requireNotNull(lmPfOut)
+        val model = requireNotNull(lmPf)
+        check(pos + n <= PMAX) { "prefill KV overflow at $pos + $n" }
+        val t0 = System.nanoTime()
+        java.util.Arrays.fill(pEmb, 0f)
+        for (i in 0 until n) System.arraycopy(embRow(ids[from + i]), 0, pEmb, i * H, H)
+        java.util.Arrays.fill(pMask, MASK_NEG)
+        for (i in 0 until n) {
+            ropeFill(pos + i)
+            System.arraycopy(cosArr, 0, pCos, i * HD, HD)
+            System.arraycopy(sinArr, 0, pSin, i * HD, HD)
+            val mb = i * (PMAX + p)
+            for (j in 0 until pos) pMask[mb + j] = 0f
+            for (j in 0 until i + 1) pMask[mb + PMAX + j] = 0f
+        }
+        ins[0].writeFloat(pEmb)
+        ins[1].writeFloat(pCos)
+        ins[2].writeFloat(pSin)
+        ins[3].writeFloat(pMask)
+        ins[4].writeFloat(pk)
+        ins[5].writeFloat(pv)
+        val t1 = System.nanoTime()
+        model.run(ins, outs)
+        val t2 = System.nanoTime()
+        val out = outs[0].readFloat()
+        var o = 0
+        for (i in 0 until n) {
+            val q = pos + i
+            for (g in 0 until G) {
+                System.arraycopy(out, o, pk, g * PMAX * HD + q * HD, HD)
+                o += HD
+            }
+        }
+        // Output is all P K rows then all P V rows, so the V block starts at
+        // P*G*HD -- not where the K loop stopped (n < P when the prompt is
+        // shorter than the graph, which is the normal case).
+        o = p * G * HD
+        for (i in 0 until n) {
+            val q = pos + i
+            for (g in 0 until G) {
+                System.arraycopy(out, o, pv, g * PMAX * HD + q * HD, HD)
+                o += HD
+            }
+        }
+        for (h in 0 until NH) {
+            val base = h * (PMAX + 1)
+            for (i in 0 until n) mask[base + pos + i] = 0f
+        }
+        pos += n
+        val t3 = System.nanoTime()
+        sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2; sLmSteps += n; sLmInv++
+        sLmInBytes += (pEmb.size + pCos.size + pSin.size + pMask.size +
+            2L * pk.size) * Float.SIZE_BYTES
+        sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
+    }
+
+    /** Text prompt into the KV: one parallel prefill pass per [prefillSteps]
+     * tokens when enabled, otherwise the shipped per-token loop. */
+    private fun prompt(ids: IntArray) {
+        if (prefillSteps <= 0) {
+            for (id in ids) step(embRow(id), zeroNoise)
+            return
+        }
+        var i = 0
+        while (i < ids.size) {
+            val n = minOf(prefillSteps, ids.size - i, PMAX - pos)
+            if (n <= 0) break
+            if (n == 1) step(embRow(ids[i]), zeroNoise) else stepPrefill(ids, i, n)
+            i += n
+        }
+    }
+
+    /** Prompt-path micro-benchmark: [tokens] synthetic tokens from the voice
+     * state, timing only the prompt so the per-token cost is visible with and
+     * without prefill. */
+    fun microBenchPrompt(tokens: Int, voice: String = VOICES.first()): Profile {
+        resetProfile()
+        loadVoice(voice)
+        resetToVoice()
+        prompt(IntArray(tokens) { (it * 7 + 3) % 4000 })
+        return snapshotProfile()
+    }
+
     /** Generate speech for `text` with the currently loaded voice. */
     fun synthesize(text: String, voice: String): Result {
         val t0 = System.nanoTime()
@@ -508,7 +627,7 @@ class PocketTtsSynthesizer(
     /** The reference autoregressive loop for one <=50-token chunk. */
     private fun generateChunk(ids: IntArray, framesAfterEos: Int): List<FloatArray> {
         resetToVoice()
-        for (id in ids) step(embRow(id), zeroNoise)
+        prompt(ids)
         val estimate = ceil((ids.size / TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE)
         val maxGen = minOf(estimate.toInt(), PMAX - pos - 1)
         val latents = ArrayList<FloatArray>(maxGen)
@@ -651,7 +770,10 @@ class PocketTtsSynthesizer(
             .forEach { l -> l.forEach { it.close() } }
         lmMsIn?.forEach { it.close() }
         lmMsOut?.forEach { it.close() }
-        lm.close(); lmMs?.close(); dectx.close(); deconly.close(); embChannel.close()
+        lmPfIn?.forEach { it.close() }
+        lmPfOut?.forEach { it.close() }
+        lm.close(); lmMs?.close(); lmPf?.close(); dectx.close(); deconly.close()
+        embChannel.close()
     }
 
     private fun readF32(f: File): FloatArray {

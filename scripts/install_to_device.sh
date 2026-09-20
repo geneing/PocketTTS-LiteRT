@@ -27,6 +27,8 @@ FILES=(
 EXTRA=(
   pt_flowlm_ms4_fp16.tflite
   pt_flowlm_ms8_fp16.tflite
+  pt_flowlm_prefill32_fp16.tflite
+  pt_flowlm_prefill64_fp16.tflite
 )
 
 # The app must have run once so Android creates its external files dir.

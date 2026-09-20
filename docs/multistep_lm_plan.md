@@ -228,6 +228,57 @@ per-invocation-overhead fix, so it should be re-measured on Mali/Adreno, where t
 already beats CPU — and the remaining 25 ms/frame of GPU dispatch is what option B
 (persistent KV / no re-upload) would have to attack next.
 
+### M3 feasibility — LiteRT-LM runtime (`optim/litertlm`)
+
+**Gate: FAIL for the runtime; PASS for the signature mechanism it embodies.** Evidence
+gathered from the pinned conversion env (`litert_lm_builder` 0.17.1 is already installed,
+`litert_torch` 0.9.3) and the LiteRT-LM sources.
+
+1. Bundling a non-Gemma model *is* representable — `llm_model_type.proto` has a
+   `GenericModel` fallback (and the exporter uses it as the `case _` default). But the
+   executor contract is token-centric: `runtime/executor/litert_compiled_model_executor_utils.cc`
+   requires the decode signature to expose `token_ids`/`tokens` **or** `embeddings`, plus
+   `input_positions`, plus `output_logits`, and runs with `strict=true`, so a model with no
+   logits output is rejected outright.
+2. The embeddings path is a **lookup, not a host buffer**: `GenericComputeTokenEmbeddings`
+   calls `embedding_lookup->LookupPrefill(input_tokens_span, …)`, and decode does
+   `FillInputBufferWithToken(pending_input_token, input_embeddings_buffer)`. The runtime owns
+   the loop token → embedding → logits → sampled token.
+3. There is no hook for a per-step Gaussian draw, the host-side flow head, or the
+   latent→embedding projection — all three are host-side in Pocket TTS and must stay there
+   for reproducibility.
+4. The public APIs are text-level: Kotlin `Session.runPrefill(contents: List<String>)` /
+   `runDecode()` (returns generated text), Python `Session.run_decode()`. Nothing takes
+   embeddings or latents, and nothing runs "N iterations" against a custom state.
+5. `com.google.ai.edge.litertlm:litertlm-android` exists (0.16.1 in the local Gradle cache)
+   but is a Conversation/Session wrapper over the C++ engine; using it means replacing the
+   app's `CompiledModel` pipeline with an LLM engine that cannot express this model.
+
+So the runtime is not applicable. What *is* reachable, and is the mechanism LiteRT-LM is
+built on, is **named signatures with different input lengths**. Verified by `javap` on
+`litert-api-2.2.0.aar`, the Kotlin `CompiledModel` exposes `createInputBuffers(signatureName)`,
+`createOutputBuffers(signatureName)`, `run(inputs, outputs, signatureName)`,
+`run(mapIn, mapOut, signatureName)`, `createInputBuffer(signatureName, tensorName)` and
+`getInputTensorType(signatureName, tensorName)`. It has **no `resizeInputTensor`** (Python
+only), so dynamic KV is out for the app and the signature family must be fixed-shape.
+
+### M3 experiment — one multi-signature file, prefill as the lever
+
+A single `pt_flowlm_sig_fp16.tflite` sharing one set of weights, four signatures:
+
+| signature | inputs | role |
+|---|---|---|
+| `prefill_32` | `emb[1,32,1024]`, `cos/sin[1,32,1,64]`, `mask[1,32,513]`, `write[1,32,512]`, `pk/pv[1,96,512,64]` | consume up to 32 prompt embeddings in ONE invocation; output new K/V + the last latent |
+| `decode` | as the shipped fused graph | 1 frame (N=1 control) |
+| `decode_4`, `decode_8` | as `MultiStepFused` | N frames per invocation |
+
+`prefill_32` is the real lever left after M2: **the text prompt is 28 sequential 1-step
+invocations in every existing placement** (28 prompt + 70 gen in the profile), each paying
+the ~12 ms upload and ~12–14 ms sync. Batching them into one invocation should save ≈0.6 s
+per utterance — more than packaging: it is the same amortization M2 applied to decode,
+applied to the prompt. Multi-signature packaging additionally replaces three loaded files
+(~510 MB) with one (~170 MB).
+
 Commit at every checkpoint (and at any surprising intermediate result); each committed
 benchmark report is immutable — new runs add a file rather than editing an old one.
 

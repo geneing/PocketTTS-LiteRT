@@ -16,8 +16,13 @@ class Benchmarker(private val context: Context) {
     private val seed = 20260919L
     private val lmBenchSteps = 128
 
-    /** One benchmark scenario: a placement plus how many LM frames per invocation. */
-    private data class Cfg(val p: Placement, val name: String, val lmSteps: Int = 1)
+    /** One benchmark scenario: placement, LM frames/invocation, prompt tokens/invocation. */
+    private data class Cfg(
+        val p: Placement,
+        val name: String,
+        val lmSteps: Int = 1,
+        val prefill: Int = 0,
+    )
 
     fun run(text: String, voice: String, repeats: Int): String {
         val sb = StringBuilder()
@@ -28,6 +33,9 @@ class Benchmarker(private val context: Context) {
             Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "shipped_gpu_lm"),
             Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "lm_gpu_ms4", 4),
             Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "lm_gpu_ms8", 8),
+            Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "lm_gpu_pf32", 1, 32),
+            Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "lm_gpu_ms4_pf32", 4, 32),
+            Cfg(Placement(Accel.GPU, Accel.CPU, Accel.GPU), "lm_gpu_ms8_pf64", 8, 64),
             Cfg(Placement(Accel.GPU32, Accel.CPU, Accel.GPU), "lm_gpu32"),
             Cfg(Placement(Accel.GPU, Accel.GPU, Accel.GPU), "all_gpu"),
         )
@@ -49,7 +57,7 @@ class Benchmarker(private val context: Context) {
             val name = cfg.name
             val tLoad = System.nanoTime()
             val s = try {
-                PocketTtsSynthesizer(context, p, seed, lmSteps = cfg.lmSteps)
+                PocketTtsSynthesizer(context, p, seed, lmSteps = cfg.lmSteps, prefillSteps = cfg.prefill)
             } catch (e: Throwable) {
                 sb.appendLine("[$name] ${p.label}: LOAD FAILED: ${e.message}")
                 continue
@@ -59,7 +67,8 @@ class Benchmarker(private val context: Context) {
                 sb.appendLine()
                 sb.appendLine("[$name] ${s.placements}")
                 sb.appendLine(
-                    "  load: lm ${s.loadMs["lm"]} dectx ${s.loadMs["dectx"]} dec ${s.loadMs["dec"]} ms " +
+                    "  load: lm ${s.loadMs["lm"]} pf ${s.loadMs["lm_pf"] ?: "-"} " +
+                        "dectx ${s.loadMs["dectx"]} dec ${s.loadMs["dec"]} ms " +
                         "(graph sum ${s.loadMs.values.sum()} ms, incl. assets/ctx $loadTotal ms)",
                 )
                 val rtf = ArrayList<Double>()
@@ -74,7 +83,7 @@ class Benchmarker(private val context: Context) {
                     sb.appendLine(
                         "  run$r: ${f("%.2f", secs)}s audio, ${res.frames} frames, ${res.ms} ms, " +
                             "${f("%.2f", x)}x RTF | lm ${pr.lmSteps} steps " +
-                            "(${pr.promptSteps} prompt + ${pr.genFrames} gen): " +
+                            "(${pr.promptSteps} prompt + ${pr.genFrames} gen, ${pr.lmInvocations} inv): " +
                             "in ${pr.lmInMs} run ${pr.lmRunMs} read ${pr.lmReadMs} ms | " +
                             "dec_tx ${pr.decTxMs} seanet ${pr.seanetMs} ms",
                     )
@@ -112,6 +121,16 @@ class Benchmarker(private val context: Context) {
                             "read ${f("%.2f", mb.lmReadMs / st)} ms/frame | " +
                             "${f("%.1f", mb.lmInBytes / 1e6 / st)} MB in + " +
                             "${f("%.2f", mb.lmOutBytes / 1e6 / st)} MB out per invocation",
+                    )
+                }
+                val pm = s.microBenchPrompt(lmBenchSteps, voice)
+                if (pm.lmSteps > 0) {
+                    val st = pm.lmSteps.toDouble()
+                    sb.appendLine(
+                        "  prompt micro: ${pm.lmSteps} tokens / ${pm.lmInvocations} inv | " +
+                            "in ${f("%.2f", pm.lmInMs / st)} run ${f("%.2f", pm.lmRunMs / st)} " +
+                            "read ${f("%.2f", pm.lmReadMs / st)} ms/token | " +
+                            "total ${pm.lmInMs + pm.lmRunMs + pm.lmReadMs} ms",
                     )
                 }
             } catch (e: Throwable) {

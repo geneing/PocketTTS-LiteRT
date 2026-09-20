@@ -35,9 +35,11 @@ Numerics: the only non-exact rewrite is erf-GELU -> fitted tanh-polynomial
 (|gelu err| <= 7.1e-5, measured below); everything else is bit-exact.
 
 Run:  PYTHONPATH=<pocket-tts clone> python build_pockettts.py [stage]
-      stage in {flowlm, head, fused, dectx, deconly, assets, pipeline, multistep, all}
+      stage in {flowlm, head, fused, dectx, deconly, assets, pipeline,
+                multistep, prefill, all}
       PT_OUT=<dir> redirects the output (default: scripts/out/)
       PT_MS_STEPS=<n,n,..> sets the multistep stage's N list (default 4,8)
+      PT_PREFILL_LENS=<n,n,..> sets the prefill stage's P list (default 32)
 """
 import math
 import os
@@ -598,6 +600,161 @@ def stage_multistep(model, steps_list):
               f"{maxd(outs16[0], out3.numpy()):.2e}")
         del ms
 
+
+class PrefillParallel(FlowLMStep):
+    """P prompt embeddings in ONE *parallel* pass -- the decode graph's mirror.
+
+    The app feeds the text prompt one token at a time (28 sequential 1-step
+    invocations for the benchmark text) and every one of those pays the full
+    25.2 MB packed-KV upload plus a readback sync. But the prompt is *not*
+    autoregressive -- every prompt embedding is known up front -- so the whole
+    prompt is one causal forward pass: P queries over ``concat(packed-kv,
+    new-k)`` in a single pass, ~150 dispatches instead of P x ~60. The prompt's
+    latents are discarded anyway (generation restarts from BOS with zero
+    noise), so this graph drops the flow head, the noise and the latent output:
+    P embeddings in, P new K/V rows out.
+
+    I/O (all fixed shape):
+      emb   [1,P,1024]      the P prompt embeddings
+      cos   [1,1,P,64]      RoPE at positions off..off+P-1
+      sin   [1,1,P,64]
+      mask  [1,1,P,PMAX+P]  additive mask; query i sees packed[0,off) and new[0,i]
+      pk/pv [1,96,PMAX,64]  packed KV before the run
+    ->  one flat [1, 2*P*96*64] = new-k[1,P,96,64] | new-v[1,P,96,64],
+        position-major (single readback).
+    """
+
+    def __init__(self, flow_lm, steps):
+        super().__init__(flow_lm)
+        self.steps = steps
+
+    def forward(self, emb, cos, sin, mask, pk, pv):
+        P = self.steps
+        scale = 1.0 / math.sqrt(HD)
+
+        def rot(t):
+            a, b = torch.chunk(t, 2, dim=-1)
+            return t * cos + torch.cat([-b, a], dim=-1) * sin
+
+        x = emb
+        nk, nv = [], []
+        for i, m in enumerate(self.layers):
+            h = self.ln(x, m.n1_w, m.n1_b)
+            proj = F.linear(h, m.in_w)                          # [1,P,3072]
+            q = proj[..., :D_MODEL].view(1, P, N_HEADS, HD)
+            k = proj[..., D_MODEL:2 * D_MODEL].view(1, P, N_HEADS, HD)
+            v = proj[..., 2 * D_MODEL:].view(1, P, N_HEADS, HD)
+            qh = rot(q.transpose(1, 2))                          # [1,16,P,64]
+            kh = rot(k.transpose(1, 2))
+            vh = v.transpose(1, 2)
+            base = i * N_HEADS
+            k_all = torch.cat([pk[:, base:base + N_HEADS], kh], dim=2)
+            v_all = torch.cat([pv[:, base:base + N_HEADS], vh], dim=2)
+            scores = torch.matmul(qh, k_all.transpose(-1, -2)) * scale + mask
+            attn = torch.softmax(scores, dim=-1)
+            ctx = torch.matmul(attn, v_all)                     # [1,16,P,64]
+            ctx = ctx.transpose(1, 2).reshape(1, P, D_MODEL)
+            x = x + F.linear(ctx, m.out_w)
+            h2 = self.ln(x, m.n2_w, m.n2_b)
+            x = x + F.linear(self.gelu(F.linear(h2, m.l1_w)), m.l2_w)
+            nk.append(kh)
+            nv.append(vh)
+        nk_all = torch.cat(nk, dim=1).permute(0, 2, 1, 3)      # [1,P,96,64]
+        nv_all = torch.cat(nv, dim=1).permute(0, 2, 1, 3)
+        return torch.cat(
+            [nk_all.reshape(1, -1), nv_all.reshape(1, -1)], dim=-1)
+
+
+def stage_prefill(model, lens):
+    """Export the P-step parallel prompt-prefill graph and check it against an
+    eager sequential FlowLMStep loop. Causal attention makes the batch pass
+    mathematically identical to P single-token steps, so the check is on the
+    appended K/V rows (the prompt has no latent output)."""
+    print(f"\n=== prompt prefill graph (P={lens}) ===")
+    flm = model.flow_lm
+    step = FlowLMStep(flm).eval()
+    ks, vs, off0 = load_voice_state("alba")
+    pk0, pv0 = pack_voice(ks, vs, off0)
+    torch.manual_seed(7)
+
+    for P in lens:
+        assert off0 + P <= PMAX, f"P={P} overflows the KV cache at off={off0}"
+        pf = PrefillParallel(flm, P).eval()
+        emb = torch.randn(1, P, D_MODEL) * 0.5
+        cos = torch.zeros(1, 1, P, HD)
+        sin = torch.zeros(1, 1, P, HD)
+        mask = torch.full((1, 1, P, PMAX + P), MASK_NEG)
+        for i in range(P):
+            c, s = rope_cos_sin_deint(off0 + i)
+            cos[0, 0, i] = torch.from_numpy(c)
+            sin[0, 0, i] = torch.from_numpy(s)
+            # Keys are laid out packed[0,PMAX) then new[PMAX,PMAX+P). Query i is
+            # allowed the voice prefix and the new rows up to and including its
+            # own; packed slots at off..PMAX hold stale zeros in this layout and
+            # must stay masked out (the sequential run overwrites them in place).
+            mask[0, 0, i, :off0] = 0.0
+            mask[0, 0, i, PMAX:PMAX + i + 1] = 0.0
+
+        # eager sequential 1-step reference, same embeddings (teacher forced)
+        pk_a, pv_a = pk0.clone(), pv0.clone()
+        with torch.no_grad():
+            for i in range(P):
+                c, s = rope_cos_sin_deint(off0 + i)
+                _, _, nk, nv = step(
+                    emb[:, i:i + 1], torch.from_numpy(c).view(1, 1, 1, HD),
+                    torch.from_numpy(s).view(1, 1, 1, HD),
+                    torch.from_numpy(make_mask(off0 + i)), pk_a, pv_a)
+                pk_a[0, :, off0 + i] = nk[0, :, 0]
+                pv_a[0, :, off0 + i] = nv[0, :, 0]
+
+        args = (emb, cos, sin, mask, pk0, pv0)
+        with torch.no_grad():
+            out = pf(*args)
+        got_k = out[:, :P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
+        got_v = out[:, P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)
+        want_k = pk_a[:, :, off0:off0 + P].permute(0, 2, 1, 3)
+        want_v = pv_a[:, :, off0:off0 + P].permute(0, 2, 1, 3)
+        print(f"P={P}: parallel vs sequential step  new-k max|d| "
+              f"{maxd(got_k.numpy(), want_k.numpy()):.2e}  new-v max|d| "
+              f"{maxd(got_v.numpy(), want_v.numpy()):.2e}")
+
+        # The app runs the prompt in one partly-padded invocation (a 28-token
+        # text in a P=32 graph), so the padded queries must not perturb the
+        # real rows.
+        if P > 4:
+            n = P - 3
+            emb_p = emb.clone()
+            emb_p[:, n:] = 0.0
+            mask_p = torch.full((1, 1, P, PMAX + P), MASK_NEG)
+            for i in range(P):
+                mask_p[0, 0, i, :off0] = 0.0
+                if i < n:
+                    mask_p[0, 0, i, PMAX:PMAX + i + 1] = 0.0
+            with torch.no_grad():
+                outp = pf(emb_p, cos, sin, mask_p, pk0, pv0)
+            gp_k = outp[:, :P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
+            gp_v = outp[:, P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)
+            print(f"P={P}: padded n={n} vs full  real-row k max|d| "
+                  f"{maxd(gp_k[:, :n].numpy(), got_k[:, :n].numpy()):.2e}  v max|d| "
+                  f"{maxd(gp_v[:, :n].numpy(), got_v[:, :n].numpy()):.2e}")
+
+        p = convert(pf, args, os.path.join(OUT, f"pt_flowlm_prefill{P}.tflite"))
+        opcheck(p, f"flowlm_prefill{P}")
+        to_fp16(p, os.path.join(OUT, f"pt_flowlm_prefill{P}_fp16.tflite"))
+        opcheck(os.path.join(OUT, f"pt_flowlm_prefill{P}_fp16.tflite"),
+                f"flowlm_prefill{P}_fp16")
+
+        cm = CM(p)
+        outs = cm(*[a.numpy() for a in args])
+        print(f"P={P}: tflite vs eager  whole-output corr "
+              f"{corr(outs[0], out.numpy()):.6f}  max|d| "
+              f"{maxd(outs[0], out.numpy()):.2e}")
+        cm16 = CM(os.path.join(OUT, f"pt_flowlm_prefill{P}_fp16.tflite"))
+        outs16 = cm16(*[a.numpy() for a in args])
+        print(f"P={P}: fp16 tflite vs eager  whole-output corr "
+              f"{corr(outs16[0], out.numpy()):.6f}  max|d| "
+              f"{maxd(outs16[0], out.numpy()):.2e}")
+        del pf
 
 # ============================================================ mimi dec graphs
 def banded_bias(seq, window, neg=MASK_NEG):
@@ -1268,6 +1425,9 @@ def main():
     if stage == "multistep":
         steps = [int(s) for s in os.environ.get("PT_MS_STEPS", "4,8").split(",")]
         stage_multistep(model, steps)
+    if stage in ("prefill", "all"):
+        lens = [int(s) for s in os.environ.get("PT_PREFILL_LENS", "32").split(",")]
+        stage_prefill(model, lens)
 
 
 if __name__ == "__main__":
