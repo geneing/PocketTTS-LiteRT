@@ -862,9 +862,17 @@ class MimiDecTx(nn.Module):
 
 
 class MimiDecOnly(nn.Module):
-    """feat[1,512,S_DEC] -> SEANet decoder (streaming semantics baked) -> audio."""
+    """feat[1,512,L] -> SEANet decoder (streaming semantics baked) -> audio.
 
-    def __init__(self, model):
+    `L` is the window length in feature positions and is what makes streaming
+    possible: the decoder is strictly causal (output sample s depends only on
+    feature positions <= s/UPS, measured) with a left receptive field of ~8
+    positions, so a short window fed at buffer offset 0 reproduces the same
+    samples as the full 4096-position window at a fraction of the cost. See
+    stage_stream().
+    """
+
+    def __init__(self, model, L=S_DEC):
         super().__init__()
         from pocket_tts.modules.conv import StreamingConv1d, StreamingConvTranspose1d
         from pocket_tts.modules.seanet import SEANetResnetBlock
@@ -892,7 +900,6 @@ class MimiDecOnly(nn.Module):
                 raise RuntimeError(f"unexpected layer {type(layer)}")
         self.mods = nn.ModuleList()
         self.plan = []
-        L = S_DEC
 
         def add_conv(conv, pad, length):
             self.mods.append(conv)
@@ -1249,6 +1256,45 @@ def stage_deconly(model):
     return g
 
 
+# Smaller SEANet windows for streaming. The decoder is strictly causal with a
+# left receptive field of ~8 feature positions (measured, see stage_stream), so
+# these are not approximations: they produce the same samples as the full
+# 4096-position window on the region they cover.
+STREAM_WINDOWS = [int(w) for w in os.environ.get("PT_STREAM_W", "512,1024,2048").split(",")]
+
+
+def stage_stream(model):
+    print("\n=== streaming SEANet windows ===")
+    detx = MimiDecTx(model).eval()
+    neutral = neutral_latent(model)
+    T = 96
+    torch.manual_seed(7)
+    lat = torch.randn(1, T, LDIM) * 0.8
+    with torch.no_grad():
+        feat = compose_dectx(detx, lat, neutral)
+    nfeat = feat.shape[-1]
+    win = torch.zeros(1, MIMI_D, S_DEC)
+    win[:, :, :nfeat] = feat
+    with torch.no_grad():
+        ref = MimiDecOnly(model).eval()(win)
+    print(f"reference: {T} latent frames -> {nfeat} feature positions, "
+          f"full window -> {ref.shape[-1]} samples")
+
+    for W in STREAM_WINDOWS:
+        g = MimiDecOnly(model, L=W).eval()
+        with torch.no_grad():
+            out = g(win[:, :, :W])
+        valid = min(nfeat, W) * UPS
+        a, b = out.numpy()[..., :valid], ref.numpy()[..., :valid]
+        print(f"W={W:5d} -> {out.shape[-1]:7d} samples | prefix of the full "
+              f"window: corr {corr(a, b):.6f} max|d| {maxd(a, b):.2e}")
+        p = convert(g, (torch.zeros(1, MIMI_D, W),),
+                    os.path.join(OUT, f"pt_mimi_deconly_w{W}.tflite"))
+        opcheck(p, f"deconly_w{W}")
+        to_fp16(p, os.path.join(OUT, f"pt_mimi_deconly_w{W}_fp16.tflite"))
+        opcheck(os.path.join(OUT, f"pt_mimi_deconly_w{W}_fp16.tflite"), f"deconly_w{W}_fp16")
+
+
 def stage_assets(model):
     print("\n=== host assets ===")
     flm = model.flow_lm
@@ -1472,6 +1518,8 @@ def main():
         stage_multistep(model, steps)
     if stage == "quant":
         stage_quant(model)
+    if stage == "stream":
+        stage_stream(model)
 
 
 if __name__ == "__main__":

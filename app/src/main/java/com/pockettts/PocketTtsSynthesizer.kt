@@ -64,6 +64,8 @@ class PocketTtsSynthesizer(
      * the same graph without rebuilding the app.
      */
     private val lmGraph: String? = null,
+    /** SEANet window (feature positions) for [synthesizeStream]; see [STREAM_W]. */
+    private val streamW: Int = STREAM_W,
 ) : Closeable {
 
     companion object {
@@ -84,6 +86,8 @@ class PocketTtsSynthesizer(
         const val DEC_FRAMES = 256       // deconly window frames
         const val S_DEC = DEC_FRAMES * UPS
         const val SPF = 1920             // samples per 12.5 Hz frame
+        /** Samples per Mimi feature position: SPF / UPS = 24000 / 200 Hz. */
+        const val SPP = SPF / UPS
         const val SAMPLE_RATE = 24000
 
         // Generation defaults from the english config / pocket_tts defaults.
@@ -120,6 +124,29 @@ class PocketTtsSynthesizer(
         fun msGraph(n: Int) = "pt_flowlm_ms${n}_fp16.tflite"
         const val DEC_TX = "pt_mimi_dec_tx_fp16.tflite"
         const val DECONLY = "pt_mimi_deconly_fp16.tflite"
+
+        /**
+         * SEANet window in feature positions for streaming. 512 (32 latent
+         * frames) measures fastest on both RTF and time-to-first-audio on the
+         * Pixel 10 GPU: it is the smallest window that still leaves a useful
+         * margin over the 16-position overlap, and it emits 3 chunks instead of
+         * 1-2. The host (XNNPACK) is bit-exact at every window size; on the GPU
+         * the delegate picks a different convolution algorithm above ~1024, so
+         * the small windows agree with each other but differ from the 2048/4096
+         * graphs by ~-73 dBFS rms. See docs/streaming.md.
+         */
+        const val STREAM_W = 512
+
+        /**
+         * Left context kept when sliding the SEANet window. The decoder's
+         * measured left receptive field is ~7.6 feature positions; 16 is a
+         * safety margin and still leaves 15 frames of new audio per window at
+         * [STREAM_W] = 512. Confirmed exact on the host for every L >= 8.
+         */
+        const val STREAM_L = 16
+
+        /** Smaller-window SEANet decoder, from `build_pockettts.py stream`. */
+        fun deconlyGraph(w: Int) = "pt_mimi_deconly_w${w}_fp16.tflite"
         const val EMBED = "pt_embed_f16.bin"
         const val INPUT_LINEAR = "pt_input_linear_f32.bin"
         const val BOS = "pt_bos_input_f32.bin"
@@ -239,6 +266,19 @@ class PocketTtsSynthesizer(
     val dectx = load(DEC_TX, "dectx", placement.dectx)
     val deconly = load(DECONLY, "dec", placement.deconly)
 
+    /**
+     * Streaming SEANet window. null when the smaller graph is not installed, in
+     * which case [synthesizeStream] falls back to the one-shot decode path.
+     */
+    val deconlyW: CompiledModel? =
+        if (File(modelDir, deconlyGraph(streamW)).exists()) {
+            load(deconlyGraph(streamW), "dec_w", placement.deconly)
+        } else {
+            null
+        }
+    private val deconlyWIn = deconlyW?.createInputBuffers()
+    private val deconlyWOut = deconlyW?.createOutputBuffers()
+
     /** e.g. "lm:GPU dectx:CPU dec:GPU" — shown in the UI status line. */
     val placements = if (lmSteps > 1) "${placement.label} ms$lmSteps" else placement.label
 
@@ -287,6 +327,8 @@ class PocketTtsSynthesizer(
     private var sDecTx = 0L
     private var sSeanet = 0L
     private var sChunks = 0
+    private var sFirstChunk = -1L
+    private var sAudioChunks = 0
 
     private var voiceName = ""
     private var voiceK = FloatArray(0)
@@ -315,6 +357,13 @@ class PocketTtsSynthesizer(
         val lmInBytes: Long = 0,
         /** Bytes read from the LM output buffer this call. */
         val lmOutBytes: Long = 0,
+        /**
+         * Time from the start of [synthesizeStream] to the first audio chunk,
+         * ms. -1 for the one-shot path, which has no chunks.
+         */
+        val firstChunkMs: Long = -1,
+        /** Audio chunks emitted by the streaming decoder. */
+        val audioChunks: Int = 0,
     )
 
     data class Result(val audio: FloatArray, val frames: Int, val ms: Long, val profile: Profile)
@@ -531,6 +580,7 @@ class PocketTtsSynthesizer(
         sLmIn = 0; sLmRun = 0; sLmRead = 0; sLmSteps = 0; sLmInv = 0
         sLmInBytes = 0; sLmOutBytes = 0
         sPrompt = 0; sFrames = 0; sDecTx = 0; sSeanet = 0; sChunks = 0
+        sFirstChunk = -1; sAudioChunks = 0
     }
 
     private fun snapshotProfile() = Profile(
@@ -546,6 +596,8 @@ class PocketTtsSynthesizer(
         lmInvocations = sLmInv,
         lmInBytes = sLmInBytes,
         lmOutBytes = sLmOutBytes,
+        firstChunkMs = sFirstChunk,
+        audioChunks = sAudioChunks,
     )
 
     /**
@@ -576,8 +628,16 @@ class PocketTtsSynthesizer(
         return snapshotProfile()
     }
 
-    /** The reference autoregressive loop for one <=50-token chunk. */
-    private fun generateChunk(ids: IntArray, framesAfterEos: Int): List<FloatArray> {
+    /**
+     * The reference autoregressive loop for one <=50-token chunk. [sink], when
+     * given, receives each latent as it is produced — that is what lets the
+     * decoder run behind the LM instead of after it.
+     */
+    private fun generateChunk(
+        ids: IntArray,
+        framesAfterEos: Int,
+        sink: ((FloatArray) -> Unit)? = null,
+    ): List<FloatArray> {
         resetToVoice()
         for (id in ids) step(embRow(id), zeroNoise)
         val estimate = ceil((ids.size / TOKENS_PER_SECOND + GEN_SECONDS_PADDING) * FRAME_RATE)
@@ -593,7 +653,7 @@ class PocketTtsSynthesizer(
                 for (i in 0 until lmSteps) {
                     if (eoses[i] > EOS_THRESHOLD && eosStep < 0) eosStep = g + i
                     if (eosStep >= 0 && g + i >= eosStep + framesAfterEos) { stop = true; break }
-                    latents.add(lats[i])
+                    latents.add(lats[i]); sink?.invoke(lats[i])
                 }
                 if (stop) break
                 emb = projectLatent(lats[lmSteps - 1])
@@ -602,7 +662,7 @@ class PocketTtsSynthesizer(
                 val (lat, eosLogit) = step(emb, gaussNoise())
                 if (eosLogit > EOS_THRESHOLD && eosStep < 0) eosStep = g
                 if (eosStep >= 0 && g >= eosStep + framesAfterEos) break
-                latents.add(lat)
+                latents.add(lat); sink?.invoke(lat)
                 emb = projectLatent(lat)
                 g++
             }
@@ -650,6 +710,159 @@ class PocketTtsSynthesizer(
         sDecTx += tSeanet - tDec
         sSeanet += System.nanoTime() - tSeanet
         return FloatArray(t * SPF) { wav[it].coerceIn(-1f, 1f) }
+    }
+
+    // ---- streaming decode --------------------------------------------------
+
+    /**
+     * Incremental Mimi decode. Frames go in as the LM produces them; a dec_tx
+     * block runs as soon as its 64 frames (or the chunk end) exist, and a
+     * SEANet window runs as soon as [STREAM_W] feature positions are available.
+     * Audio leaves through [onChunk].
+     *
+     * Both stages are block-exact rather than approximate: dec_tx keeps only the
+     * region its 32-frame overlap makes valid, and the SEANet is strictly causal
+     * (output sample s depends only on feature positions <= s/UPS) with a ~8
+     * position left receptive field, so a sliding window reproduces the one-shot
+     * 4096-position run. Concatenated chunks equal [decode]'s output bit-for-bit
+     * on the host; on the GPU they differ by the delegate's own rounding
+     * (~-73 dBFS rms) because it picks a different convolution algorithm for the
+     * smaller window. See docs/streaming.md.
+     */
+    private inner class StreamDecoder(private val onChunk: (FloatArray) -> Unit) {
+        private val lats = ArrayList<FloatArray>()
+        private val feat = FloatArray(MIMI_D * S_DEC)
+        private val win = FloatArray(MIMI_D * streamW)
+        private val blk = FloatArray((1 + F_BLK) * LDIM)
+        private var kept = 0        // frames already written into `feat`
+        private var featPos = 0     // feature positions written
+        private var emitted = 0     // feature positions already emitted as audio
+        var chunks = 0
+            private set
+
+        fun push(lat: FloatArray) {
+            lats.add(lat)
+            advance(final = false)
+            while (featPos - emitted >= streamW - STREAM_L) emitWindow()
+        }
+
+        fun flush() {
+            advance(final = true)
+            while (featPos > emitted) emitWindow()
+        }
+
+        /** Run every dec_tx block whose inputs are complete. */
+        private fun advance(final: Boolean) {
+            val n = lats.size
+            if (n == 0) return
+            if (kept == 0) {
+                // Block 0 needs all F_BLK frames; only a flush may run it short.
+                if (n < F_BLK && !final) return
+                block(n, 0, neutral)
+            }
+            while (kept < n && (final || n - kept >= F_HOP)) {
+                block(n, kept - F_HOP, lats[kept - F_HOP - 1])
+            }
+        }
+
+        /**
+         * One dec_tx block over frames [start, start+F_BLK); appends the newly
+         * valid frames to `feat`. Block 0 keeps from frame 0, later blocks drop
+         * the first F_HOP frames, which the previous block already kept.
+         */
+        private fun block(size: Int, start: Int, prev: FloatArray) {
+            System.arraycopy(prev, 0, blk, 0, LDIM)
+            for (f in 0 until F_BLK) {
+                val src = if (start + f < size) lats[start + f] else neutral
+                System.arraycopy(src, 0, blk, (1 + f) * LDIM, LDIM)
+            }
+            dectxIn[0].writeFloat(blk)
+            val t0 = System.nanoTime()
+            dectx.run(dectxIn, dectxOut)
+            val out = dectxOut[0].readFloat()
+            sDecTx += System.nanoTime() - t0
+            val drop = if (start == 0) 0 else F_HOP
+            val keepN = minOf(F_BLK, size - start) - drop
+            for (c in 0 until MIMI_D) {
+                System.arraycopy(
+                    out, c * S_BLK + drop * UPS,
+                    feat, c * S_DEC + (start + drop) * UPS, keepN * UPS,
+                )
+            }
+            kept = start + drop + keepN
+            featPos = kept * UPS
+        }
+
+        /** One SEANet window; emits the positions that now have full left context. */
+        private fun emitWindow() {
+            val model = deconlyW ?: return
+            val ins = deconlyWIn ?: return
+            val outs = deconlyWOut ?: return
+            val start = if (emitted == 0) 0 else emitted - STREAM_L
+            val avail = minOf(featPos, start + streamW) - start
+            java.util.Arrays.fill(win, 0f)
+            for (c in 0 until MIMI_D) {
+                System.arraycopy(feat, c * S_DEC + start, win, c * streamW, avail)
+            }
+            ins[0].writeFloat(win)
+            val t0 = System.nanoTime()
+            model.run(ins, outs)
+            val wav = outs[0].readFloat()
+            sSeanet += System.nanoTime() - t0
+            val keep = minOf(start + streamW, featPos) - emitted
+            val off = (emitted - start) * SPP
+            val out = FloatArray(keep * SPP) { wav[off + it].coerceIn(-1f, 1f) }
+            emitted += keep
+            chunks++
+            sAudioChunks++
+            onChunk(out)
+        }
+    }
+
+    /**
+     * Streaming synthesis: [onChunk] receives audio as soon as it is decodable
+     * instead of after the whole utterance, so playback can start during
+     * generation. The concatenated chunks match [synthesize]'s audio to within
+     * backend rounding (bit-exact on the host). Falls back to [synthesize] when
+     * the streaming SEANet graph is absent.
+     */
+    fun synthesizeStream(
+        text: String,
+        voice: String,
+        onChunk: (FloatArray) -> Unit,
+    ): Result {
+        if (deconlyW == null) {
+            android.util.Log.w("PocketTTS", "no ${deconlyGraph(streamW)}: one-shot fallback")
+            return synthesize(text, voice)
+        }
+        val t0 = System.nanoTime()
+        noiseSeed?.let { rnd.setSeed(it) }
+        resetProfile()
+        loadVoice(voice)
+        val all = ArrayList<FloatArray>()
+        var frames = 0
+        for (chunk in splitIntoBestSentences(text)) {
+            val (prepared, eosGuess) = prepareTextPrompt(chunk)
+            val ids = tokenizer.encode(prepared)
+            val dec = StreamDecoder { c ->
+                if (sFirstChunk < 0) sFirstChunk = (System.nanoTime() - t0) / 1_000_000
+                all.add(c)
+                onChunk(c)
+            }
+            val lats = generateChunk(ids, framesAfterEos = eosGuess + 2) { dec.push(it) }
+            dec.flush()
+            android.util.Log.i(
+                "PocketTTS",
+                "chunk: ${ids.size} tokens -> ${lats.size} frames, ${dec.chunks} audio chunks",
+            )
+            frames += lats.size
+            sPrompt += ids.size; sFrames += lats.size; sChunks++
+        }
+        val total = all.sumOf { it.size }
+        val out = FloatArray(total)
+        var o = 0
+        for (a in all) { System.arraycopy(a, 0, out, o, a.size); o += a.size }
+        return Result(out, frames, (System.nanoTime() - t0) / 1_000_000, snapshotProfile())
     }
 
     // ---- text preparation (ports of pocket_tts.models.tts_model) ----------
@@ -722,7 +935,10 @@ class PocketTtsSynthesizer(
             .forEach { l -> l.forEach { it.close() } }
         lmMsIn?.forEach { it.close() }
         lmMsOut?.forEach { it.close() }
-        lm.close(); lmMs?.close(); dectx.close(); deconly.close(); embChannel.close()
+        deconlyWIn?.forEach { it.close() }
+        deconlyWOut?.forEach { it.close() }
+        lm.close(); lmMs?.close(); dectx.close(); deconly.close()
+        deconlyW?.close(); embChannel.close()
         npuEnvironment?.close()
     }
 

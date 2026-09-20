@@ -98,19 +98,36 @@ class MainActivity : Activity() {
             bg.execute {
                 val s = synth ?: return@execute
                 try {
-                    val r = s.synthesize(text, voice)
+                    // Streaming: play each chunk as the decoder produces it, so
+                    // audio starts during generation instead of after it. Falls
+                    // back to a single chunk when the smaller SEANet graph is not
+                    // installed (synthesizeStream then calls synthesize).
+                    val track = streamTrack()
+                    track.play()
+                    val r = s.synthesizeStream(text, voice) { chunk ->
+                        track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
+                    }
+                    track.stop()
+                    track.release()
                     saveWav(r.audio, voice)
                     val secs = r.audio.size.toFloat() / PocketTtsSynthesizer.SAMPLE_RATE
-                    val rtf = secs * 1000f / r.ms
-                    val line = "Spoke %.1fs (%d frames) in %d ms — %.2fx real-time (%s)"
-                        .format(secs, r.frames, r.ms, rtf, s.placements)
+                    // r.ms is wall clock, and the chunk writes block on the audio
+                    // device, so it is throttled to playback rate (~1x by
+                    // construction). The headline number is first audio; the
+                    // unthrottled RTF is what the benchmark measures.
+                    val line = (
+                        "Spoke %.1fs (%d frames) in %d ms wall — first audio %d ms, " +
+                            "%d chunks (%s)"
+                        ).format(
+                        secs, r.frames, r.ms,
+                        r.profile.firstChunkMs, r.profile.audioChunks, s.placements,
+                    )
                     android.util.Log.i("PocketTTS", line)
                     runOnUiThread {
                         status.text = line
                         button.isEnabled = true
                         waveform.start(r.audio, PocketTtsSynthesizer.SAMPLE_RATE)
                     }
-                    play(r.audio)
                 } catch (e: Throwable) {
                     android.util.Log.e("PocketTTS", "generation failed", e)
                     runOnUiThread { status.text = "Error: ${e.message}"; button.isEnabled = true }
@@ -181,21 +198,32 @@ class MainActivity : Activity() {
         Wav.write(File(filesDir, "output_$voice.wav"), audio)
     }
 
-    private fun play(audio: FloatArray) {
-        if (audio.isEmpty()) return
-        val track = AudioTrack(
-            AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build(),
-            AudioFormat.Builder()
-                .setSampleRate(PocketTtsSynthesizer.SAMPLE_RATE)
-                .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
-                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
-                .build(),
-            audio.size * 4, AudioTrack.MODE_STATIC, AudioManager.AUDIO_SESSION_ID_GENERATE,
+    /**
+     * An AudioTrack in streaming mode, so chunks can be written as the decoder
+     * produces them. The buffer holds a couple of seconds: it only has to cover
+     * the gap between one SEANet window finishing and the next, and the writes
+     * block, which throttles the decoder to playback rate rather than letting
+     * generated audio pile up.
+     */
+    private fun streamTrack(): AudioTrack {
+        val attrs = AudioAttributes.Builder()
+            .setUsage(AudioAttributes.USAGE_MEDIA)
+            .build()
+        val fmt = AudioFormat.Builder()
+            .setSampleRate(PocketTtsSynthesizer.SAMPLE_RATE)
+            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+            .build()
+        val min = AudioTrack.getMinBufferSize(
+            PocketTtsSynthesizer.SAMPLE_RATE,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_FLOAT,
         )
-        track.write(audio, 0, audio.size, AudioTrack.WRITE_BLOCKING)
-        track.play()
-        Thread.sleep((audio.size * 1000L / PocketTtsSynthesizer.SAMPLE_RATE) + 250)
-        track.release()
+        val bytes = maxOf(min, PocketTtsSynthesizer.SAMPLE_RATE * 4 * 2)
+        return AudioTrack(
+            attrs, fmt, bytes,
+            AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE,
+        )
     }
 
     override fun onDestroy() {

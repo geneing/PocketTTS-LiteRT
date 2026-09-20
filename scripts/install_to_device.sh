@@ -31,6 +31,8 @@ FILES=(
 #  * multi-step decode (`build_pockettts.py multistep`)
 #  * int8 flow-LM variants (`build_pockettts.py quant`), picked by the
 #    benchmark's lmGraph override
+#  * smaller-window SEANet decoders (`build_pockettts.py stream`) for streaming
+#    generation; the app prefers pt_mimi_deconly_w512_fp16.tflite
 #  * AOT-compiled Tensor G5 variants (`aot_tensor_g5.py`), which the app picks
 #    instead of the stock graph for an Accel.NPU placement.
 EXTRA=(
@@ -41,6 +43,9 @@ EXTRA=(
   pt_flowlm_fused_dyn4_all.tflite
   pt_flowlm_fused_wo8_all.tflite
   pt_flowlm_fused_st8_body.tflite
+  pt_mimi_deconly_w512_fp16.tflite
+  pt_mimi_deconly_w1024_fp16.tflite
+  pt_mimi_deconly_w2048_fp16.tflite
   pt_flowlm_fused_fp16_g5.tflite
   pt_flowlm_ms4_fp16_g5.tflite
   pt_flowlm_ms8_fp16_g5.tflite

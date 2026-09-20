@@ -40,11 +40,12 @@ class Benchmarker(private val context: Context) {
         // environment is process-global and the *first* load fixes dispatch
         // options, so an NPU load must not come after a CPU/GPU one.
         val placements = listOf(
-            Cfg(Placement.GOLD, "gold_cpu"),
+            // The gold is the fp16 CPU reference, pinned explicitly: the app's
+            // default LM graph is now int8, and the quality reference has to
+            // stay comparable to the best-performance run.
+            Cfg(Placement.GOLD, "gold_cpu", lmGraph = I8_FP16),
             // fp16 references at the two placements the int8 run compares against.
-            // Named explicitly: the default is now the int8 graph when present.
             Cfg(Placement(Accel.CPU, Accel.NPU, Accel.GPU), "fp16_dectx_npu", lmGraph = I8_FP16),
-            Cfg(Placement(Accel.CPU, Accel.CPU, Accel.CPU), "fp16_all_cpu", lmGraph = I8_FP16),
             // int8 flow-LM (M6). dectx:NPU + dec:GPU is held fixed so only the
             // LM graph changes between these rows.
             Cfg(Placement(Accel.CPU, Accel.NPU, Accel.GPU), "i8_dyn8_all", lmGraph = I8_DYN8_ALL),
@@ -66,6 +67,7 @@ class Benchmarker(private val context: Context) {
         sb.appendLine()
 
         var gold: FloatArray? = null
+        val audioByName = HashMap<String, FloatArray>()
 
         sb.appendLine("== placements ==")
         for (cfg in placements) {
@@ -114,6 +116,7 @@ class Benchmarker(private val context: Context) {
                 )
                 val audio = last?.audio
                 if (audio != null) {
+                    audioByName[name] = audio
                     if (p == Placement.GOLD) {
                         gold = audio
                         Wav.write(File(context.filesDir, "bench_gold.wav"), audio)
@@ -147,6 +150,13 @@ class Benchmarker(private val context: Context) {
             } finally {
                 s.close()
             }
+        }
+
+        // ---- streaming -------------------------------------------------------
+        sb.appendLine()
+        sb.appendLine("== streaming: audio chunks emitted while the LM is still generating ==")
+        for (w in listOf(512, 1024, 2048)) {
+            streamRow(sb, w, Accel.GPU, audioByName["i8_dyn8_all"], text, voice, repeats)
         }
 
         sb.appendLine()
@@ -193,6 +203,79 @@ class Benchmarker(private val context: Context) {
                 s.close()
             }
         }
+    }
+
+    /**
+     * One streaming scenario: [w] is the SEANet window, [dec] its accelerator,
+     * [ref] the one-shot audio to compare against. The comparison is the point:
+     * the host is bit-exact at every window, so whatever the device reports
+     * here is the backend's own rounding, not the windowing rule.
+     */
+    private fun streamRow(
+        sb: StringBuilder,
+        w: Int,
+        dec: Accel,
+        ref: FloatArray?,
+        text: String,
+        voice: String,
+        repeats: Int,
+    ) {
+        val graph = "pt_mimi_deconly_w${w}_fp16.tflite"
+        if (!File(context.getExternalFilesDir(null), graph).exists()) {
+            sb.appendLine("  w=$w dec=${dec.tag}: $graph not installed, skipped")
+            return
+        }
+        val s = try {
+            PocketTtsSynthesizer(
+                context, Placement(Accel.CPU, Accel.NPU, dec), seed,
+                lmGraph = I8_DYN8_ALL, streamW = w,
+            )
+        } catch (e: Throwable) {
+            sb.appendLine("  w=$w dec=${dec.tag}: LOAD FAILED: ${e.message}")
+            return
+        }
+        try {
+            for (r in 1..repeats) {
+                var chunks = 0
+                val res = s.synthesizeStream(text, voice) { chunks++ }
+                val secs = res.audio.size.toDouble() / PocketTtsSynthesizer.SAMPLE_RATE
+                val pr = res.profile
+                sb.appendLine(
+                    "  w=$w dec=${dec.tag} run$r: ${f("%.2f", secs)}s audio, ${res.frames} frames, " +
+                        "${res.ms} ms, ${f("%.2f", secs * 1000.0 / res.ms)}x RTF | " +
+                        "first audio ${pr.firstChunkMs} ms | ${pr.audioChunks} chunks | " +
+                        "lm ${pr.lmRunMs} dec_tx ${pr.decTxMs} seanet ${pr.seanetMs} ms",
+                )
+                if (r == 1) {
+                    Wav.write(File(context.filesDir, "bench_stream_w${w}_${dec.tag}.wav"), res.audio)
+                    if (ref != null) {
+                        sb.appendLine(
+                            "        vs one-shot: corr " +
+                                "${f("%.6f", AudioQuality.compare(ref, res.audio).corr)} | " +
+                                "max|d| ${f("%.3e", maxAbsDiff(ref, res.audio))} | " +
+                                "len ${ref.size} vs ${res.audio.size}",
+                        )
+                    }
+                }
+            }
+        } catch (e: Throwable) {
+            sb.appendLine("  w=$w dec=${dec.tag} RUN FAILED: $e")
+        } finally {
+            s.close()
+        }
+    }
+
+    /**
+     * Largest sample-wise difference between two takes. Zero when the backend
+     * runs the same graph shape; non-zero between window sizes on the GPU
+     * because the delegate switches convolution algorithm above ~1024, which
+     * reorders the fp32 accumulation (measured ~-73 dBFS rms).
+     */
+    private fun maxAbsDiff(a: FloatArray, b: FloatArray): Double {
+        val n = minOf(a.size, b.size)
+        var m = 0.0
+        for (i in 0 until n) m = maxOf(m, kotlin.math.abs(a[i] - b[i]).toDouble())
+        return m
     }
 
     private fun median(v: List<Double>): Double {

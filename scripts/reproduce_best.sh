@@ -2,19 +2,20 @@
 #
 # Reproduce the best measured Pocket TTS configuration in one run.
 #
-# The configuration (Pixel 10 / Tensor G5, 2.16x real-time -- docs/int8_lm.md):
+# The configuration (Pixel 10 / Tensor G5, 3.2x real-time -- docs/streaming.md):
 #
 #   flow-LM   pt_flowlm_fused_dyn8_all.tflite   CPU  dynamic-range int8 weights
 #   dec_tx    pt_mimi_dec_tx_fp16_g5.tflite     Tensor G5 NPU (AOT-compiled)
-#   SEANet    pt_mimi_deconly_fp16.tflite       GPU
+#   SEANet    pt_mimi_deconly_w512_fp16.tflite  GPU, sliding 512-position window
 #
 # Usage:
 #   scripts/reproduce_best.sh [stage ...]
 #
-# Stages, run in this order when none are named (default: env build quant aot shim):
+# Stages, run in this order when none are named (default: env build quant stream aot shim):
 #   env     check the toolchain and report what is missing
 #   build   export the base graphs + host assets      build_pockettts.py all
 #   quant   export the int8 flow-LM                   PT_QUANT=dyn8_all
+#   stream  export the sliding-window SEANet decoders build_pockettts.py stream
 #   aot     AOT-compile dec_tx for the Tensor G5 NPU  aot_tensor_g5.py
 #   shim    fetch libLiteRtDispatch_GoogleTensor.so   fetch_google_tensor_dispatch.sh
 #   push    push every file the app loads to the device
@@ -56,6 +57,7 @@ warn() { printf 'WARN: %s\n' "$*" >&2; }
 BEST_FILES=(
   pt_flowlm_fused_dyn8_all.tflite
   pt_mimi_dec_tx_fp16_g5.tflite
+  pt_mimi_deconly_w512_fp16.tflite
   pt_mimi_deconly_fp16.tflite
   pt_embed_f16.bin
   pt_input_linear_f32.bin
@@ -110,6 +112,16 @@ stage_quant() {
     "$VENV/bin/python" "$ROOT/scripts/build_pockettts.py" quant
 }
 
+stage_stream() {
+  say "stream: smaller-window SEANet decoders"
+  # The app streams: it runs the SEANet decoder over a sliding window as the LM
+  # produces frames, so audio starts ~1.2s in instead of after the whole
+  # utterance. The 512 window is the app default; 1024/2048 are kept so the
+  # benchmark can compare them.
+  PYTHONPATH="$REFS" \
+    "$VENV/bin/python" "$ROOT/scripts/build_pockettts.py" stream
+}
+
 stage_aot() {
   say "aot: dec_tx for the Tensor G5 NPU"
   if [ ! -x "$AOT_VENV/bin/python" ]; then
@@ -152,7 +164,8 @@ stage_summary() {
   if [ "$missing" = 0 ]; then
     echo "all present. run the app and it picks this configuration automatically:"
     echo "  the flow-LM prefers the int8 graph, dec_tx the _g5 graph when the"
-    echo "  dispatch shim is installed, SEANet the GPU."
+    echo "  dispatch shim is installed, and SEANet streams through the 512-position"
+    echo "  window graph on the GPU."
     echo "  scripts/reproduce_best.sh push apk     # to get it onto a phone"
   else
     warn "some artifacts are missing -- see the stage output above"
@@ -160,7 +173,7 @@ stage_summary() {
   fi
 }
 
-ALL=(env build quant aot shim)
+ALL=(env build quant stream aot shim)
 if [ "$#" -eq 0 ]; then
   stages=("${ALL[@]}")
 else
@@ -172,6 +185,7 @@ for s in "${stages[@]}"; do
     env)     stage_env ;;
     build)   stage_build ;;
     quant)   stage_quant ;;
+    stream)  stage_stream ;;
     aot)     stage_aot ;;
     shim)    stage_shim ;;
     push)    stage_push ;;
