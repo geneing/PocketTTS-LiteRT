@@ -1,0 +1,127 @@
+Pocket TTS benchmark
+device   : Pixel 10 (frankel), Android 17
+renderer : PowerVR D-Series DXT-48-1536
+text     : 95 chars, voice=alba, repeats=3, seed=20260919
+
+== placements ==
+
+[gold_cpu] lm:CPU dectx:CPU dec:CPU
+  load: lm 313 pf - dectx 20 dec 20 ms (graph sum 353 ms, incl. assets/ctx 390 ms)
+  run1: 5.60s audio, 70 frames, 7453 ms, 0.75x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 148 run 1934 read 17 ms | dec_tx 503 seanet 4667 ms
+  run2: 5.60s audio, 70 frames, 6757 ms, 0.83x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 143 run 2030 read 16 ms | dec_tx 472 seanet 4076 ms
+  run3: 5.60s audio, 70 frames, 6622 ms, 0.85x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 139 run 1920 read 17 ms | dec_tx 473 seanet 4055 ms
+  RTF: median 0.83x (min 0.75 max 0.85)
+  lm micro: 128 frames / 128 inv | in 1.41 run 19.51 read 0.16 ms/frame | 25.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 1.43 run 19.52 read 0.13 ms/token | total 2697 ms
+
+[lm_cpu_dec_gpu] lm:CPU dectx:CPU dec:GPU
+  load: lm 389 pf - dectx 20 dec 212 ms (graph sum 621 ms, incl. assets/ctx 658 ms)
+  run1: 5.60s audio, 70 frames, 4114 ms, 1.36x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 151 run 1996 read 12 ms | dec_tx 493 seanet 1367 ms
+  run2: 5.60s audio, 70 frames, 4009 ms, 1.40x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 147 run 2009 read 12 ms | dec_tx 474 seanet 1328 ms
+  run3: 5.60s audio, 70 frames, 4014 ms, 1.40x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 147 run 2009 read 12 ms | dec_tx 474 seanet 1337 ms
+  RTF: median 1.40x (min 1.36 max 1.40)
+  vs gold: corr 1.0000 (lag 0) | SNR 45.4 dB | high-band err 33.0 dB | HNR gold 1.0 / cand 1.0 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 128 inv | in 1.45 run 20.12 read 0.12 ms/frame | 25.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 1.45 run 20.19 read 0.12 ms/token | total 2785 ms
+
+[lm_cpu_all_gpu] lm:CPU dectx:GPU dec:GPU
+  load: lm 298 pf - dectx 255 dec 168 ms (graph sum 721 ms, incl. assets/ctx 759 ms)
+  run1: 5.60s audio, 70 frames, 3756 ms, 1.49x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 147 run 2014 read 12 ms | dec_tx 136 seanet 1346 ms
+  run2: 5.60s audio, 70 frames, 3710 ms, 1.51x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 142 run 2038 read 12 ms | dec_tx 124 seanet 1361 ms
+  run3: 5.60s audio, 70 frames, 3700 ms, 1.51x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 148 run 2031 read 12 ms | dec_tx 130 seanet 1353 ms
+  RTF: median 1.51x (min 1.49 max 1.51)
+  vs gold: corr 0.4445 (lag 3) | SNR 1.0 dB | high-band err -2.2 dB | HNR gold 1.0 / cand 0.4 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 128 inv | in 1.41 run 20.30 read 0.13 ms/frame | 25.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 1.41 run 20.30 read 0.13 ms/token | total 2795 ms
+
+[shipped_gpu_lm] lm:GPU dectx:CPU dec:GPU
+  load: lm 697 pf - dectx 19 dec 170 ms (graph sum 886 ms, incl. assets/ctx 925 ms)
+  run1: 5.60s audio, 70 frames, 7008 ms, 0.80x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1224 run 115 read 3639 ms | dec_tx 553 seanet 1348 ms
+  run2: 5.60s audio, 70 frames, 6969 ms, 0.80x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1210 run 117 read 3661 ms | dec_tx 541 seanet 1360 ms
+  run3: 5.60s audio, 70 frames, 6746 ms, 0.83x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1120 run 126 read 3542 ms | dec_tx 540 seanet 1348 ms
+  RTF: median 0.80x (min 0.80 max 0.83)
+  vs gold: corr 0.7670 (lag 0) | SNR 3.9 dB | high-band err 5.5 dB | HNR gold 1.0 / cand 0.9 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 128 inv | in 11.88 run 1.18 read 36.44 ms/frame | 25.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 11.89 run 1.27 read 36.47 ms/token | total 6352 ms
+
+[lm_gpu_ms4] lm:GPU dectx:CPU dec:GPU ms4
+  load: lm 715 pf - dectx 36 dec 219 ms (graph sum 3775 ms, incl. assets/ctx 3833 ms)
+  run1: 5.60s audio, 70 frames, 5793 ms, 0.97x RTF | lm 100 steps (28 prompt + 70 gen, 46 inv): in 565 run 61 read 3133 ms | dec_tx 569 seanet 1339 ms
+  run2: 5.60s audio, 70 frames, 5733 ms, 0.98x RTF | lm 100 steps (28 prompt + 70 gen, 46 inv): in 599 run 68 read 3127 ms | dec_tx 538 seanet 1346 ms
+  run3: 5.60s audio, 70 frames, 5681 ms, 0.99x RTF | lm 100 steps (28 prompt + 70 gen, 46 inv): in 578 run 64 read 3109 ms | dec_tx 539 seanet 1334 ms
+  RTF: median 0.98x (min 0.97 max 0.99)
+  vs gold: corr 0.8334 (lag 0) | SNR 5.2 dB | high-band err 5.4 dB | HNR gold 1.0 / cand 1.1 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 32 inv | in 3.27 run 0.47 read 28.66 ms/frame | 6.3 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 12.41 run 1.17 read 37.22 ms/token | total 6503 ms
+
+[lm_gpu_ms8] lm:GPU dectx:CPU dec:GPU ms8
+  load: lm 876 pf - dectx 45 dec 245 ms (graph sum 7813 ms, incl. assets/ctx 7888 ms)
+  run1: 5.60s audio, 70 frames, 5481 ms, 1.02x RTF | lm 100 steps (28 prompt + 70 gen, 37 inv): in 383 run 65 read 2886 ms | dec_tx 654 seanet 1362 ms
+  run2: 5.60s audio, 70 frames, 5142 ms, 1.09x RTF | lm 100 steps (28 prompt + 70 gen, 37 inv): in 351 run 50 read 2829 ms | dec_tx 570 seanet 1302 ms
+  run3: 5.60s audio, 70 frames, 5128 ms, 1.09x RTF | lm 100 steps (28 prompt + 70 gen, 37 inv): in 332 run 49 read 2831 ms | dec_tx 538 seanet 1342 ms
+  RTF: median 1.09x (min 1.02 max 1.09)
+  vs gold: corr 0.6235 (lag 0) | SNR 2.1 dB | high-band err 4.4 dB | HNR gold 1.0 / cand 0.8 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 16 inv | in 1.34 run 0.27 read 27.46 ms/frame | 3.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 10.98 run 1.27 read 36.21 ms/token | total 6203 ms
+
+[lm_gpu_pf32] lm:GPU dectx:CPU dec:GPU pf32
+  load: lm 1031 pf 1338 dectx 21 dec 183 ms (graph sum 2573 ms, incl. assets/ctx 2618 ms)
+  run1: 5.60s audio, 70 frames, 5564 ms, 1.01x RTF | lm 99 steps (28 prompt + 70 gen, 72 inv): in 810 run 92 read 2648 ms | dec_tx 558 seanet 1342 ms
+  run2: 5.60s audio, 70 frames, 5495 ms, 1.02x RTF | lm 99 steps (28 prompt + 70 gen, 72 inv): in 841 run 92 read 2625 ms | dec_tx 534 seanet 1343 ms
+  run3: 5.60s audio, 70 frames, 5498 ms, 1.02x RTF | lm 99 steps (28 prompt + 70 gen, 72 inv): in 798 run 87 read 2667 ms | dec_tx 537 seanet 1354 ms
+  RTF: median 1.02x (min 1.01 max 1.02)
+  vs gold: corr 0.7378 (lag 0) | SNR 3.4 dB | high-band err 4.9 dB | HNR gold 1.0 / cand 1.1 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 128 inv | in 12.14 run 1.20 read 36.77 ms/frame | 25.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 4 inv | in 0.38 run 0.02 read 2.04 ms/token | total 312 ms
+
+[lm_gpu_ms4_pf32] lm:GPU dectx:CPU dec:GPU ms4 pf32
+  load: lm 779 pf 1250 dectx 35 dec 208 ms (graph sum 4947 ms, incl. assets/ctx 4998 ms)
+  run1: 5.60s audio, 70 frames, 4433 ms, 1.26x RTF | lm 100 steps (28 prompt + 70 gen, 19 inv): in 283 run 39 read 2111 ms | dec_tx 554 seanet 1350 ms
+  run2: 5.60s audio, 70 frames, 4285 ms, 1.31x RTF | lm 100 steps (28 prompt + 70 gen, 19 inv): in 266 run 37 read 2070 ms | dec_tx 542 seanet 1333 ms
+  run3: 5.60s audio, 70 frames, 4345 ms, 1.29x RTF | lm 100 steps (28 prompt + 70 gen, 19 inv): in 262 run 37 read 2112 ms | dec_tx 545 seanet 1349 ms
+  RTF: median 1.29x (min 1.26 max 1.31)
+  vs gold: corr 0.8387 (lag 0) | SNR 5.3 dB | high-band err 5.1 dB | HNR gold 1.0 / cand 1.0 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 32 inv | in 3.48 run 0.48 read 27.92 ms/frame | 6.3 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 4 inv | in 0.41 run 0.02 read 1.89 ms/token | total 298 ms
+
+[lm_gpu_ms8_pf64] lm:GPU dectx:CPU dec:GPU ms8 pf64
+  load: lm 837 pf 1485 dectx 35 dec 224 ms (graph sum 8488 ms, incl. assets/ctx 8578 ms)
+  run1: 5.60s audio, 70 frames, 4146 ms, 1.35x RTF | lm 100 steps (28 prompt + 70 gen, 10 inv): in 99 run 28 read 2019 ms | dec_tx 551 seanet 1333 ms
+  run2: 5.60s audio, 70 frames, 4011 ms, 1.40x RTF | lm 100 steps (28 prompt + 70 gen, 10 inv): in 108 run 19 read 1972 ms | dec_tx 528 seanet 1344 ms
+  run3: 5.60s audio, 70 frames, 4050 ms, 1.38x RTF | lm 100 steps (28 prompt + 70 gen, 10 inv): in 105 run 22 read 2023 ms | dec_tx 528 seanet 1335 ms
+  RTF: median 1.38x (min 1.35 max 1.40)
+  vs gold: corr 0.2782 (lag 0) | SNR 0.3 dB | high-band err 0.8 dB | HNR gold 1.0 / cand 0.2 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 16 inv | in 1.51 run 0.27 read 27.30 ms/frame | 3.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 2 inv | in 0.23 run 0.01 read 1.06 ms/token | total 167 ms
+
+[lm_gpu32] lm:GPU32 dectx:CPU dec:GPU
+  load: lm 1297 pf - dectx 21 dec 178 ms (graph sum 1496 ms, incl. assets/ctx 1533 ms)
+  run1: 5.60s audio, 70 frames, 8581 ms, 0.65x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1243 run 136 read 5186 ms | dec_tx 536 seanet 1349 ms
+  run2: 5.60s audio, 70 frames, 8558 ms, 0.65x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1276 run 139 read 5182 ms | dec_tx 527 seanet 1354 ms
+  run3: 5.60s audio, 70 frames, 8404 ms, 0.67x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1218 run 136 read 5106 ms | dec_tx 528 seanet 1337 ms
+  RTF: median 0.65x (min 0.65 max 0.67)
+  vs gold: corr 1.0000 (lag 0) | SNR 41.4 dB | high-band err 32.3 dB | HNR gold 1.0 / cand 1.0 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 128 inv | in 12.35 run 1.36 read 51.87 ms/frame | 25.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 12.16 run 1.27 read 51.78 ms/token | total 8347 ms
+
+[all_gpu] lm:GPU dectx:GPU dec:GPU
+  load: lm 752 pf - dectx 247 dec 173 ms (graph sum 1172 ms, incl. assets/ctx 1203 ms)
+  run1: 5.60s audio, 70 frames, 6678 ms, 0.84x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1190 run 119 read 3734 ms | dec_tx 140 seanet 1355 ms
+  run2: 5.60s audio, 70 frames, 6554 ms, 0.85x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1253 run 126 read 3632 ms | dec_tx 133 seanet 1341 ms
+  run3: 5.60s audio, 70 frames, 6456 ms, 0.87x RTF | lm 99 steps (28 prompt + 70 gen, 99 inv): in 1144 run 127 read 3607 ms | dec_tx 146 seanet 1362 ms
+  RTF: median 0.85x (min 0.84 max 0.87)
+  vs gold: corr 0.3891 (lag 0) | SNR 0.7 dB | high-band err -1.2 dB | HNR gold 1.0 / cand -0.0 dB | len gold 134400 cand 134400
+  lm micro: 128 frames / 128 inv | in 12.27 run 1.25 read 37.19 ms/frame | 25.2 MB in + 0.05 MB out per invocation
+  prompt micro: 128 tokens / 128 inv | in 12.07 run 1.20 read 36.61 ms/token | total 6384 ms
+
+== load-time scenarios (two passes each; pass2 ~ warm page cache) ==
+default(policy) pass1: lm 331 dectx 45 dec 217 ms (total 627 ms)
+default(policy) pass2: lm 298 dectx 20 dec 175 ms (total 524 ms)
+all-GPU pass1: lm 699 dectx 234 dec 177 ms (total 1144 ms)
+all-GPU pass2: lm 705 dectx 234 dec 176 ms (total 1150 ms)
+all-CPU pass1: lm 297 dectx 21 dec 24 ms (total 368 ms)
+all-CPU pass2: lm 293 dectx 19 dec 20 ms (total 352 ms)
+
+== GPU program cache (all-GPU; pass2 should hit the serialized cache) ==
+all-GPU+cache pass1: lm 693 dectx 168 dec 134 ms (total 1024 ms)
+all-GPU+cache pass2: lm 754 dectx 143 dec 117 ms (total 1041 ms)

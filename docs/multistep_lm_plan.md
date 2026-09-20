@@ -279,6 +279,61 @@ per utterance — more than packaging: it is the same amortization M2 applied to
 applied to the prompt. Multi-signature packaging additionally replaces three loaded files
 (~510 MB) with one (~170 MB).
 
+### M3 result (`optim/litertlm`)
+
+`docs/bench/2026-09-19-pixel10-optim-litertlm-1b541df.txt`. **Prefill is the win.** Prompt-path
+micro-benchmark (128 synthetic tokens, LM on GPU) and full-utterance medians:
+
+| prompt path | inv | ms/token | prompt total | RTF | corr vs gold |
+|---|---|---|---|---|---|
+| per-token 1-step (shipped) | 128 | 48.9 | 6352 ms | 0.80× | 0.7670 |
+| `pf32` | 4 | 2.04 | **312 ms** | 1.02× | 0.7378 |
+| `pf64` | 2 | 1.06 | **167 ms** | — | — |
+
+Full utterance, LM in/run/read in ms:
+
+| LM config | inv | in | run | read | RTF | corr vs gold |
+|---|---|---|---|---|---|---|
+| CPU gold | 99 | 148 | 1934 | 17 | 0.83× | gold |
+| `lm_cpu_dec_gpu` | 99 | 151 | 1996 | 12 | **1.40×** | 1.0000 |
+| shipped GPU LM | 99 | 1224 | 115 | 3639 | 0.80× | 0.7670 |
+| ms4 | 46 | 565 | 61 | 3133 | 0.98× | 0.8334 |
+| ms8 | 37 | 383 | 65 | 2886 | 1.09× | 0.6235 |
+| pf32 | 72 | 810 | 92 | 2648 | 1.02× | 0.7378 |
+| **ms4+pf32** | **19** | 283 | 39 | 2111 | **1.29×** | **0.8387** |
+| ms8+pf64 | 10 | 99 | 28 | 2019 | **1.38×** | 0.2782 |
+| GPU32 | 99 | 1243 | 136 | 5186 | 0.65× | 1.0000 |
+
+1. Prefill alone is a **20× prompt speedup** (48.9 → 2.04 ms/token) for ~1.3 s of extra graph
+   load. It is not dispatch-free — ~65 ms of GPU work per 32-token invocation — but the
+   parallel pass shares the packed-KV read across all P queries, so 32 queries cost ~2.6× one
+   AR frame rather than 32× it.
+2. Combined with multi-step it lifts the all-GPU LM from 0.80× to **1.29×** (ms4+pf32) and
+   **1.38×** (ms8+pf64) — level with the shipped best (`lm_cpu_dec_gpu` 1.40×) but with the LM
+   *on the GPU*. M2's "PowerVR must keep the LM on CPU" is therefore a statement about the
+   per-token prompt path, not about the LM: once both the prompt and decode are batched, GPU
+   ties CPU on this device.
+3. Quality: **ms4+pf32 corr 0.8387** — the best GPU-LM number measured, above the 0.767 the
+   user accepted by ear. pf64+ms8 collapses to 0.2782: the fp16 prefill and the fp16
+   multi-step drift compound, so keep **pf32**.
+4. Bug found during bring-up and fixed: the prefill output is *all P K rows then all P V
+   rows*, so the V block starts at `P*G*HD`; splicing V from where the K loop stopped is only
+   correct when `n == P`, which is why the multi-step graph (n == N) never hit it while
+   prefill (n < P) did. The parity checks in `stage_prefill` also assert that padded queries
+   leave the real rows bit-identical, which is the case this bug hid behind.
+
+Left open:
+
+- A single multi-signature `.tflite` (`decode` + `decode_4` + `prefill_32` sharing weights)
+  was **not** built. The Kotlin API does support named signatures
+  (`run(inputs, outputs, name)`, `createInputBuffers(name)`), but the benefit is packaging
+  only, and `torch.export` would most likely emit one weight copy per signature (the ms
+  graphs are 170 MB each), which would be worse than the separate files. Worth one
+  measurement before any app refactor.
+- The prompt graph is a batched *input length*, not a LiteRT-LM-style named-signature family:
+  `prefill_32` and `prefill_64` are two files the app picks from. If a real multi-signature
+  bundle lands, that is where it belongs.
+
 Commit at every checkpoint (and at any surprising intermediate result); each committed
 benchmark report is immutable — new runs add a file rather than editing an old one.
 
