@@ -131,11 +131,41 @@ to the CPU reference. The GPU delegate is as fast but changes the decoder's outp
 audibly, which is why `dectx` defaults to CPU on every device except a Tensor G5
 with both the AOT graph and the dispatch shim installed.
 
+## E. int8 flow-LM on CPU (M6)
+
+Weight precision, not FLOPs, is the flow-LM's lever on CPU: the step is
+DRAM-bandwidth-bound (84.44M weights, batch-1 activations), so int8 weights cut
+the per-frame traffic 4x. Dynamic-range int8 keeps the graph I/O fp32, so the
+host protocol is unchanged.
+
+| LM graph | accel | copy-in ms/step | compute ms/step | readback ms/step | total ms/step | size |
+|---|---|---|---|---|---|---|
+| `fused_fp16` | CPU | 1.33 | 19.59 | 0.13 | 21.1 | 161.4 MB |
+| **`dyn8_all`** | CPU | 1.50 | **8.65** | 0.12 | **10.3** | 81.7 MB |
+| `dyn8_body` | CPU | 1.45 | 9.86 | 0.12 | 11.4 | 105.6 MB |
+| `dyn4_all` | CPU | 1.68 | 7.09 | 0.13 | 8.9 | 45.6 MB |
+| `wo8_all` | CPU | 1.39 | 18.90 | 0.13 | 20.4 | 81.7 MB |
+
+`wo8_all` is weight-only quantization: the same 82 MB file, but it inserts
+`DEQUANTIZE` and computes in float, so it saves nothing (1.04x). That is the
+control proving the cost is bandwidth, not arithmetic.
+
+End to end at `lm:CPU dectx:NPU dec:GPU`: 1.51x fp16 -> **2.16x** `dyn8_all`
+(3680 -> 2564 ms). All-CPU: 0.83x -> 0.99x.
+
+Full-graph static int8 turns all 7 inputs and the output int8 and collapses
+(latent corr -0.002 vs eager); int16 makes the I/O int16; FC-only static keeps
+fp32 I/O but coarsens activations and stops generation after 3 frames. The exact
+recipe, the rejected variants and the caveats: `int8_lm.md`.
+
 ## What to keep
 
-- **LM on CPU, decoder-transformer on NPU, SEANet on GPU** (`1.53x`, the best
-  measured placement). `Placement.default` opts into the NPU `dectx` on a
-  Pixel-class GPU when `pt_mimi_dec_tx_fp16_g5.tflite` and
+- **int8 weights for the flow-LM** (`pt_flowlm_fused_dyn8_all.tflite`) — 2.27x on
+  the LM step, 2.16x end to end, half the size, and accepted by ear. The app
+  prefers it when it has been pushed. See `int8_lm.md`.
+- **LM on CPU, decoder-transformer on NPU, SEANet on GPU** (`1.53x` fp16, `2.16x`
+  with int8 — the best measured placement). `Placement.default` opts into the NPU
+  `dectx` on a Pixel-class GPU when `pt_mimi_dec_tx_fp16_g5.tflite` and
   `libLiteRtDispatch_GoogleTensor.so` are both present.
 - **N = 1 LM steps on the NPU, N = 4-8 on the GPU.** The two accelerators want
   opposite things: the GPU is transfer-bound and rewards batching, the NPU is
@@ -159,10 +189,11 @@ than as noise or artefacts.
 | `bench/2026-09-19-pixel10-optim-litertlm-1b541df.txt` | `optim/litertlm` | M3 prompt prefill (section C) |
 | `bench/2026-09-19-pixel10-optim-tensor_g5-npu-singlestep.txt` | `optim/tensor_g5` | M4 NPU single-step (own session) |
 | `bench/2026-09-19-pixel10-optim-tensor_g5-npu-multistep.txt` | `optim/tensor_g5` | M5 NPU multi-step (sections A, B, D) |
+| `bench/2026-09-19-pixel10-optim-tensor_g5_int8-4038d13.txt` | `optim/tensor_g5_int8` | M6 int8 flow-LM (section E) |
 
 Sections A, B and D come from one session and are comparable with each other;
-section C is its own session, and M2/M4 are separate sessions again. Do not mix
-numbers across sections.
+section C is its own session, M2/M4 are separate sessions again, and section E is
+the M6 session. Do not mix numbers across sections.
 
 Design notes, the branch topology and the per-milestone reasoning live in
-`multistep_lm_plan.md`.
+`multistep_lm_plan.md`; the int8 decision and recipe live in `int8_lm.md`.
