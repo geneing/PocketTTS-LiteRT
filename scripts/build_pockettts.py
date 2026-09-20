@@ -103,6 +103,26 @@ def maxd(a, b):
     return float(np.abs(a - b).max())
 
 
+def quant_to(a, dtype, q):
+    """float32 host array -> the graph's input dtype (no-op when it is float)."""
+    a = np.asarray(a)
+    if dtype in (np.float32, np.float16):
+        return a.astype(dtype)
+    scale, zero = q
+    info = np.iinfo(dtype)
+    return np.clip(np.round(a / np.float32(scale)) + np.float32(zero),
+                   info.min, info.max).astype(dtype)
+
+
+def quant_from(a, dtype, q):
+    """the graph's output dtype -> float32 (no-op when it is float)."""
+    a = np.asarray(a)
+    if dtype in (np.float32, np.float16):
+        return a.astype(np.float32)
+    scale, zero = q
+    return (a.astype(np.float32) - np.float32(zero)) * np.float32(scale)
+
+
 def convert(mod, example_inputs, out):
     import litert_torch
     litert_torch.convert(mod.eval(), example_inputs).export(out)
@@ -130,6 +150,124 @@ def to_fp16(fp32_path, fp16_path):
     return fp16_path
 
 
+# ------------------------------------------------------------- int8 (CPU)
+# The flow-LM step is DRAM-bandwidth-bound on the phone: ~85M fp32 weights
+# (~340 MB) are streamed per frame while the activations are batch-1 and tiny.
+# int8 weights cut that traffic ~4x, so weight quantization is where the CPU
+# speedup is; activation quantization only buys the KV re-reads.
+#
+# Scope note: every variant targets FULLY_CONNECTED only, or ALL_SUPPORTED
+# (which in this graph resolves to the same 47 FC ops -- the 12 BATCH_MATMULs
+# have no constant weight to quantize). The graph inputs and output therefore
+# stay fp32 in every variant, so the app's host protocol is unchanged.
+QUANT_VARIANTS = {
+    "dyn8_all": dict(kind="dynamic", ops=["ALL_SUPPORTED"], weight_bits=8, regex=".*"),
+    "dyn8_body": dict(kind="dynamic", ops=["FULLY_CONNECTED"], weight_bits=8,
+                      regex=".*FlowLMStep.*"),
+    "dyn8_head": dict(kind="dynamic", ops=["FULLY_CONNECTED"], weight_bits=8,
+                      regex=".*FlowHead.*"),
+    "dyn4_all": dict(kind="dynamic", ops=["ALL_SUPPORTED"], weight_bits=4, regex=".*"),
+    "wo8_all": dict(kind="weight_only", ops=["ALL_SUPPORTED"], weight_bits=8, regex=".*"),
+    "st8_all": dict(kind="static", ops=["ALL_SUPPORTED"], weight_bits=8,
+                    act_bits=8, regex=".*"),
+    "st16_all": dict(kind="static", ops=["ALL_SUPPORTED"], weight_bits=8,
+                     act_bits=16, regex=".*"),
+    "st8_body": dict(kind="static", ops=["FULLY_CONNECTED"], weight_bits=8,
+                     act_bits=8, regex=".*FlowLMStep.*"),
+}
+
+
+def quant_recipe(spec):
+    from ai_edge_quantizer import recipe_manager
+    from ai_edge_quantizer.recipe import AlgorithmName, qtyping
+    from ai_edge_quantizer.qtyping import QuantGranularity
+    wb = spec.get("weight_bits", 8)
+    gran = (QuantGranularity.BLOCKWISE_32 if wb == 4
+            else QuantGranularity.CHANNELWISE)
+    algo = spec.get("algorithm", AlgorithmName.MIN_MAX_UNIFORM_QUANT)
+    rm = recipe_manager.RecipeManager()
+    for op in spec["ops"]:
+        name = getattr(qtyping.TFLOperationName, op)
+        if spec["kind"] == "dynamic":
+            rm.add_dynamic_config(regex=spec["regex"], operation_name=name,
+                                  num_bits=wb, granularity=gran, algorithm_key=algo)
+        elif spec["kind"] == "weight_only":
+            rm.add_weight_only_config(regex=spec["regex"], operation_name=name,
+                                      num_bits=wb, granularity=gran, algorithm_key=algo)
+        elif spec["kind"] == "static":
+            rm.add_static_config(regex=spec["regex"], operation_name=name,
+                                 activation_num_bits=spec.get("act_bits", 8),
+                                 weight_num_bits=wb, weight_granularity=gran,
+                                 algorithm_key=algo)
+        else:
+            raise ValueError(f"unknown kind {spec['kind']}")
+    return rm.get_quantization_recipe()
+
+
+def to_quant(src, dst, spec, calibration=None):
+    from ai_edge_quantizer import quantizer
+    if os.path.exists(dst):
+        os.remove(dst)
+    qt = quantizer.Quantizer(float_model=src)
+    qt.load_quantization_recipe(quant_recipe(spec))
+    cal = qt.calibrate(calibration) if spec["kind"] == "static" else None
+    qt.quantize(calibration_result=cal).export_model(dst)
+    print(f"exported {dst} ({os.path.getsize(dst)/1e6:.1f} MB)")
+    return dst
+
+
+def quant_calibration(model, voice="alba", n=32, run=128, seed=11):
+    """List of fused-step input dicts for static-range calibration.
+
+    A free-run from the voice state walks the same offsets, RoPE phases and
+    accumulated-KV magnitudes the graph meets in production, so the activation
+    ranges the calibrator sees are the real ones. `run` steps are simulated and
+    every `run // n`-th is kept: a sample carries ~50 MB of KV and the calibrator
+    materialises the whole set (it calls `len(list(dataset))`), so keeping all of
+    them would cost gigabytes. Every 7th simulated step uses zero noise to cover
+    the text-prompt phase, where the host feeds no noise -- deliberately coprime
+    with the subsample stride, or the kept set would be all-zero-noise and the
+    noise input would calibrate to a degenerate scale.
+    """
+    flm = model.flow_lm
+    fused = FusedStep(flm).eval()
+    ks, vs, off0 = load_voice_state(voice)
+    pk, pv = pack_voice(ks, vs, off0)
+    in_w = flm.input_linear.weight.detach()
+    bos_in = (flm.bos_emb.detach() @ in_w.T).view(1, 1, -1)
+    torch.manual_seed(seed)
+    x_in, off, keep, samples = bos_in, off0, max(1, run // n), []
+    with torch.no_grad():
+        for i in range(run):
+            noise = (torch.zeros(1, LDIM) if i % 7 == 0
+                     else torch.randn(1, LDIM) * math.sqrt(0.3))
+            c, s = rope_cos_sin_deint(off)
+            c = torch.from_numpy(c).view(1, 1, 1, HD)
+            s = torch.from_numpy(s).view(1, 1, 1, HD)
+            mask = torch.from_numpy(make_mask(off))
+            if i % keep == 0:
+                samples.append({
+                    "args_0": x_in.numpy().copy(),
+                    "args_1": c.numpy().copy(),
+                    "args_2": s.numpy().copy(),
+                    "args_3": mask.numpy().copy(),
+                    "args_4": pk.numpy().copy(),
+                    "args_5": pv.numpy().copy(),
+                    "args_6": noise.numpy().copy(),
+                })
+            out = fused(x_in, c, s, mask, pk, pv, noise)
+            lat = out[:, 1:1 + LDIM]
+            nk = out[:, 1 + LDIM:1 + LDIM + G_KV].reshape(1, N_LAYERS * N_HEADS, 1, HD)
+            nv = out[:, 1 + LDIM + G_KV:].reshape(1, N_LAYERS * N_HEADS, 1, HD)
+            pk[0, :, off] = nk[0, :, 0]
+            pv[0, :, off] = nv[0, :, 0]
+            off += 1
+            x_in = (lat[0] @ in_w.T).view(1, 1, -1)
+    print(f"calibration: {len(samples)} samples over {run} free-run steps "
+          f"(offsets {off0}..{off})")
+    return samples
+
+
 def opcheck(path, label):
     import collections
     from ai_edge_litert.interpreter import Interpreter
@@ -146,7 +284,12 @@ def opcheck(path, label):
 
 
 class CM:
-    """ai_edge_litert CompiledModel wrapper (CPU on host) with named-order I/O."""
+    """ai_edge_litert CompiledModel wrapper (CPU on host) with named-order I/O.
+
+    Tolerates quantized I/O: host float32 arrays are quantized to the graph's
+    input dtype and outputs are dequantized back, which is exactly what the app
+    has to do for a fully-integer graph.
+    """
 
     def __init__(self, path):
         from ai_edge_litert.compiled_model import CompiledModel
@@ -155,16 +298,21 @@ class CM:
         self.outb = self.m.create_output_buffers(0)
         from ai_edge_litert.interpreter import Interpreter
         it = Interpreter(model_path=path)
-        self.in_shapes = [tuple(d["shape"]) for d in it.get_input_details()]
-        self.out_shapes = [tuple(d["shape"]) for d in it.get_output_details()]
+        self.ind = it.get_input_details()
+        self.outd = it.get_output_details()
+        self.in_shapes = [tuple(int(x) for x in d["shape"]) for d in self.ind]
+        self.out_shapes = [tuple(int(x) for x in d["shape"]) for d in self.outd]
 
     def __call__(self, *arrays):
-        for buf, a in zip(self.inb, arrays):
-            buf.write(np.ascontiguousarray(a, dtype=np.float32).ravel())
+        for buf, a, d in zip(self.inb, arrays, self.ind):
+            buf.write(np.ascontiguousarray(
+                quant_to(a, d["dtype"], d["quantization"])).ravel())
         self.m.run_by_index(0, self.inb, self.outb)
         outs = []
-        for buf, shp in zip(self.outb, self.out_shapes):
-            outs.append(np.array(buf.read(int(np.prod(shp)), np.float32)).reshape(shp))
+        for buf, d in zip(self.outb, self.outd):
+            n = int(np.prod(d["shape"]))
+            raw = np.array(buf.read(n, d["dtype"])).reshape(tuple(d["shape"]))
+            outs.append(quant_from(raw, d["dtype"], d["quantization"]))
         return outs
 
 
@@ -1248,6 +1396,60 @@ def compose_dectx_np(cm, lat, neutral):
     return feat
 
 
+def stage_quant(model):
+    print("\n=== int8 flow-LM (CPU) ===")
+    src = os.path.join(OUT, "pt_flowlm_fused.tflite")
+    if not os.path.exists(src):
+        raise SystemExit(f"missing {src}; run the `fused` stage first")
+    tags = os.environ.get("PT_QUANT", ",".join(QUANT_VARIANTS)).split(",")
+
+    flm = model.flow_lm
+    fused = FusedStep(flm).eval()
+    ks, vs, off0 = load_voice_state("alba")
+    pk, pv = pack_voice(ks, vs, off0)
+    in_w = flm.input_linear.weight.detach()
+    bos_in = (flm.bos_emb.detach() @ in_w.T).view(1, 1, -1)
+    c, s = rope_cos_sin_deint(off0)
+    mask = make_mask(off0)
+    torch.manual_seed(3)
+    noise = torch.randn(1, LDIM) * math.sqrt(0.3)
+    with torch.no_grad():
+        ref = fused(bos_in, torch.from_numpy(c).view(1, 1, 1, HD),
+                    torch.from_numpy(s).view(1, 1, 1, HD),
+                    torch.from_numpy(mask), pk, pv, noise).numpy()
+
+    for tag in tags:
+        spec = QUANT_VARIANTS[tag]
+        dst = os.path.join(OUT, f"pt_flowlm_fused_{tag}.tflite")
+        cal = None
+        if spec["kind"] == "static":
+            cal = {"serving_default": quant_calibration(
+                model, n=int(os.environ.get("PT_QUANT_CAL", 32)),
+                run=int(os.environ.get("PT_QUANT_CAL_RUN", 128)))}
+        to_quant(src, dst, spec, calibration=cal)
+        opcheck(dst, f"flowlm_{tag}")
+        from ai_edge_litert.interpreter import Interpreter
+        it = Interpreter(model_path=dst)
+        dts = {d["dtype"].__name__ for d in it.get_input_details()}
+        dts |= {d["dtype"].__name__ for d in it.get_output_details()}
+        if not dts <= {"float32", "float16", "int8", "uint8"}:
+            print(f"[{tag}] io {sorted(dts)}: no host runner for this dtype, "
+                  f"parity skipped")
+            continue
+        print(f"[{tag}] io {sorted(dts)}")
+        cm = CM(dst)
+        outs = cm(bos_in.numpy(), c.reshape(1, 1, 1, HD), s.reshape(1, 1, 1, HD),
+                  mask, pk.numpy(), pv.numpy(), noise.numpy())
+        o, r = outs[0][0], ref[0]
+        slices = [("eos", slice(0, 1)), ("lat", slice(1, 1 + LDIM)),
+                  ("k", slice(1 + LDIM, 1 + LDIM + G_KV)),
+                  ("v", slice(1 + LDIM + G_KV, None))]
+        print(f"[{tag}] vs eager fp32: " + " | ".join(
+            f"{n} " + (f"corr {corr(o[s], r[s]):.6f} " if o[s].size > 1 else "")
+            + f"max|d| {maxd(o[s], r[s]):.2e}"
+            for n, s in slices))
+
+
 def main():
     stage = sys.argv[1] if len(sys.argv) > 1 else "all"
     model = load_eager()
@@ -1268,6 +1470,8 @@ def main():
     if stage == "multistep":
         steps = [int(s) for s in os.environ.get("PT_MS_STEPS", "4,8").split(",")]
         stage_multistep(model, steps)
+    if stage == "quant":
+        stage_quant(model)
 
 
 if __name__ == "__main__":

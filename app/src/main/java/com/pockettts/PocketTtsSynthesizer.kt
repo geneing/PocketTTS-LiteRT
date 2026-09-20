@@ -58,6 +58,12 @@ class PocketTtsSynthesizer(
      * sync over N frames. See docs/multistep_lm_plan.md.
      */
     private val lmSteps: Int = 1,
+    /**
+     * Override the flow-LM graph filename, e.g. `pt_flowlm_fused_dyn8_all.tflite`.
+     * null = the shipped [LM]. Used by the benchmark to compare quantizations of
+     * the same graph without rebuilding the app.
+     */
+    private val lmGraph: String? = null,
 ) : Closeable {
 
     companion object {
@@ -93,6 +99,23 @@ class PocketTtsSynthesizer(
         // Mali the per-frame cost is dispatch/sync-bound, and two invocations
         // plus four readbacks per frame cost more than the math itself.
         const val LM = "pt_flowlm_fused_fp16.tflite"
+
+        /**
+         * Dynamic-range int8 flow-LM: int8 weights, fp32 activations, so the
+         * inputs and output stay fp32 and the host protocol is unchanged.
+         * Measured 2.27x faster per frame than [LM] on XNNPACK (19.6 -> 8.65 ms),
+         * 2.16x vs 1.51x end to end, and 82 MB instead of 161 MB; it passes the
+         * by-ear test against the fp16 graph. See docs/RESULTS.md.
+         */
+        const val LM_INT8 = "pt_flowlm_fused_dyn8_all.tflite"
+
+        /**
+         * Prefer the int8 flow-LM when it has been pushed, else the fp16 one.
+         * The fp16 graph is not a fallback in the error sense -- both are valid
+         * builds; this only decides which one a fresh device uses.
+         */
+        fun lmGraphFor(dir: File) = if (File(dir, LM_INT8).exists()) LM_INT8 else LM
+
         /** N-step fused decode graph: N frames per invocation (see docs/multistep_lm_plan.md). */
         fun msGraph(n: Int) = "pt_flowlm_ms${n}_fp16.tflite"
         const val DEC_TX = "pt_mimi_dec_tx_fp16.tflite"
@@ -204,7 +227,10 @@ class PocketTtsSynthesizer(
         return model
     }
 
-    val lm = load(LM, "lm", placement.lm)
+    /** Filename of the flow-LM graph actually loaded (see [lmGraph]). */
+    val lmGraphName: String = lmGraph ?: lmGraphFor(modelDir)
+
+    val lm = load(lmGraphName, "lm", placement.lm)
 
     /** N-step decode graph; null when [lmSteps] == 1. Prompt/tail still use [lm]. */
     private val lmMs: CompiledModel? =

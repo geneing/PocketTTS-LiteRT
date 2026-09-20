@@ -25,11 +25,18 @@ FILES=(
 
 # Optional graphs, pushed only when present:
 #  * multi-step decode (`build_pockettts.py multistep`)
+#  * int8 flow-LM variants (`build_pockettts.py quant`), picked by the
+#    benchmark's lmGraph override
 #  * AOT-compiled Tensor G5 variants (`aot_tensor_g5.py`), which the app picks
 #    instead of the stock graph for an Accel.NPU placement.
 EXTRA=(
   pt_flowlm_ms4_fp16.tflite
   pt_flowlm_ms8_fp16.tflite
+  pt_flowlm_fused_dyn8_all.tflite
+  pt_flowlm_fused_dyn8_body.tflite
+  pt_flowlm_fused_dyn4_all.tflite
+  pt_flowlm_fused_wo8_all.tflite
+  pt_flowlm_fused_st8_body.tflite
   pt_flowlm_fused_fp16_g5.tflite
   pt_flowlm_ms4_fp16_g5.tflite
   pt_flowlm_ms8_fp16_g5.tflite
