@@ -22,6 +22,67 @@ pipeline — language model, flow head and codec decoder — runs on the GPU**.
 | Voices | precomputed prompt-state KV caches (alba, marius, javert, charles, mary, eve — CC-BY-4.0/CC0 only) |
 | App | `com.pockettts` — pick a voice, type text, generate, play |
 
+## Best configuration (Pixel 10, Tensor G5)
+
+Measured on a Pixel 10: **2.16x real-time** — 5.60 s of speech in 2.56 s — against
+0.84x for the all-CPU reference. One command reproduces it:
+
+```bash
+cd pockettts/
+scripts/reproduce_best.sh            # writes the weights into scripts/out/
+scripts/reproduce_best.sh push apk   # and gets them onto a phone
+```
+
+| stage | graph | where | why |
+|---|---|---|---|
+| flow-LM (fused step + flow head) | `pt_flowlm_fused_dyn8_all.tflite` | **CPU**, dynamic-range int8 | The step is DRAM-bandwidth-bound, not FLOP-bound: 84.44M weights stream from DRAM every frame while the activations are batch-1. int8 weights cut that traffic 4x, the step 2.27x (19.6 → 8.65 ms/frame), and the file to 82 MB from 161 MB. |
+| Mimi decoder transformer | `pt_mimi_dec_tx_fp16_g5.tflite` | **NPU**, AOT-compiled for Tensor G5 | 131 ms vs 489 ms on CPU and 142 ms on GPU, and unlike the GPU delegate it is faithful to the CPU reference (corr 0.9999). |
+| SEANet decoder | `pt_mimi_deconly_fp16.tflite` | **GPU** | 1.36 s vs 4.6 s on CPU; the GPU output is clean on this stage. |
+
+The app picks this automatically when the files are present — `PocketTtsSynthesizer`
+prefers the int8 flow-LM, `Placement.default` opts into the NPU decoder
+transformer when both the `_g5` graph and the dispatch shim are installed, and
+SEANet defaults to the GPU. `force_cpu.txt` / `force_gpu.txt` / `force_fp32.txt`
+still override. Decisions and rejected variants: `docs/int8_lm.md`; the joint
+CPU/GPU/NPU timing tables: `docs/RESULTS.md`.
+
+### Steps to reproduce the weights
+
+`scripts/reproduce_best.sh` runs all of these in order; each stage also runs alone
+(`build`, `quant`, `aot`, `shim`, `push`, `apk`, `env`, `summary`). All of it must
+run under **Linux or WSL2** — `litert-converter` has no Windows wheel.
+
+1. **Reference clone** at the pinned commit:
+   ```bash
+   git clone https://github.com/kyutai-labs/pocket-tts.git references/pocket-tts
+   git -C references/pocket-tts checkout 001cf6e
+   ```
+2. **Conversion venv** (Python 3.10, CPU torch, pinned stack) — see `AGENTS.md` and
+   `scripts/requirements-convert.txt`. Defaults to `~/pockettts-conv/.venv`.
+3. **Base graphs + host assets** — `python scripts/build_pockettts.py all`. Downloads
+   the ungated `kyutai/pocket-tts-without-voice-cloning` weights, runs ~3 minutes, and
+   writes the fp16 graphs, the host `.bin` assets, the tokenizer and the voices into
+   `scripts/out/`.
+4. **int8 flow-LM** — `PT_QUANT=dyn8_all python scripts/build_pockettts.py quant`.
+   Dynamic-range int8, channelwise weights, fp32 activations, **no calibration**; the
+   graph's inputs and output stay fp32, so nothing in the host protocol changes.
+5. **AOT-compile the decoder transformer** —
+   `python scripts/aot_tensor_g5.py pt_mimi_dec_tx_fp16`, which needs its own venv
+   (`ai-edge-litert==2.2.0` + `ai-edge-litert-sdk-google-tensor==2.2.0`, default
+   `~/pockettts-aot/.venv`) and writes `pt_mimi_dec_tx_fp16_g5.tflite`. Optional:
+   without it `dec_tx` runs on CPU and only that stage slows down.
+6. **Dispatch shim** — `scripts/fetch_google_tensor_dispatch.sh` pulls
+   `libLiteRtDispatch_GoogleTensor.so` from the matching LiteRT release (v2.2.0) into
+   `app/src/main/jniLibs/arm64-v8a/`. The shim, the Android `litert` runtime and the
+   AOT compiler must all be the same LiteRT release, or the NPU silently never engages.
+7. **Device** — `scripts/install_to_device.sh`, then `./gradlew :app:installDebug`.
+   `ADB=<path>` overrides the adb binary, which is what you need on Windows: the WSL
+   adb server cannot see the device.
+
+The int8 flow-LM and the `_g5` AOT graph are produced by this branch and are **not**
+in the published [mlboydaisuke/Pocket-TTS-LiteRT](https://huggingface.co/mlboydaisuke/Pocket-TTS-LiteRT)
+bundle, which carries the fp16 graphs.
+
 ## Graphs and placement
 
 Every graph is stateless; KV caches, RoPE tables, the token-embedding lookup, the
@@ -31,6 +92,7 @@ Every graph is stateless; KV caches, RoPE tables, the token-embedding lookup, th
 | graph | I/O | fp16 size |
 |---|---|---|
 | `pt_flowlm_fused` | emb[1,1,1024] + cos/sin[1,1,1,64] + mask[1,16,1,513] + pk/pv[1,96,512,64] + noise[1,32] → [1,12321] = eos ∣ latent ∣ new-k ∣ new-v | 169 MB |
+| `pt_flowlm_fused_dyn8_all` | the same I/O (int8 weights only, activations still fp32) | **82 MB** |
 | `pt_mimi_dec_tx` | lat[1,65,32] → feat[1,512,1024] | 17 MB |
 | `pt_mimi_deconly` | feat[1,512,4096] → audio[1,1,491520] | 11 MB |
 | `pt_flowlm_step` / `pt_flow_head` | the same frame split into two graphs (cond exposed) — reference variant, not loaded by the app | 151 + 18 MB |
@@ -109,11 +171,26 @@ same KV graph reproduces the batched prompt exactly (causal), but the BOS input 
 
 ## Build and run
 
+For the best configuration, use the one-shot script:
+
+```bash
+cd pockettts/
+scripts/reproduce_best.sh               # env + base graphs + int8 LM + AOT + shim
+scripts/reproduce_best.sh push apk      # push to the device and install
+```
+
+By hand, that is:
+
 ```bash
 cd pockettts/
 # graphs + assets + parity (needs a pocket-tts clone on PYTHONPATH and the
 # litert-torch conversion env; downloads the ungated english weights)
 PYTHONPATH=/path/to/pocket-tts python scripts/build_pockettts.py all
+# int8 flow-LM for the CPU (the single biggest win: 2.27x on the LM step)
+PYTHONPATH=/path/to/pocket-tts PT_QUANT=dyn8_all python scripts/build_pockettts.py quant
+# decoder transformer for the Tensor G5 NPU (AOT venv; optional)
+python scripts/aot_tensor_g5.py pt_mimi_dec_tx_fp16
+./scripts/fetch_google_tensor_dispatch.sh
 ./scripts/install_to_device.sh          # pushes scripts/out -> device files dir
 ./gradlew :app:installDebug
 ```
@@ -125,7 +202,7 @@ on an M4 Max: it downloads the ungated `kyutai/pocket-tts-without-voice-cloning`
 every file the HF repo carries into `scripts/out/` (the re-run was byte-identical to the published
 files — sha256 of all 20 LFS files matched), and prints the tflite-vs-eager numbers of the
 Validation table below. Stages run individually (`flowlm`, `head`, `fused`, `dectx`, `deconly`,
-`assets`, `pipeline`); `PT_OUT=<dir>` redirects the output.
+`assets`, `pipeline`, `multistep`, `quant`); `PT_OUT=<dir>` redirects the output.
 
 First launch before the push fails with "Missing pt_..." by design; run the app once,
 push, relaunch. Everything (fp16 graphs + assets + 6 voices ≈ 225 MB) loads from the

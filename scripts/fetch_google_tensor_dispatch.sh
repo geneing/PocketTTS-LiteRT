@@ -27,5 +27,8 @@ trap 'rm -rf "$TMP"' EXIT
 echo "fetch $URL"
 curl -sSL -o "$TMP/libs.zip" "$URL"
 unzip -q "$TMP/libs.zip" -d "$TMP"
+# Replace rather than overwrite: an existing copy may be read-only (a WSL
+# /mnt/<drive> checkout often is), and cp would then fail on the mode bits.
+rm -f "$DEST/libLiteRtDispatch_GoogleTensor.so"
 cp "$TMP/google_tensor_runtime/src/main/jni/arm64-v8a/libLiteRtDispatch_GoogleTensor.so" "$DEST/"
 echo "wrote $DEST/libLiteRtDispatch_GoogleTensor.so ($(stat -c%s "$DEST/libLiteRtDispatch_GoogleTensor.so") bytes)"

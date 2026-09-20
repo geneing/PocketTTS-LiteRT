@@ -2,8 +2,12 @@
 # Push the Pocket TTS graphs + host assets into the app's external files dir.
 # Build them first:  python scripts/build_pockettts.py all   (writes scripts/out/)
 # Usage:             ./scripts/install_to_device.sh [dir-with-files]
+#
+# ADB=<path> overrides the adb binary. That matters on Windows, where adb lives
+# in the SDK and the WSL adb server cannot see the device.
 set -e
 SRC="${1:-$(dirname "$0")/out}"
+ADB="${ADB:-adb}"
 DST="/sdcard/Android/data/com.pockettts/files"
 
 FILES=(
@@ -44,14 +48,14 @@ EXTRA=(
 )
 
 # The app must have run once so Android creates its external files dir.
-adb shell mkdir -p "$DST"
+"$ADB" shell mkdir -p "$DST"
 for f in "${FILES[@]}"; do
   echo "push $f"
-  adb push "$SRC/$f" "$DST/$f" >/dev/null
+  "$ADB" push "$SRC/$f" "$DST/$f" >/dev/null
 done
 for f in "${EXTRA[@]}"; do
   [ -f "$SRC/$f" ] || continue
   echo "push $f"
-  adb push "$SRC/$f" "$DST/$f" >/dev/null
+  "$ADB" push "$SRC/$f" "$DST/$f" >/dev/null
 done
-echo "done: $(adb shell ls "$DST" | wc -l | tr -d ' ') files in $DST"
+echo "done: $("$ADB" shell ls "$DST" | wc -l | tr -d ' ') files in $DST"
