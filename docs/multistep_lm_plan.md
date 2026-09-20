@@ -198,6 +198,76 @@ Open before M2: the graph is decode-only (frame 0 from the host, frames 1..N−1
 in-graph), so the text prompt still runs step-by-step; and the host must cap N at
 `PMAX − pos`.
 
+## Option C — `optim/tensor_g5` (Google Tensor G5 NPU)
+
+Spur off the umbrella for the same reason as A/B but a different accelerator: a third
+branch, so its artifacts and numbers never mix with the GPU ones.
+
+```
+optim/multistep_lm
+└── optim/tensor_g5        (option C: AOT-compile for the Tensor G5 EdgeTPU)
+```
+
+Unlike the GPU, the Tensor NPU has no runtime compiler in the app: only an
+ahead-of-time compiled graph (`<graph>_g5.tflite`, produced by
+`scripts/aot_tensor_g5.py` through `ai_edge_litert.aot` + the Google Tensor SDK vendor
+backend) can run there, and it is executed by a dispatch shim
+(`libLiteRtDispatch_GoogleTensor.so`, from `litert_npu_runtime_libraries.zip` on the
+matching LiteRT GitHub release) that `dlopen`s the device's own
+`/vendor/lib64/libedgetpu_litert.so`. Shim, Android `litert` runtime and AOT compiler
+must all be the same LiteRT release (2.2.0 here).
+
+Offload (Tensor SDK 2.2.0, `keep_going=False`):
+
+| graph | ops offloaded | output |
+|---|---|---|
+| `pt_flowlm_fused_fp16` | 715 / 715, 1 partition | 172.4 MB |
+| `pt_flowlm_ms4_fp16` | 2785 / 2785, 1 partition | 183.1 MB |
+| `pt_flowlm_ms8_fp16` | 5529 / 5529, 1 partition | 196.0 MB |
+| `pt_mimi_dec_tx_fp16` | 210 / 210, 1 partition | 16.5 MB |
+| `pt_mimi_deconly_fp16` | **fails** in the backend compiler (fp32 too) | — |
+
+fp16 is accepted, and the fp32 flow-LM compiles to the *same* 172.4 MB as the fp16 one —
+the compiler normalizes weight precision itself, so compiling fp32 buys nothing.
+
+### M4/M5 result (Pixel 10, `optim/tensor_g5`)
+
+`docs/bench/2026-09-19-pixel10-optim-tensor_g5-npu-singlestep.txt` (M4) and
+`2026-09-19-pixel10-optim-tensor_g5-npu-multistep.txt` (M5).
+
+| scenario | RTF | LM in/run/read per invocation | corr vs gold |
+|---|---|---|---|
+| gold CPU/CPU/CPU | 0.81× | 143/1858/17 | gold |
+| lm:NPU | 1.29× | 654/1777/55 | 0.4639 |
+| lm:NPU ms4 | 1.18× | 331/2442/79 | 0.4639 |
+| lm:NPU ms8 | 1.21× | 225/2390/33 | 0.4639 |
+| lm:NPU ms4 + dectx:NPU | 1.31× | 310/2362/67 | 0.4638 |
+| lm:CPU + **dectx:NPU** + dec:GPU | **1.53×** | 164/1937/12 | **0.9999** |
+| lm:CPU dectx:CPU dec:GPU | 1.37× | 159/2027/11 | 1.0000 |
+| lm:CPU dectx:GPU dec:GPU | 1.49× | 155/2028/13 | 0.4445 |
+| lm:GPU (shipped) | 0.79× | 1195/115/3765 | 0.7670 |
+| lm:GPU ms4 / ms8 | 0.97× / 1.01× | — | 0.8334 / 0.6235 |
+
+1. **The NPU does not beat XNNPACK for the flow-LM.** Its compute is genuinely faster per
+   frame (17.2 ms vs 20.0 ms micro), but staging the 25.2 MB packed KV into a dispatch
+   buffer costs 6.7 ms against 1.5 ms, so the LM nets out ~1.2× slower. Consistent with the
+   GPU result: the LM is transfer-bound on this device, not FLOP-bound.
+2. **Multi-step makes the NPU worse, not better** (ms1 1.29× → ms4 1.18× → ms8 1.21×;
+   24.4 → 29.4 → 29.2 ms/frame). The opposite of the GPU, where batching amortized the
+   upload. Likely the one-hot write-mask scatter and the 2785/5529-op program are expensive
+   on the EdgeTPU. **Keep N = 1 on the NPU.**
+3. **The real win is the Mimi decoder transformer.** `dectx:NPU` is 131 ms against 489 ms
+   on CPU and 142 ms on GPU — and unlike the GPU delegate, which degrades the decoder
+   audibly (corr 0.4445), the NPU output is faithful (`corr 0.9999`). `lm:CPU dectx:NPU
+   dec:GPU` reaches **1.53× RTF**, better than every previously measured placement
+   (best was 1.49×, and that one had corr 0.4445). `Placement.default` now opts into it on
+   a Pixel-class GPU when both the AOT graph and the dispatch shim are installed.
+4. **LM quality on the NPU is poor** (`corr 0.4639`, length exact, identical for ms1/ms4/ms8
+   and independent of the decoder). The drift is the NPU's own precision, worse than GPU
+   fp16 (0.7670) — so the NPU is not a drop-in for the LM even if its timing were better.
+5. `pt_mimi_deconly` (SEANet, x16 ConvTranspose) is the one graph the backend compiler
+   rejects outright, so the SEANet decoder stays on the GPU.
+
 Commit at every checkpoint (and at any surprising intermediate result); each committed
 benchmark report is immutable — new runs add a file rather than editing an old one.
 

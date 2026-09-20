@@ -96,7 +96,20 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
             // The Mimi decoder transformer defaults to CPU everywhere: its GPU
             // output is audibly degraded (Mali and confirmed on PowerVR), and
             // fp32 does not recover it. force_gpu.txt "dectx" re-enables GPU.
+            //
+            // The Tensor G5 NPU is the one accelerator that is both faster AND
+            // accurate here: 131 ms vs 489 ms on CPU and 142 ms on GPU, at corr
+            // 0.9999 against the CPU gold. Opted into only when the AOT-compiled
+            // graph and the dispatch shim are both actually installed, since an
+            // NPU load of a missing/stock graph cannot fall back.
+            val npuDectx = powerVr && "dectx" !in userCpu &&
+                File(dir, "pt_mimi_dec_tx_fp16_g5.tflite").exists() &&
+                File(
+                    context.applicationInfo.nativeLibraryDir,
+                    "libLiteRtDispatch_GoogleTensor.so",
+                ).exists()
             val dectx = when {
+                npuDectx -> Accel.NPU
                 "dectx" !in forceGpu -> Accel.CPU
                 "dectx" in fp32 -> Accel.GPU32
                 else -> Accel.GPU
