@@ -9,6 +9,10 @@ by-ear test, and it is what the app now loads by default
 (`PocketTtsSynthesizer.LM_INT8`, preferred by `lmGraphFor()` when the file has
 been pushed, with `pt_flowlm_fused_fp16.tflite` as the fallback).
 
+The end-to-end numbers below are the **one-shot** path. The app now streams, which
+re-runs the same LM behind a sliding SEANet window and measures 3.1-3.3x RTF with
+first audio at ~1.2 s — see `streaming.md`. The LM rows here are unaffected.
+
 | | fp16 (`fused_fp16`) | int8 (`dyn8_all`) | |
 |---|---|---|---|
 | LM compute / frame | 19.59 ms | **8.65 ms** | **2.27x** |

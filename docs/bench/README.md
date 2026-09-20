@@ -26,6 +26,9 @@ The verbatim `benchmark.txt` written by `Benchmarker` (also available in logcat 
   ms/frame | A MB in + B MB out per invocation`. For the shipped 1-step graph
   `M == N`; a multi-step graph shows `M == N/step` and the transfer per invocation
   divided by `N/M`.
+- A **streaming** section (M7): one row per SEANet window, each reporting
+  ms/RTF, time to first audio, chunk count, the `lm`/`dec_tx`/`seanet` split, and
+  `corr` + `max|d|` against the one-shot take for that placement.
 - Load-time scenarios and GPU program-cache passes.
 
 Matching `bench_*.wav` files live in the app's filesDir (adb-pullable with

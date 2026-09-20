@@ -158,6 +158,35 @@ Full-graph static int8 turns all 7 inputs and the output int8 and collapses
 fp32 I/O but coarsens activations and stops generation after 3 frames. The exact
 recipe, the rejected variants and the caveats: `int8_lm.md`.
 
+## F. Streaming decode (M7)
+
+The decoder is streaming-clean, so it can run behind the flow-LM instead of
+after it. Two facts make that exact rather than approximate: the SEANet decoder
+is strictly causal (first changed sample is exactly `P*120` for a truncation at
+feature position `P`) with a ~7.6 position left receptive field, and `dec_tx`
+already keeps only the region its 32-frame overlap makes valid. Concatenated
+chunks therefore reproduce the one-shot audio.
+
+The SEANet window also happens to be the cheapest way to run the decoder, so
+streaming improves RTF and time-to-first-audio at once (`lm:CPU dectx:NPU
+dec:GPU`, int8 flow-LM):
+
+| SEANet | utterance | RTF | first audio | chunks | SEANet | flow-LM |
+|---|---|---|---|---|---|---|
+| one-shot (4096) | 2576-2654 ms | 2.15x | 2576 ms | — | 1377-1401 ms | 855-870 ms |
+| **w=512** | **1691-1818 ms** | **3.08-3.31x** | **1179-1307 ms** | 3 | **466-492 ms** | 858-897 ms |
+| w=1024 | 1846-1964 ms | 2.85-3.03x | 1347-1463 ms | 2 | 635-660 ms | 854-873 ms |
+| w=2048 | 1872-1939 ms | 2.89-2.99x | 1870-1937 ms | 1 | 663-686 ms | 847-877 ms |
+
+The flow-LM is unchanged in every row, so its ~0.86 s is the floor for both
+metrics. Against the one-shot audio, `w=512` and `w=1024` measure corr 0.999999 /
+max|d| 1.465e-03 and are **bit-identical to each other**; `w=2048` is bit-exact.
+The identity is what rules the windowing out as the cause of that delta — the GPU
+delegate switches convolution algorithm above ~1024 elements, which reorders the
+fp32 accumulation (rms -73 dBFS, peak -52.5 dBFS, inaudible).
+
+Full detail, the chunk-granularity analysis and the reproduce steps: `streaming.md`.
+
 ## What to keep
 
 - **int8 weights for the flow-LM** (`pt_flowlm_fused_dyn8_all.tflite`) — 2.27x on
@@ -172,6 +201,10 @@ recipe, the rejected variants and the caveats: `int8_lm.md`.
   compute-bound and is penalized by it.
 - **Prefill for the prompt** on GPU; it is the largest single win measured
   (49.6 -> 2.4 ms/token).
+- **Stream through a `w=512` SEANet window** (`pt_mimi_deconly_w512_fp16.tflite`)
+  — 3.1-3.3x RTF and first audio at ~1.2 s instead of ~2.6 s, for a -73 dBFS rms
+  rounding difference from the one-shot take. The app does this by default; use
+  `w=2048` if a bit-exact take is wanted. See `streaming.md`.
 - **Do not** put the flow-LM on the GPU on PowerVR (0.79-1.01x), and do not use
   fp32 compute anywhere (GPU32 is the slowest row in every table).
 
@@ -190,10 +223,12 @@ than as noise or artefacts.
 | `bench/2026-09-19-pixel10-optim-tensor_g5-npu-singlestep.txt` | `optim/tensor_g5` | M4 NPU single-step (own session) |
 | `bench/2026-09-19-pixel10-optim-tensor_g5-npu-multistep.txt` | `optim/tensor_g5` | M5 NPU multi-step (sections A, B, D) |
 | `bench/2026-09-19-pixel10-optim-tensor_g5_int8-4038d13.txt` | `optim/tensor_g5_int8` | M6 int8 flow-LM (section E) |
+| `bench/2026-09-20-pixel10-optim-npu_int8_streaming-0b05d18.txt` | `optim/npu_int8_streaming` | M7 streaming decode (section F) |
 
 Sections A, B and D come from one session and are comparable with each other;
-section C is its own session, M2/M4 are separate sessions again, and section E is
-the M6 session. Do not mix numbers across sections.
+section C is its own session, M2/M4 are separate sessions again, and sections E
+and F are the M6 and M7 sessions. Do not mix numbers across sections.
 
 Design notes, the branch topology and the per-milestone reasoning live in
-`multistep_lm_plan.md`; the int8 decision and recipe live in `int8_lm.md`.
+`multistep_lm_plan.md`; the int8 decision and recipe live in `int8_lm.md`; the
+streaming design lives in `streaming.md`.

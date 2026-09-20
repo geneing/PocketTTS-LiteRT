@@ -24,8 +24,9 @@ pipeline — language model, flow head and codec decoder — runs on the GPU**.
 
 ## Best configuration (Pixel 10, Tensor G5)
 
-Measured on a Pixel 10: **2.16x real-time** — 5.60 s of speech in 2.56 s — against
-0.84x for the all-CPU reference. One command reproduces it:
+Measured on a Pixel 10: **3.1-3.3x real-time** — 5.60 s of speech in ~1.7 s, with
+the first audio out at **~1.2 s** — against 0.84x for the all-CPU reference. One
+command reproduces it:
 
 ```bash
 cd pockettts/
@@ -37,20 +38,22 @@ scripts/reproduce_best.sh push apk   # and gets them onto a phone
 |---|---|---|---|
 | flow-LM (fused step + flow head) | `pt_flowlm_fused_dyn8_all.tflite` | **CPU**, dynamic-range int8 | The step is DRAM-bandwidth-bound, not FLOP-bound: 84.44M weights stream from DRAM every frame while the activations are batch-1. int8 weights cut that traffic 4x, the step 2.27x (19.6 → 8.65 ms/frame), and the file to 82 MB from 161 MB. |
 | Mimi decoder transformer | `pt_mimi_dec_tx_fp16_g5.tflite` | **NPU**, AOT-compiled for Tensor G5 | 131 ms vs 489 ms on CPU and 142 ms on GPU, and unlike the GPU delegate it is faithful to the CPU reference (corr 0.9999). |
-| SEANet decoder | `pt_mimi_deconly_fp16.tflite` | **GPU** | 1.36 s vs 4.6 s on CPU; the GPU output is clean on this stage. |
+| SEANet decoder | `pt_mimi_deconly_w512_fp16.tflite` | **GPU**, sliding 512-position window | Runs behind the LM over a window instead of the full 4096 positions: 0.48 s vs 1.38 s, and audio starts as soon as the first window is decodable. The decoder is strictly causal with a ~8 position left receptive field, so the windowed output matches the full run to backend rounding. |
 
 The app picks this automatically when the files are present — `PocketTtsSynthesizer`
 prefers the int8 flow-LM, `Placement.default` opts into the NPU decoder
 transformer when both the `_g5` graph and the dispatch shim are installed, and
-SEANet defaults to the GPU. `force_cpu.txt` / `force_gpu.txt` / `force_fp32.txt`
-still override. Decisions and rejected variants: `docs/int8_lm.md`; the joint
+SEANet streams through the 512-position window on the GPU, falling back to
+one-shot `pt_mimi_deconly_fp16.tflite` if the window graph is absent.
+`force_cpu.txt` / `force_gpu.txt` / `force_fp32.txt` still override. Decisions and
+rejected variants: `docs/int8_lm.md` and `docs/streaming.md`; the joint
 CPU/GPU/NPU timing tables: `docs/RESULTS.md`.
 
 ### Steps to reproduce the weights
 
 `scripts/reproduce_best.sh` runs all of these in order; each stage also runs alone
-(`build`, `quant`, `aot`, `shim`, `push`, `apk`, `env`, `summary`). All of it must
-run under **Linux or WSL2** — `litert-converter` has no Windows wheel.
+(`build`, `quant`, `stream`, `aot`, `shim`, `push`, `apk`, `env`, `summary`). All
+of it must run under **Linux or WSL2** — `litert-converter` has no Windows wheel.
 
 1. **Reference clone** at the pinned commit:
    ```bash
@@ -71,11 +74,16 @@ run under **Linux or WSL2** — `litert-converter` has no Windows wheel.
    (`ai-edge-litert==2.2.0` + `ai-edge-litert-sdk-google-tensor==2.2.0`, default
    `~/pockettts-aot/.venv`) and writes `pt_mimi_dec_tx_fp16_g5.tflite`. Optional:
    without it `dec_tx` runs on CPU and only that stage slows down.
-6. **Dispatch shim** — `scripts/fetch_google_tensor_dispatch.sh` pulls
+6. **Streaming SEANet windows** — `python scripts/build_pockettts.py stream` exports
+   `pt_mimi_deconly_w{512,1024,2048}{,_fp16}.tflite` (`PT_STREAM_W` overrides the
+   list). Each is a prefix-exact copy of the full 4096-position window on the host;
+   the app streams through the 512 one. Without it the app falls back to one-shot
+   decoding — correct, but audio only starts once the whole utterance is decoded.
+7. **Dispatch shim** — `scripts/fetch_google_tensor_dispatch.sh` pulls
    `libLiteRtDispatch_GoogleTensor.so` from the matching LiteRT release (v2.2.0) into
    `app/src/main/jniLibs/arm64-v8a/`. The shim, the Android `litert` runtime and the
    AOT compiler must all be the same LiteRT release, or the NPU silently never engages.
-7. **Device** — `scripts/install_to_device.sh`, then `./gradlew :app:installDebug`.
+8. **Device** — `scripts/install_to_device.sh`, then `./gradlew :app:installDebug`.
    `ADB=<path>` overrides the adb binary, which is what you need on Windows: the WSL
    adb server cannot see the device.
 
@@ -95,6 +103,7 @@ Every graph is stateless; KV caches, RoPE tables, the token-embedding lookup, th
 | `pt_flowlm_fused_dyn8_all` | the same I/O (int8 weights only, activations still fp32) | **82 MB** |
 | `pt_mimi_dec_tx` | lat[1,65,32] → feat[1,512,1024] | 17 MB |
 | `pt_mimi_deconly` | feat[1,512,4096] → audio[1,1,491520] | 11 MB |
+| `pt_mimi_deconly_w{512,1024,2048}` | feat[1,512,W] → audio[1,1,W*120] — the same decoder over a shorter window, for streaming | 8.3 / 8.6 / 9.3 MB |
 | `pt_flowlm_step` / `pt_flow_head` | the same frame split into two graphs (cond exposed) — reference variant, not loaded by the app | 151 + 18 MB |
 
 The app runs the **fused** frame graph: on Mali the per-frame cost is dispatch/sync-bound,
@@ -175,7 +184,7 @@ For the best configuration, use the one-shot script:
 
 ```bash
 cd pockettts/
-scripts/reproduce_best.sh               # env + base graphs + int8 LM + AOT + shim
+scripts/reproduce_best.sh               # env + base graphs + int8 LM + stream + AOT + shim
 scripts/reproduce_best.sh push apk      # push to the device and install
 ```
 
@@ -188,6 +197,8 @@ cd pockettts/
 PYTHONPATH=/path/to/pocket-tts python scripts/build_pockettts.py all
 # int8 flow-LM for the CPU (the single biggest win: 2.27x on the LM step)
 PYTHONPATH=/path/to/pocket-tts PT_QUANT=dyn8_all python scripts/build_pockettts.py quant
+# sliding-window SEANet decoders, so audio starts during generation
+PYTHONPATH=/path/to/pocket-tts python scripts/build_pockettts.py stream
 # decoder transformer for the Tensor G5 NPU (AOT venv; optional)
 python scripts/aot_tensor_g5.py pt_mimi_dec_tx_fp16
 ./scripts/fetch_google_tensor_dispatch.sh
