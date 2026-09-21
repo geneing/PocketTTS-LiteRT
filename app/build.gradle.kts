@@ -37,8 +37,10 @@ android {
     }
 }
 dependencies {
-    // 2.2.0: latest on Google Maven (2.1.6 pinned earlier for Mali; 2.1.5+
-    // accepts the KV-step FULLY_CONNECTED weight shapes).
-    implementation("com.google.ai.edge.litert:litert:2.2.0")
+    // The reusable engine (brings litert 2.2.0 transitively) and the TTS engine
+    // service. 2.2.0: latest on Google Maven (2.1.6 pinned earlier for Mali;
+    // 2.1.5+ accepts the KV-step FULLY_CONNECTED weight shapes).
+    implementation(project(":pockettts-core"))
+    implementation(project(":pockettts-service"))
     implementation("androidx.core:core-ktx:1.15.0")
 }

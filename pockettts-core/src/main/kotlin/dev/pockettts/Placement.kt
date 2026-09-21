@@ -1,4 +1,4 @@
-package com.pockettts
+package dev.pockettts
 
 import android.content.Context
 import android.opengl.EGL14
@@ -7,8 +7,8 @@ import android.opengl.GLES20
 import java.io.File
 
 /**
- * Where one graph runs: GPU (fp16 weights/compute), GPU at fp32 compute, CPU
- * (XNNPACK), or the Tensor G5 NPU (an AOT-compiled `*_g5.tflite` variant).
+ * Where one graph runs: GPU (fp16), GPU at fp32 compute, CPU (XNNPACK), or the
+ * Google Tensor NPU (an AOT-compiled `*_g5.tflite` variant).
  */
 enum class Accel(val tag: String) {
     GPU("GPU"),
@@ -18,9 +18,9 @@ enum class Accel(val tag: String) {
 }
 
 /**
- * Per-graph accelerator choice. Every graph can be placed independently; the
- * repo's measurements show the best split is device-specific (Mali/Adreno win
- * with the flow-LM on GPU, PowerVR loses badly there).
+ * Per-graph accelerator choice. Every graph is placed independently; the best
+ * split is device-specific (Mali/Adreno win with the flow-LM on GPU, PowerVR
+ * loses badly there, Tensor G5 wins with the decoder transformer on the NPU).
  */
 data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
     val label: String get() = "lm:${lm.tag} dectx:${dectx.tag} dec:${deconly.tag}"
@@ -28,13 +28,13 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
     override fun toString(): String = label
 
     companion object {
-        /** The reference: every graph on CPU. Used as the audio-quality gold. */
+        /** Every graph on CPU — the audio-quality gold. */
         val GOLD = Placement(Accel.CPU, Accel.CPU, Accel.CPU)
 
         /**
          * `GL_RENDERER` of the GPU the LiteRT delegate will use, e.g.
          * "PowerVR DXT-48-1536", "Mali-G715", "Adreno (TM) 740". Empty when no
-         * EGL context can be created (then the GPU default is kept).
+         * EGL context can be created.
          */
         fun renderer(): String = try {
             val d = EGL14.eglGetDisplay(EGL14.EGL_DEFAULT_DISPLAY)
@@ -69,8 +69,14 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
             ""
         }
 
-        /** Parse the force_* override files and apply the device default. */
-        fun default(context: Context): Placement {
+        /**
+         * The device policy. `force_cpu.txt` / `force_gpu.txt` / `force_fp32.txt`
+         * in the app's external files dir override individual graphs (debug knob).
+         *
+         * @param modelDir directory that holds the graphs, used to detect the
+         *   AOT-compiled decoder transformer before opting into the NPU.
+         */
+        fun default(context: Context, modelDir: File): Placement {
             val dir = context.getExternalFilesDir(null)
             fun keys(file: String): Set<String> =
                 File(dir, file).takeIf { it.exists() }
@@ -83,27 +89,18 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
             val powerVr = renderer().contains("PowerVR", ignoreCase = true)
 
             // PowerVR (Tensor G5 / Pixel 10): the OpenCL delegate's per-AR-step
-            // overhead (~500 dispatches plus a 25 MB packed-KV upload and a
-            // 12.6 MB readback) makes the flow-LM ~2.7x SLOWER than XNNPACK
-            // here — 0.81x vs 1.33x real-time, measured. Mali and Adreno still
-            // win with the LM on GPU, so only PowerVR is auto-pinned to CPU.
+            // overhead makes the flow-LM ~2.7x slower than XNNPACK here.
             val lm = when {
                 "lm" in userCpu -> Accel.CPU
                 powerVr && "lm" !in forceGpu -> Accel.CPU
                 "lm" in fp32 -> Accel.GPU32
                 else -> Accel.GPU
             }
-            // The Mimi decoder transformer defaults to CPU everywhere: its GPU
-            // output is audibly degraded (Mali and confirmed on PowerVR), and
-            // fp32 does not recover it. force_gpu.txt "dectx" re-enables GPU.
-            //
-            // The Tensor G5 NPU is the one accelerator that is both faster AND
-            // accurate here: 131 ms vs 489 ms on CPU and 142 ms on GPU, at corr
-            // 0.9999 against the CPU gold. Opted into only when the AOT-compiled
-            // graph and the dispatch shim are both actually installed, since an
-            // NPU load of a missing/stock graph cannot fall back.
+            // The Mimi decoder transformer defaults to CPU: its GPU output is
+            // audibly degraded. The Tensor G5 NPU is both faster and accurate,
+            // opted into only when the AOT graph and dispatch shim are present.
             val npuDectx = powerVr && "dectx" !in userCpu &&
-                File(dir, "pt_mimi_dec_tx_fp16_g5.tflite").exists() &&
+                File(modelDir, PocketTts.g5Variant(PocketTts.DEC_TX)).exists() &&
                 File(
                     context.applicationInfo.nativeLibraryDir,
                     "libLiteRtDispatch_GoogleTensor.so",

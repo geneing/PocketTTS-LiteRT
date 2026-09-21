@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application>
+
+        <!--
+          Exposes the library as an Android text-to-speech engine. The service is
+          exported so the system TTS framework (and any app using TextToSpeech)
+          can bind to it; BIND_TTS_SERVICE keeps it to the system.
+        -->
+        <service
+            android:name="dev.pockettts.service.PocketTtsService"
+            android:exported="true"
+            android:label="@string/pockettts_engine_name"
+            android:permission="android.permission.BIND_TTS_SERVICE">
+            <intent-filter>
+                <action android:name="android.intent.action.TTS_SERVICE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.speech.tts"
+                android:resource="@xml/pockettts_tts_engine" />
+        </service>
+
+    </application>
+
+</manifest>

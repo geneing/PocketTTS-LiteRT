@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Engine metadata pointed at by the TTS_SERVICE declaration. Pocket TTS is fully
+  on-device and streams 24 kHz mono PCM.
+-->
+<tts-engine xmlns:android="http://schemas.android.com/apk/res/android"
+    android:value="pockettts" />

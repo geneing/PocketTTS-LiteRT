@@ -1,4 +1,4 @@
-package com.pockettts
+package dev.pockettts
 
 import java.io.File
 
@@ -13,11 +13,7 @@ import java.io.File
  *   1. Prepend "▁" and replace every space with "▁" (U+2581).
  *   2. Viterbi over the UTF-8 bytes: pick the segmentation with the highest
  *      summed piece score; any byte not covered by a piece falls back to its
- *      `<0xNN>` byte piece at score `min(normal scores) - 10` (SentencePiece's
- *      unknown penalty — byte pieces carry score 0 in the model proto).
- *
- * Verified against `sentencepiece.SentencePieceProcessor.encode` on 613
- * mixed-content strings (all exact) by scripts/build_pockettts.py's mirror.
+ *      `<0xNN>` byte piece at score `min(normal scores) - 10`.
  *
  * The piece table is `pt_tokenizer.tsv`: `id \t type \t score \t piece` with
  * `\t`, `\n` and `\\` escaped in the piece column.
@@ -55,7 +51,6 @@ class SpTokenizer(file: File) {
                     if (key.length > maxLen) maxLen = key.length
                     if (score < minScore) minScore = score
                 }
-                // 2 (unk) and 3 (control) never match raw text
             }
         }
         byteScore = minScore - 10f

@@ -39,14 +39,14 @@ scripts/reproduce_best.sh push apk   # and gets them onto a phone
 | Mimi decoder transformer | `pt_mimi_dec_tx_fp16_g5.tflite` | **NPU**, AOT-compiled for Tensor G5 | 131 ms vs 489 ms on CPU and 142 ms on GPU, and unlike the GPU delegate it is faithful to the CPU reference (corr 0.9999). |
 | SEANet decoder | `pt_mimi_deconly_w512_fp16.tflite` | **GPU**, sliding 512-position window | Runs behind the LM over a window instead of the full 4096 positions: 0.48 s vs 1.38 s, and audio starts as soon as the first window is decodable. The decoder is strictly causal with a ~8 position left receptive field, so the windowed output matches the full run to backend rounding. |
 
-The app picks this automatically when the files are present — `PocketTtsSynthesizer`
+The app picks this automatically when the files are present — `PocketTtsEngine`
 prefers the int8 flow-LM, `Placement.default` opts into the NPU decoder
 transformer when both the `_g5` graph and the dispatch shim are installed, and
 SEANet streams through the 512-position window on the GPU, falling back to
 one-shot `pt_mimi_deconly_fp16.tflite` if the window graph is absent.
 `force_cpu.txt` / `force_gpu.txt` / `force_fp32.txt` still override. Decisions and
 rejected variants: `docs/int8_lm.md` and `docs/streaming.md`; the joint
-CPU/GPU/NPU timing tables: `docs/RESULTS.md`.
+CPU/GPU/NPU timing tables: `docs/RESULTS.md`; the library API: `docs/library.md`.
 
 ### Steps to reproduce the weights
 
@@ -94,7 +94,8 @@ bundle, which carries the fp16 graphs.
 
 Every graph is stateless; KV caches, RoPE tables, the token-embedding lookup, the
 32→1024 latent projection, noise draws and EOS logic live in Kotlin
-(`PocketTtsSynthesizer.kt`) — the dia2/vibevoice packed-KV pattern.
+(`PocketTtsEngine.kt` / `PocketTtsSession.kt` in `:pockettts-core`) — the
+dia2/vibevoice packed-KV pattern.
 
 | graph | I/O | fp16 size |
 |---|---|---|
@@ -215,6 +216,38 @@ Validation table below. Stages run individually (`flowlm`, `head`, `fused`, `dec
 First launch before the push fails with "Missing pt_..." by design; run the app once,
 push, relaunch. Everything (fp16 graphs + assets + 6 voices ≈ 225 MB) loads from the
 app's external files dir.
+
+## Using it as a library
+
+The engine, model delivery and TTS service are a reusable library; `:app` is a thin
+demo on top. Full guide: `docs/library.md`.
+
+| module | what |
+|---|---|
+| `:pockettts-core` | `dev.pockettts` — `PocketTtsEngine`, `PocketTtsSession`, `ModelSource` family |
+| `:pockettts-service` | `PocketTtsService`, an Android `TextToSpeechService` registered by its own manifest |
+| `:app` | demo UI — picks a voice, types text, streams to an `AudioTrack` |
+
+```kotlin
+val engine = PocketTtsEngine(context)          // once per process; compiles the graphs
+val session = engine.newSession("alba")
+
+// streaming, blocking: audio starts during generation
+engine.stream("Hello! I am Pocket TTS.", "alba") { chunk ->
+    track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
+}
+
+// or asynchronous and cancellable, for a voice agent's barge-in
+val u = session.speak("Hello!", listener)
+u.cancel()
+```
+
+Models come from a chained `ModelSource`: an adb-pushed directory first (so
+iterating on a rebuilt graph needs no APK rebuild), then a versioned GitHub release
+with a SHA-256 manifest, optionally bundled assets. `ReleaseModelSource.ensure()`
+downloads only the variants the device's placement needs. Pack and publish with
+`scripts/pack_models.py` + a `gh release create`; test the download path with
+`scripts/serve_models.py` and `adb reverse`.
 
 ## Validation
 

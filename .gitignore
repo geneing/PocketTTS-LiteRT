@@ -10,8 +10,14 @@ local.properties
 # model files are pushed to the device, never committed
 *.tflite
 
+# runtime .so files are fetched, not committed (scripts/fetch_google_tensor_dispatch.sh)
+**/jniLibs/**/*.so
+
 # build outputs of the conversion scripts (models, assets, wavs)
 scripts/out/
+
+# packed release zips built by scripts/pack_models.py (models.json is committed)
+scripts/dist/
 
 # Google Tensor SDK compiler plugin bundle (360 MB, downloaded not committed)
 litert_plugin_compiler.tar.gz

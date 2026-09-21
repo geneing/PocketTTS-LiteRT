@@ -1,0 +1,80 @@
+{
+  "modelVersion": "2026.09",
+  "modelApi": 1,
+  "note": "Pocket TTS LiteRT model packs. Entries are stored uncompressed; sha256/bytes are filled in by pack_models.py.",
+  "variants": [
+    {
+      "name": "base",
+      "zip": "pockettts-base-2026.09.zip",
+      "sha256": "b1866f39b547781beec5cc26c40609554047b7b41782629fe607e1badcfb9407",
+      "bytes": 81410030,
+      "files": [
+        "pt_embed_f16.bin",
+        "pt_input_linear_f32.bin",
+        "pt_bos_input_f32.bin",
+        "pt_neutral_latent_f32.bin",
+        "pt_tokenizer.tsv",
+        "pt_voice_alba.bin",
+        "pt_voice_marius.bin",
+        "pt_voice_javert.bin",
+        "pt_voice_charles.bin",
+        "pt_voice_mary.bin",
+        "pt_voice_eve.bin",
+        "pt_mimi_dec_tx_fp16.tflite",
+        "pt_mimi_deconly_fp16.tflite",
+        "pt_mimi_deconly_w512_fp16.tflite",
+        "pt_mimi_deconly_w1024_fp16.tflite",
+        "pt_mimi_deconly_w2048_fp16.tflite"
+      ]
+    },
+    {
+      "name": "lm-int8",
+      "zip": "pockettts-lm-int8-2026.09.zip",
+      "sha256": "1e3a0a15fca56c43fe2dabc5a9ce9962b28e55172e9127b3009858e91da2cce6",
+      "bytes": 85656304,
+      "files": [
+        "pt_flowlm_fused_dyn8_all.tflite"
+      ]
+    },
+    {
+      "name": "lm-fp16",
+      "zip": "pockettts-lm-fp16-2026.09.zip",
+      "sha256": "3e977187ff99ded63bbda123dd8a4ea3456724490f8d42ac985306087efe9a4c",
+      "bytes": 169234280,
+      "files": [
+        "pt_flowlm_fused_fp16.tflite"
+      ]
+    },
+    {
+      "name": "npu-g5",
+      "zip": "pockettts-npu-g5-2026.09.zip",
+      "sha256": "787d16bd69c265508180ef83c4df1a1c06507607c5bb0aab33736e9738a65b8f",
+      "bytes": 16468108,
+      "files": [
+        "pt_mimi_dec_tx_fp16_g5.tflite"
+      ]
+    },
+    {
+      "name": "lm-quant-variants",
+      "zip": "pockettts-lm-quant-2026.09.zip",
+      "sha256": "PENDING",
+      "bytes": 0,
+      "files": [
+        "pt_flowlm_fused_dyn8_body.tflite",
+        "pt_flowlm_fused_dyn4_all.tflite",
+        "pt_flowlm_fused_st8_body.tflite",
+        "pt_flowlm_fused_wo8_all.tflite"
+      ]
+    },
+    {
+      "name": "lm-multistep",
+      "zip": "pockettts-lm-multistep-2026.09.zip",
+      "sha256": "PENDING",
+      "bytes": 0,
+      "files": [
+        "pt_flowlm_ms4_fp16.tflite",
+        "pt_flowlm_ms8_fp16.tflite"
+      ]
+    }
+  ]
+}

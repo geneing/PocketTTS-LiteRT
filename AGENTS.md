@@ -137,8 +137,20 @@ logic change. Treat the parity numbers, not the checksums, as the contract.
 ./gradlew :app:installDebug
 ```
 
-`install_to_device.sh` pushes the 14 files the synthesizer actually loads
-(`PocketTtsSynthesizer` constants) into
-`/sdcard/Android/data/com.pockettts/files/`. The app can benchmark placements and
-compare audio quality against the CPU/CPU/CPU gold — see the "Benchmark" button
-(or `adb shell am start -n com.pockettts/.MainActivity --ez bench true`).
+The engine, model delivery and TTS service live in the library modules
+(`:pockettts-core`, `:pockettts-service`); `:app` is a thin demo on top. See
+`docs/library.md`. `install_to_device.sh` pushes the files the engine actually
+loads (`PocketTtsEngine` constants in `:pockettts-core`) into
+`/sdcard/Android/data/com.pockettts/files/`, which `PocketTtsModels.default`
+resolves first — that directory source is what makes model iteration a plain
+`adb push` with no APK rebuild.
+
+To distribute models instead, `scripts/pack_models.py` builds the stored zips and
+fills `models.json`; upload them as a `models-<version>` GitHub release, which
+`ReleaseModelSource` then downloads on demand (variants: `base`, `lm-int8`,
+`lm-fp16`, `npu-g5`). `scripts/serve_models.py` + `adb reverse` tests that path
+locally.
+
+The app can benchmark placements and compare audio quality against the
+CPU/CPU/CPU gold — see the "Benchmark" button (or
+`adb shell am start -n com.pockettts/.MainActivity --ez bench true`).

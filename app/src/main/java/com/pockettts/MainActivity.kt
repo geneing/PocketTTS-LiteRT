@@ -13,18 +13,23 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
+import dev.pockettts.PocketTts
+import dev.pockettts.PocketTtsEngine
+import dev.pockettts.Wav
 import java.io.File
 import java.util.concurrent.Executors
 
 /**
  * Minimal Pocket TTS UI: pick a voice, type a sentence, tap Generate, listen.
- * Model load and generation run on a background thread; audio plays via
- * AudioTrack (float PCM) and the last output is saved to filesDir/output.wav.
+ * All model work is the `:pockettts-core` library; this class only drives it and
+ * plays the streamed chunks. Model load and generation run on a background
+ * thread; audio plays via AudioTrack (float PCM) and the last output is saved to
+ * filesDir/output.wav.
  */
 class MainActivity : Activity() {
 
     private val bg = Executors.newSingleThreadExecutor()
-    private var synth: PocketTtsSynthesizer? = null
+    private var engine: PocketTtsEngine? = null
 
     private lateinit var status: TextView
     private lateinit var input: EditText
@@ -54,7 +59,7 @@ class MainActivity : Activity() {
             adapter = ArrayAdapter(
                 this@MainActivity,
                 android.R.layout.simple_spinner_dropdown_item,
-                PocketTtsSynthesizer.VOICES,
+                PocketTts.VOICES,
             )
         }
         button = Button(this).apply { text = "Generate"; isEnabled = false }
@@ -73,17 +78,17 @@ class MainActivity : Activity() {
         setContentView(root)
 
         bg.execute {
-            val s = try {
-                PocketTtsSynthesizer(this)
+            val e = try {
+                PocketTtsEngine(this)
             } catch (e: Throwable) {
                 android.util.Log.e("PocketTTS", "load failed", e)
                 runOnUiThread { status.text = "Load failed: ${e.message}" }
                 return@execute
             }
-            synth = s
-            android.util.Log.i("PocketTTS", "ready (${s.placements})")
+            engine = e
+            android.util.Log.i("PocketTTS", "ready (${e.placements})")
             runOnUiThread {
-                status.text = "Ready (${s.placements})."
+                status.text = "Ready (${e.placements})."
                 button.isEnabled = true
                 benchButton.isEnabled = true
                 runFromIntent(intent)
@@ -96,37 +101,32 @@ class MainActivity : Activity() {
             button.isEnabled = false
             status.text = "Generating…"
             bg.execute {
-                val s = synth ?: return@execute
+                val e = engine ?: return@execute
                 try {
                     // Streaming: play each chunk as the decoder produces it, so
-                    // audio starts during generation instead of after it. Falls
-                    // back to a single chunk when the smaller SEANet graph is not
-                    // installed (synthesizeStream then calls synthesize).
+                    // audio starts during generation. The library falls back to a
+                    // single chunk when the smaller SEANet graph is not installed.
                     val track = streamTrack()
                     track.play()
-                    val r = s.synthesizeStream(text, voice) { chunk ->
+                    val r = e.stream(text, voice) { chunk ->
                         track.write(chunk, 0, chunk.size, AudioTrack.WRITE_BLOCKING)
                     }
                     track.stop()
                     track.release()
                     saveWav(r.audio, voice)
-                    val secs = r.audio.size.toFloat() / PocketTtsSynthesizer.SAMPLE_RATE
-                    // r.ms is wall clock, and the chunk writes block on the audio
-                    // device, so it is throttled to playback rate (~1x by
-                    // construction). The headline number is first audio; the
-                    // unthrottled RTF is what the benchmark measures.
+                    val secs = r.audio.size.toFloat() / PocketTts.SAMPLE_RATE
                     val line = (
                         "Spoke %.1fs (%d frames) in %d ms wall — first audio %d ms, " +
                             "%d chunks (%s)"
                         ).format(
                         secs, r.frames, r.ms,
-                        r.profile.firstChunkMs, r.profile.audioChunks, s.placements,
+                        r.profile.firstChunkMs, r.profile.audioChunks, e.placements,
                     )
                     android.util.Log.i("PocketTTS", line)
                     runOnUiThread {
                         status.text = line
                         button.isEnabled = true
-                        waveform.start(r.audio, PocketTtsSynthesizer.SAMPLE_RATE)
+                        waveform.start(r.audio, PocketTts.SAMPLE_RATE)
                     }
                 } catch (e: Throwable) {
                     android.util.Log.e("PocketTTS", "generation failed", e)
@@ -143,21 +143,21 @@ class MainActivity : Activity() {
             val runs = benchRuns
             bg.execute {
                 // Free the UI model first: each Benchmarker placement loads its own.
-                synth?.close(); synth = null
+                engine?.close(); engine = null
                 try {
                     Benchmarker(this).run(text, voice, runs)
                 } catch (e: Throwable) {
                     android.util.Log.e("PocketTTS", "benchmark failed", e)
                 }
-                val s = try { PocketTtsSynthesizer(this) } catch (e: Throwable) { null }
-                synth = s
+                val e = try { PocketTtsEngine(this) } catch (e: Throwable) { null }
+                engine = e
                 runOnUiThread {
-                    status.text = if (s != null) {
-                        "Benchmark done — see benchmark.txt / logcat. Ready (${s.placements})."
+                    status.text = if (e != null) {
+                        "Benchmark done — see benchmark.txt / logcat. Ready (${e.placements})."
                     } else {
                         "Benchmark done, but model reload failed."
                     }
-                    button.isEnabled = s != null
+                    button.isEnabled = e != null
                     benchButton.isEnabled = true
                 }
             }
@@ -175,7 +175,7 @@ class MainActivity : Activity() {
         i.getStringExtra("text")?.let { t ->
             input.setText(t)
             i.getStringExtra("voice")?.let { v ->
-                val idx = PocketTtsSynthesizer.VOICES.indexOf(v)
+                val idx = PocketTts.VOICES.indexOf(v)
                 if (idx >= 0) voices.setSelection(idx)
             }
         }
@@ -199,27 +199,25 @@ class MainActivity : Activity() {
     }
 
     /**
-     * An AudioTrack in streaming mode, so chunks can be written as the decoder
-     * produces them. The buffer holds a couple of seconds: it only has to cover
-     * the gap between one SEANet window finishing and the next, and the writes
-     * block, which throttles the decoder to playback rate rather than letting
-     * generated audio pile up.
+     * An AudioTrack in streaming mode. The buffer covers the gap between one
+     * SEANet window and the next; the blocking writes throttle the decoder to
+     * playback rate rather than letting generated audio pile up.
      */
     private fun streamTrack(): AudioTrack {
         val attrs = AudioAttributes.Builder()
             .setUsage(AudioAttributes.USAGE_MEDIA)
             .build()
         val fmt = AudioFormat.Builder()
-            .setSampleRate(PocketTtsSynthesizer.SAMPLE_RATE)
+            .setSampleRate(PocketTts.SAMPLE_RATE)
             .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
             .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
             .build()
         val min = AudioTrack.getMinBufferSize(
-            PocketTtsSynthesizer.SAMPLE_RATE,
+            PocketTts.SAMPLE_RATE,
             AudioFormat.CHANNEL_OUT_MONO,
             AudioFormat.ENCODING_PCM_FLOAT,
         )
-        val bytes = maxOf(min, PocketTtsSynthesizer.SAMPLE_RATE * 4 * 2)
+        val bytes = maxOf(min, PocketTts.SAMPLE_RATE * 4 * 2)
         return AudioTrack(
             attrs, fmt, bytes,
             AudioTrack.MODE_STREAM, AudioManager.AUDIO_SESSION_ID_GENERATE,
@@ -229,6 +227,6 @@ class MainActivity : Activity() {
     override fun onDestroy() {
         super.onDestroy()
         bg.shutdownNow()
-        synth?.close()
+        engine?.close()
     }
 }

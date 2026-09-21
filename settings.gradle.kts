@@ -9,3 +9,5 @@ dependencyResolutionManagement {
 }
 rootProject.name = "PocketTTS"
 include(":app")
+include(":pockettts-core")
+include(":pockettts-service")

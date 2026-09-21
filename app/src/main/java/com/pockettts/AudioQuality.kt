@@ -1,5 +1,6 @@
 package com.pockettts
 
+import dev.pockettts.PocketTts
 import kotlin.math.log10
 import kotlin.math.max
 import kotlin.math.min
@@ -30,7 +31,7 @@ object AudioQuality {
         val highBandErrDb: Double,
     )
 
-    private const val SR = PocketTtsSynthesizer.SAMPLE_RATE
+    private const val SR = PocketTts.SAMPLE_RATE
 
     fun compare(ref: FloatArray, cand: FloatArray, maxLag: Int = 128): Metrics {
         val al = align(ref, cand, maxLag)
