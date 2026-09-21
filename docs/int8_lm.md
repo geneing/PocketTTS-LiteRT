@@ -71,8 +71,8 @@ without any change to `PocketTtsSynthesizer`'s step loop.
 
 ```bash
 # in WSL2, conversion venv active (see AGENTS.md)
-PYTHONPATH=$(pwd)/references/pocket-tts PT_OUT=$(pwd)/pockettts/scripts/out \
-    PT_QUANT=dyn8_all python pockettts/scripts/build_pockettts.py quant
+PYTHONPATH=$(pwd)/references/pocket-tts PT_OUT=$(pwd)/scripts/out \
+    PT_QUANT=dyn8_all python scripts/build_pockettts.py quant
 
 ./scripts/install_to_device.sh      # pushes it (it is in EXTRA)
 ./gradlew :app:installDebug         # the app prefers it automatically

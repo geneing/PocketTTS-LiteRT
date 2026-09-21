@@ -29,7 +29,6 @@ the first audio out at **~1.2 s** — against 0.84x for the all-CPU reference. O
 command reproduces it:
 
 ```bash
-cd pockettts/
 scripts/reproduce_best.sh            # writes the weights into scripts/out/
 scripts/reproduce_best.sh push apk   # and gets them onto a phone
 ```
@@ -183,7 +182,6 @@ same KV graph reproduces the batched prompt exactly (causal), but the BOS input 
 For the best configuration, use the one-shot script:
 
 ```bash
-cd pockettts/
 scripts/reproduce_best.sh               # env + base graphs + int8 LM + stream + AOT + shim
 scripts/reproduce_best.sh push apk      # push to the device and install
 ```
@@ -191,7 +189,6 @@ scripts/reproduce_best.sh push apk      # push to the device and install
 By hand, that is:
 
 ```bash
-cd pockettts/
 # graphs + assets + parity (needs a pocket-tts clone on PYTHONPATH and the
 # litert-torch conversion env; downloads the ungated english weights)
 PYTHONPATH=/path/to/pocket-tts python scripts/build_pockettts.py all

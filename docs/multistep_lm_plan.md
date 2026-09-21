@@ -88,7 +88,7 @@ Do this before either spike so results are comparable.
   per-utterance totals; we need per-step and per-invocation numbers to see the amortization.
 - **Per-invocation profile fields.** Extend `PocketTtsSynthesizer.Profile` with invocations
   and bytes-in/out so a multi-step graph reports “invocations” not just “steps”.
-- **Results store.** `pockettts/docs/bench/` (committed): one text report and the matching
+- **Results store.** `docs/bench/` (committed): one text report and the matching
   `bench_*.wav` per run, named `<date>-<device>-<branch>-<shortsha>.txt`. Include the
   placement table, the LM micro-benchmark, and the vs-gold quality block verbatim from
   `Benchmarker`. `benchmark.txt` keeps being written to app filesDir for adb pull; the

@@ -36,8 +36,8 @@
 # cannot run on a native Windows host. Run this from WSL2 (see AGENTS.md).
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # pockettts/
-REPO="$(cd "$ROOT/.." && pwd)"                            # repo root
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # repository root
+REPO="$ROOT"
 OUT="${PT_OUT:-$ROOT/scripts/out}"
 REFS="${PT_REFS:-$REPO/references/pocket-tts}"
 VENV="${PT_VENV:-$HOME/pockettts-conv/.venv}"

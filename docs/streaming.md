@@ -77,8 +77,8 @@ smaller first block would need a dec_tx variant exported at 32 frames.
 
 ```bash
 # in WSL2, conversion venv active (see AGENTS.md)
-PYTHONPATH=$(pwd)/references/pocket-tts PT_OUT=$(pwd)/pockettts/scripts/out \
-    python pockettts/scripts/build_pockettts.py stream     # PT_STREAM_W=512,1024,2048
+PYTHONPATH=$(pwd)/references/pocket-tts PT_OUT=$(pwd)/scripts/out \
+    python scripts/build_pockettts.py stream     # PT_STREAM_W=512,1024,2048
 
 ./scripts/install_to_device.sh      # pushes all three windows
 ./gradlew :app:installDebug         # the app streams through w=512

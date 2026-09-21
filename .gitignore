@@ -1,10 +1,9 @@
 *.iml
 .gradle
-/local.properties
-/.idea
+.idea/
 .DS_Store
-/build
-/captures
+build/
+captures/
 .externalNativeBuild
 .cxx
 local.properties
@@ -16,3 +15,15 @@ scripts/out/
 
 # Google Tensor SDK compiler plugin bundle (360 MB, downloaded not committed)
 litert_plugin_compiler.tar.gz
+
+# kyutai reference clone: fetched by hand, never committed (see AGENTS.md)
+references/
+
+# downloaded model weights
+pockettts_models/
+
+# scratch notebook for the AOT flow, kept local
+LiteRT NPU AOT compilation for Google Tensor.ipynb
+
+# codegraph index
+.codegraph/

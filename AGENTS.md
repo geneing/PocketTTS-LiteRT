@@ -22,11 +22,11 @@ uv venv --python 3.10 .venv && source .venv/bin/activate
 uv pip install torch==2.12.1 --index-url https://download.pytorch.org/whl/cpu
 printf 'torch==2.12.1+cpu\n' > constraints.txt
 uv pip install -c constraints.txt --extra-index-url https://download.pytorch.org/whl/cpu \
-    -e references/pocket-tts -r pockettts/scripts/requirements-convert.txt
+    -e references/pocket-tts -r scripts/requirements-convert.txt
 
-# 3. convert everything (writes pockettts/scripts/out/, gitignored)
-PYTHONPATH=$(pwd)/references/pocket-tts PT_OUT=$(pwd)/pockettts/scripts/out \
-    python pockettts/scripts/build_pockettts.py all
+# 3. convert everything (writes scripts/out/, gitignored)
+PYTHONPATH=$(pwd)/references/pocket-tts PT_OUT=$(pwd)/scripts/out \
+    python scripts/build_pockettts.py all
 ```
 
 No manual model download and no Hugging Face token are needed — the script pulls
@@ -133,7 +133,6 @@ logic change. Treat the parity numbers, not the checksums, as the contract.
 ## Handoff to the Android app
 
 ```bash
-cd pockettts/
 ./scripts/install_to_device.sh                 # default src is scripts/out/ (or pass a dir)
 ./gradlew :app:installDebug
 ```
