@@ -8,7 +8,7 @@ Self Distillation, 1 step — no diffusion loop); a 20M tiny Mimi (×16 ConvTran
 2-layer transformer + SEANet) decodes latents to 24 kHz audio. No FFT anywhere in the
 pipeline, which is exactly why this architecture fits the GPU delegate.
 
-This is the first flow-matching LM in this zoo, and the first TTS here whose **entire
+This was the first flow-matching LM in the parent zoo, and the first TTS there whose **entire
 pipeline — language model, flow head and codec decoder — runs on the GPU**.
 
 | | |
@@ -234,6 +234,22 @@ app's external files dir.
 Voice cloning needs the Mimi *encoder*, and its weights ship only in the **gated**
 [kyutai/pocket-tts](https://huggingface.co/kyutai/pocket-tts) repo — the ungated bundle
 zeroes them. Accepting Kyutai's terms there unlocks the missing piece; the encoder is the
-same SEANet re-authoring as the decoder (the mimi/ module in this zoo already has the
-recipe), plus a per-step replay of the projected latents to warm the KV cache — the graphs
-here would not change.
+same SEANet re-authoring as the decoder (the `mimi/` module in the parent zoo already has
+the recipe), plus a per-step replay of the projected latents to warm the KV cache — the
+graphs here would not change.
+
+## Acknowledgements
+
+Extracted from
+[geneing/LiteRT-Models-Pocket-TTS](https://github.com/geneing/LiteRT-Models-Pocket-TTS),
+the LiteRT model zoo where this conversion and all of its optimization work were
+originally done. That repo is a fork of
+[john-rocky/LiteRT-Models](https://github.com/john-rocky/LiteRT-Models), which established
+the zoo's conventions, the shared Kotlin helpers under `common/` and the per-model
+conversion recipes. Only the `pockettts/` module was carried over, with its full history:
+the milestone branches are preserved here as `optim/*`.
+
+Thanks to [Kyutai](https://kyutai.org/) for
+[Pocket TTS](https://github.com/kyutai-labs/pocket-tts), and to the Google teams behind
+[LiteRT](https://github.com/google-ai-edge/LiteRT) and
+[`litert-torch`](https://github.com/google-ai-edge/litert-torch).
