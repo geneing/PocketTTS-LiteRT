@@ -104,7 +104,8 @@ class PocketTtsService : TextToSpeechService() {
         val t0 = System.nanoTime()
         android.util.Log.i(
             "PocketTTSTime",
-            "service synth: ${text.length} chars voice=${voice.name} rate=$rate pitch=$pitch",
+            "service synth: ${text.length} chars voice=${voice.name} rate=$rate pitch=$pitch " +
+                "maxBuf=${callback.maxBufferSize}",
         )
 
         val session: PocketTtsSession
@@ -146,7 +147,6 @@ class PocketTtsService : TextToSpeechService() {
                     session.cancel()
                 }
             }
-            if (!out.flush(callback)) session.cancel()
             android.util.Log.i(
                 "PocketTTSTime",
                 "service done: ${(System.nanoTime() - t0) / 1_000_000}ms firstAudio=${firstAudio}ms",
@@ -163,43 +163,32 @@ class PocketTtsService : TextToSpeechService() {
     }
 
     /**
-     * Buffers the decoded (and rate-shaped) float chunks into the chunk size the
-     * framework allows, so the size handed to [SynthesisCallback.audioAvailable]
-     * does not depend on the SEANet window and never exceeds
-     * [SynthesisCallback.getMaxBufferSize]. A partial chunk is held until it
-     * fills; [flush] emits the tail.
+     * Converts decoded (and rate-shaped) float PCM into 16-bit blocks the
+     * framework accepts. Every block of at most
+     * [SynthesisCallback.getMaxBufferSize] bytes is handed to
+     * [SynthesisCallback.audioAvailable] as soon as it is assembled, so nothing
+     * is held back waiting for a full buffer.
      */
-    private class PcmBuffer(private val sizeBytes: Int) {
-        private val buf = ByteArray(sizeBytes)
-        private var n = 0
+    private class PcmBuffer(sizeBytes: Int) {
+        // A sample is 2 bytes. Keep the buffer even so every block is whole
+        // samples; an odd framework max would otherwise strand the last byte.
+        private val buf = ByteArray(sizeBytes - sizeBytes % 2)
 
         /** Feed [audio]; returns false when the framework stopped the utterance. */
         fun put(audio: FloatArray, callback: SynthesisCallback): Boolean {
             var i = 0
             while (i < audio.size) {
-                val room = (buf.size - n) / 2
-                val take = minOf(room, audio.size - i)
-                var o = n
+                val take = minOf(buf.size / 2, audio.size - i)
+                var o = 0
                 for (j in i until i + take) {
                     val s = (audio[j].coerceIn(-1f, 1f) * 32767f).toInt()
                     buf[o++] = (s and 0xFF).toByte()
                     buf[o++] = ((s shr 8) and 0xFF).toByte()
                 }
                 i += take
-                n = o
-                if (n == buf.size) {
-                    if (callback.audioAvailable(buf, 0, n) == TextToSpeech.STOPPED) return false
-                    n = 0
-                }
+                if (callback.audioAvailable(buf, 0, o) == TextToSpeech.STOPPED) return false
             }
             return true
-        }
-
-        fun flush(callback: SynthesisCallback): Boolean {
-            if (n == 0) return true
-            val ok = callback.audioAvailable(buf, 0, n) != TextToSpeech.STOPPED
-            n = 0
-            return ok
         }
     }
 
