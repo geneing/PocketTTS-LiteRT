@@ -34,8 +34,13 @@ object PocketTts {
      * time-to-first-audio scale with the sentence up to 64 frames; starting at
      * [F_FIRST] keeps it flat. Must be >= 2 so the next block has a previous
      * frame to seed it.
+     *
+     * It must also be big enough that the first window's audio outlasts the wait
+     * for the canonical [F_BLK] block, otherwise playback starves: at 1.5x,
+     * `F_FIRST` frames of output (~53 ms each) must cover `F_BLK - F_FIRST`
+     * frames of LM time (~43 ms each), so [F_FIRST] = [F_HOP] leaves margin.
      */
-    const val F_FIRST = 8
+    const val F_FIRST = F_HOP
     const val S_BLK = F_BLK * UPS
     const val DEC_FRAMES = 256       // one-shot deconly window frames
     const val S_DEC = DEC_FRAMES * UPS

@@ -12,6 +12,7 @@ import dev.pockettts.PocketTtsModels
 import dev.pockettts.PocketTtsSession
 import dev.pockettts.Voice as TtsVoice
 import java.util.Locale
+import java.util.concurrent.ArrayBlockingQueue
 
 /**
  * Android text-to-speech engine backed by Pocket TTS. Declared by this module's
@@ -124,7 +125,34 @@ class PocketTtsService : TextToSpeechService() {
         current = session
 
         // audioAvailable() must never receive more than this many bytes.
-        val out = PcmBuffer(callback.maxBufferSize.coerceAtLeast(2))
+        val out = PcmBuffer(callback.maxBufferSize.coerceAtLeast(2), t0)
+
+        // Generate on a worker and drain the queue here. audioAvailable() blocks
+        // while the framework's playback buffer is full; if that happened on the
+        // generation thread the LM could not start the next decoder block until
+        // the current window had drained, so playback underran between windows.
+        // The queue lets the LM run ahead and have the next block ready in time.
+        val queue = ArrayBlockingQueue<FloatArray>(QUEUE_CHUNKS)
+        val sentinel = FloatArray(0)
+        var producerError: Throwable? = null
+        val producer = Thread({
+            try {
+                session.stream(text) { queue.put(it) }
+            } catch (e: Throwable) {
+                producerError = e
+            } finally {
+                // Always unblock the consumer, even after cancel or failure.
+                while (true) {
+                    try {
+                        queue.put(sentinel)
+                        break
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                }
+            }
+        }, "pockettts-tts").apply { isDaemon = true }
+
         var failed = false
         var firstAudio = -1L
         try {
@@ -133,7 +161,12 @@ class PocketTtsService : TextToSpeechService() {
             ) {
                 return
             }
-            session.stream(text) { chunk ->
+            producer.start()
+            var stopped = false
+            while (true) {
+                val chunk = queue.take()
+                if (chunk === sentinel) break
+                if (stopped) continue
                 if (firstAudio < 0) {
                     firstAudio = (System.nanoTime() - t0) / 1_000_000
                     android.util.Log.i(
@@ -142,20 +175,27 @@ class PocketTtsService : TextToSpeechService() {
                     )
                 }
                 // The framework stops calling back once the utterance is
-                // stopped or done; stop generating as soon as it does.
+                // stopped or done; stop generating then, but keep draining so
+                // the producer can reach its sentinel.
                 if (callback.hasFinished() == true || !out.put(chunk, callback)) {
                     session.cancel()
+                    stopped = true
                 }
             }
+            producerError?.let { throw it }
             android.util.Log.i(
                 "PocketTTSTime",
                 "service done: ${(System.nanoTime() - t0) / 1_000_000}ms firstAudio=${firstAudio}ms",
             )
         } catch (e: Throwable) {
             failed = true
+            session.cancel()
             android.util.Log.e(TAG, "synthesis failed", e)
+            // Let the producer finish so the join below cannot hang.
+            runCatching { while (queue.take() !== sentinel) { /* drain */ } }
         } finally {
             current = null
+            producer.join(5_000)
             // done() is mandatory once start() succeeded, errors included.
             callback.done()
             if (failed) callback.error(ERROR_SYNTHESIS)
@@ -169,10 +209,12 @@ class PocketTtsService : TextToSpeechService() {
      * [SynthesisCallback.audioAvailable] as soon as it is assembled, so nothing
      * is held back waiting for a full buffer.
      */
-    private class PcmBuffer(sizeBytes: Int) {
+    private class PcmBuffer(sizeBytes: Int, private val t0: Long) {
         // A sample is 2 bytes. Keep the buffer even so every block is whole
         // samples; an odd framework max would otherwise strand the last byte.
         private val buf = ByteArray(sizeBytes - sizeBytes % 2)
+        private var calls = 0
+        private var bytes = 0L
 
         /** Feed [audio]; returns false when the framework stopped the utterance. */
         fun put(audio: FloatArray, callback: SynthesisCallback): Boolean {
@@ -186,7 +228,14 @@ class PocketTtsService : TextToSpeechService() {
                     buf[o++] = ((s shr 8) and 0xFF).toByte()
                 }
                 i += take
-                if (callback.audioAvailable(buf, 0, o) == TextToSpeech.STOPPED) return false
+                val stopped = callback.audioAvailable(buf, 0, o) == TextToSpeech.STOPPED
+                bytes += o
+                android.util.Log.i(
+                    "PocketTTSTime",
+                    "  audioAvailable#${++calls} ${o}B total=${bytes}B " +
+                        "at ${(System.nanoTime() - t0) / 1_000_000}ms",
+                )
+                if (stopped) return false
             }
             return true
         }
@@ -317,5 +366,11 @@ class PocketTtsService : TextToSpeechService() {
 
         /** `TextToSpeech.Engine.DEFAULT_PITCH`, the percentage "no preference" value. */
         private const val DEFAULT_PITCH = 100
+
+        /**
+         * Decoded chunks the producer may run ahead of the framework. Two would
+         * cover the decode gap; a few more absorb jitter without much memory.
+         */
+        private const val QUEUE_CHUNKS = 8
     }
 }

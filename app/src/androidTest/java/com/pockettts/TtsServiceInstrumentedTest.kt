@@ -97,6 +97,32 @@ class TtsServiceInstrumentedTest {
         throw AssertionError("no pockettts voice; engine=${tts.defaultEngine} voices=${tts.voices}")
     }
 
+    /**
+     * Diagnostic: speak through the framework (real AudioTrack playback, so
+     * `audioAvailable` can block) and log when chunks are produced vs consumed
+     * under the `PocketTTSTime` tag.
+     */
+    @Test
+    fun speakTiming() {
+        val tts = connect()
+        try {
+            tts.voice = waitForPocketTtsVoice(tts)
+            tts.setSpeechRate(1.5f)
+            val done = CountDownLatch(1)
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) = Unit
+                override fun onDone(utteranceId: String?) { done.countDown() }
+                @Deprecated("deprecated in Java")
+                override fun onError(utteranceId: String?) { done.countDown() }
+                override fun onError(utteranceId: String?, errorCode: Int) { done.countDown() }
+            })
+            tts.speak(SPEAK_TEXT, TextToSpeech.QUEUE_FLUSH, null, "speak")
+            assertTrue("speak timed out", done.await(120, TimeUnit.SECONDS))
+        } finally {
+            tts.shutdown()
+        }
+    }
+
     @Test
     fun rateAndPitchAreIndependent() {
         val tts = connect()
@@ -206,5 +232,9 @@ class TtsServiceInstrumentedTest {
         const val ENGINE = "com.pockettts"
         const val SAMPLE_RATE = 24000
         const val TEXT = "The quick brown fox jumps over the lazy dog, and then it rests."
+        const val SPEAK_TEXT =
+            "Hello! I am Pocket TTS, a tiny hundred million parameter model speaking to you " +
+                "from this phone. The quick brown fox jumps over the lazy dog, and then it " +
+                "rests for a while before it runs again."
     }
 }
