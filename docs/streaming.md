@@ -44,14 +44,18 @@ for every `L >= 8` with real dec_tx features at `W` = 512/1024/2048.
 blocks incrementally as frames arrive is the same arithmetic as running them all
 at the end. Later blocks fire as soon as 32 more frames exist.
 
-The first block is special: it is *causal* (sliding-window transformer, ~31-frame
-left receptive field), so running it with fewer than 64 real frames and neutral
-padding produces exactly the same output for the frames that do exist. It
-therefore fires as soon as `F_FIRST = 8` frames are available, and the SEANet
-window (also strictly causal) emits a **partial** first window immediately. That
-keeps time-to-first-audio flat instead of scaling with the sentence up to 64
-frames. A block that cannot yet seed a 32-frame overlap reruns block 0, which is
-free of consequences because the recomputed prefix is bit-identical.
+The first block is special: the decoder is *causal* (sliding-window transformer,
+~31-frame left receptive field), so running a block with fewer than 64 real frames
+and neutral padding yields the same output on the frames that exist. The streaming
+path therefore runs an early preview block at `F_FIRST = 8` frames and lets the
+(also strictly causal) SEANet emit a **partial** first window, so playback starts
+after `F_FIRST` frames instead of 64. The next block is deliberately *not* slid
+from the resulting negative offset — an intermediate rerun changes which frames
+each block contributes and, through fp16 block-boundary rounding, pushes
+one-shot parity from ~1.5e-3 to ~2.5e-2. Instead the decoder waits for the
+canonical `F_BLK = 64` first block; only frames `0..F_FIRST-1` come from the
+preview, and everything after matches the original block chain exactly (measured
+parity stays at the documented ~1.5e-3 / relDb ~ -59 dB).
 
 The result: the first audio chunk lands after the LM has produced `F_FIRST`
 frames, not 64.
@@ -78,10 +82,11 @@ bit-exact take is ever wanted.
 The first chunk is `F_FIRST = 8` frames (0.64 s) so playback can start early; the
 SEANet then slides by `w - STREAM_L` positions (2.56 s at `w=512`) and the tail is
 whatever remains. Time-to-first-audio is dominated by the LM work for the prompt
-plus those 8 frames, not by the decoder, so it is constant across sentence
-lengths. The 64-frame `dec_tx` graph is still invoked (with neutral padding) for
-that first block; a dedicated 8- or 32-frame export would trim the wasted compute
-but not the latency.
+plus those 8 frames, not by the decoder, so it is flat across sentence lengths
+(only the prompt grows with the text). The 64-frame `dec_tx` graph is invoked
+twice up front — once as the neutral-padded preview, once as the canonical
+64-frame block — so a dedicated small export would trim that redundant work but
+not the latency.
 
 ## Reproduce
 

@@ -663,10 +663,12 @@ class PocketTtsSession internal constructor(
                 if (start >= 1) {
                     block(n, start, lats[start - 1])
                 } else {
-                    // Fewer than F_HOP frames are valid so far; rerun the first
-                    // block once more frames exist. It is causal, so the
-                    // recomputed prefix is identical and any audio already
-                    // emitted for it stays valid.
+                    // The first block kept fewer than F_HOP frames, so there is
+                    // no valid previous frame to seed a hop. Wait for the
+                    // canonical F_BLK-wide first block rather than sliding from
+                    // a negative offset; it supersedes the early preview
+                    // features for everything not already emitted.
+                    if (!final && n < PocketTts.F_BLK) break
                     block(n, 0, engine.neutral)
                 }
             }

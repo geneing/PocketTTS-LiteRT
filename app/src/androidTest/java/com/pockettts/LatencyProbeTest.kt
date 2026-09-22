@@ -7,12 +7,17 @@ import dev.pockettts.Placement
 import dev.pockettts.PocketTtsConfig
 import dev.pockettts.PocketTtsEngine
 import dev.pockettts.PocketTtsModels
+import dev.pockettts.sonicStretch
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import kotlin.math.abs
 
-/** Temporary: measures time-to-first-audio vs sentence length and rate, and
- *  checks the streaming audio still matches the one-shot take. */
+/**
+ * Device harness for streaming: logs time-to-first-audio vs sentence length and
+ * rate, and asserts the streamed audio still matches the one-shot take.
+ */
 @RunWith(AndroidJUnit4::class)
 class LatencyProbeTest {
 
@@ -36,7 +41,7 @@ class LatencyProbeTest {
             PocketTtsConfig(models, Placement.default(ctx, dir), noiseSeed = 42L),
         )
         for ((label, text) in texts) {
-            for (rate in listOf(1f, 0.5f)) {
+            for (rate in listOf(1f, 1.4f, 1.5f)) {
                 val session = engine.newSession("alba")
                 session.rate = rate
                 var chunks = 0
@@ -56,10 +61,40 @@ class LatencyProbeTest {
             val streamed = engine.newSession("alba").use { it.stream(text) {}.audio }
             val n = minOf(oneShot.size, streamed.size)
             var maxD = 0f
-            for (i in 0 until n) maxD = maxOf(maxD, abs(oneShot[i] - streamed[i]))
+            var diffSq = 0.0
+            var sigSq = 0.0
+            var dot = 0.0
+            for (i in 0 until n) {
+                val d = (oneShot[i] - streamed[i]).toDouble()
+                maxD = maxOf(maxD, abs(oneShot[i] - streamed[i]))
+                diffSq += d * d
+                sigSq += oneShot[i].toDouble() * oneShot[i]
+                dot += oneShot[i].toDouble() * streamed[i]
+            }
+            val rmsDiff = kotlin.math.sqrt(diffSq / n)
+            val rmsSig = kotlin.math.sqrt(sigSq / n)
+            val relDb = 20 * kotlin.math.log10(rmsDiff / rmsSig)
             Log.i(
                 "Probe",
-                "parity $label: oneShot=${oneShot.size} streamed=${streamed.size} max|d|=$maxD",
+                "parity $label: oneShot=${oneShot.size} streamed=${streamed.size} max|d|=$maxD " +
+                    "rmsDiff=$rmsDiff rmsSig=$rmsSig relDb=$relDb",
+            )
+            assertEquals("parity $label length", oneShot.size, streamed.size)
+            assertTrue("parity $label relDb $relDb", relDb < -40.0)
+        }
+        // The streaming Sonic path should match shaping the one-shot take.
+        for ((label, text) in texts) {
+            val oneShot = engine.newSession("alba").use { it.synthesize(text).audio }
+            val shaped = sonicStretch(oneShot, 1.5f)
+            val session = engine.newSession("alba")
+            session.rate = 1.5f
+            val streamed = session.use { it.stream(text) {}.audio }
+            val n = minOf(shaped.size, streamed.size)
+            var maxD = 0f
+            for (i in 0 until n) maxD = maxOf(maxD, abs(shaped[i] - streamed[i]))
+            Log.i(
+                "Probe",
+                "rate1.5 $label: oneShotShaped=${shaped.size} streamed=${streamed.size} max|d|=$maxD",
             )
         }
         engine.close()
