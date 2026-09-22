@@ -28,19 +28,16 @@ object PocketTts {
     const val F_BLK = 64             // dec_tx block payload frames
     const val F_HOP = 32             // dec_tx block hop
     /**
-     * Frames the *first* dec_tx block waits for. The graph is 64 frames wide, but
-     * the block is causal (sliding-window, ~31-frame receptive field), so it can
-     * run with fewer real frames and neutral padding. Starting at 64 makes
-     * time-to-first-audio scale with the sentence up to 64 frames; starting at
-     * [F_FIRST] keeps it flat. Must be >= 2 so the next block has a previous
-     * frame to seed it.
-     *
-     * It must also be big enough that the first window's audio outlasts the wait
-     * for the canonical [F_BLK] block, otherwise playback starves: at 1.5x,
-     * `F_FIRST` frames of output (~53 ms each) must cover `F_BLK - F_FIRST`
-     * frames of LM time (~43 ms each), so [F_FIRST] = [F_HOP] leaves margin.
+     * Emitted audio chunk sizes (frames) while ramping up, before the steady
+     * window. The first entry is also how long the first dec_tx block waits, so
+     * it is the time-to-first-audio knob. Small early chunks start playback
+     * sooner, but each has to outlast the wait for the next or playback starves,
+     * so the sizes grow. The cumulative targets (8, 16, 32, 48, 64, 96, 128,
+     * 160, 224) deliberately land on frame 0 up to [F_BLK] and on [F_HOP]
+     * multiples after, so the dec_tx stays on the canonical block chain the
+     * one-shot decode uses and the streaming audio keeps matching it.
      */
-    const val F_FIRST = F_HOP
+    val STREAM_RAMP = intArrayOf(8, 8, 16, 16, 16, 32, 32, 32, 64)
     const val S_BLK = F_BLK * UPS
     const val DEC_FRAMES = 256       // one-shot deconly window frames
     const val S_DEC = DEC_FRAMES * UPS

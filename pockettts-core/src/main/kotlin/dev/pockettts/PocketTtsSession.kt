@@ -624,49 +624,54 @@ class PocketTtsSession internal constructor(
         private var kept = 0
         private var featPos = 0
         private var emitted = 0
+
+        /** Next emission target in frames: cumulative chunk sizes. */
+        private var emitAt = PocketTts.STREAM_RAMP[0]
+        private var ramp = 1
+
+        /** Largest chunk one SEANet window can add: window minus its left context. */
+        private val maxHop = (engine.streamW - PocketTts.STREAM_L) / PocketTts.UPS
         var chunks = 0
             private set
 
         fun push(lat: FloatArray) {
             if (cancelled) return
             lats.add(lat)
-            advance(final = false)
-            val w = engine.streamW
-            // Emit the first window as soon as the first block exists: a partial
-            // window is exact because the SEANet is causal. After that, slide by
-            // w - STREAM_L as before.
-            while (featPos > emitted &&
-                (emitted == 0 || featPos - emitted >= w - PocketTts.STREAM_L)
-            ) {
+            val n = lats.size
+            // Decode up to each emission target as the LM reaches it and emit at
+            // once: a partial window is exact because the SEANet is causal, and
+            // the growing chunk sizes keep playback fed without stalling on a
+            // full window.
+            while (!cancelled && kept < n && n >= emitAt) {
+                decodeTo(emitAt)
                 emitWindow()
+                emitAt += nextChunk()
             }
         }
 
         fun flush() {
-            advance(final = true)
+            val n = lats.size
+            while (kept < n && !cancelled) decodeTo(n)
             while (featPos > emitted && !cancelled) emitWindow()
         }
 
-        private fun advance(final: Boolean) {
-            val n = lats.size
-            if (n == 0) return
-            if (kept == 0) {
-                if (n < PocketTts.F_FIRST && !final) return
-                block(n, 0, engine.neutral)
-            }
-            while (kept < n && (final || n - kept >= PocketTts.F_HOP)) {
-                val start = kept - PocketTts.F_HOP
-                if (start >= 1) {
-                    block(n, start, lats[start - 1])
-                } else {
-                    // The first block kept fewer than F_HOP frames, so there is
-                    // no valid previous frame to seed a hop. Wait for the
-                    // canonical F_BLK-wide first block rather than sliding from
-                    // a negative offset; it supersedes the early preview
-                    // features for everything not already emitted.
-                    if (!final && n < PocketTts.F_BLK) break
-                    block(n, 0, engine.neutral)
-                }
+        /** Next chunk size: the ramp while it lasts, then the steady window. */
+        private fun nextChunk(): Int {
+            if (ramp >= PocketTts.STREAM_RAMP.size) return maxHop
+            return PocketTts.STREAM_RAMP[ramp++]
+        }
+
+        /** Run dec_tx blocks until [target] frames are decoded. */
+        private fun decodeTo(target: Int) {
+            while (kept < target && !cancelled) {
+                // Canonical block chain: frame 0 while the prefix is at most
+                // F_BLK (whole prefix present, so exact), then slide F_HOP back
+                // exactly like the one-shot decode, so the streaming features
+                // match it instead of drifting through fp16 boundary rounding.
+                val start = if (target <= PocketTts.F_BLK) 0
+                else (kept - PocketTts.F_HOP).coerceAtLeast(0)
+                val prev = if (start >= 1) lats[start - 1] else engine.neutral
+                block(target, start, prev)
             }
         }
 

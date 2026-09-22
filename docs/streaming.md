@@ -47,20 +47,23 @@ at the end. Later blocks fire as soon as 32 more frames exist.
 The first block is special: the decoder is *causal* (sliding-window transformer,
 ~31-frame left receptive field), so running a block with fewer than 64 real frames
 and neutral padding yields the same output on the frames that exist. The streaming
-path therefore runs an early preview block at `F_FIRST = F_HOP = 32` frames and
-lets the (also strictly causal) SEANet emit a **partial** first window, so playback
-starts after 32 frames instead of 64. The next block is deliberately *not* slid
-from the resulting negative offset — an intermediate rerun changes which frames
-each block contributes and, through fp16 block-boundary rounding, pushes one-shot
-parity from ~1.5e-3 to ~2.5e-2. Instead the decoder waits for the canonical
-`F_BLK = 64` first block; only frames `0..F_FIRST-1` come from the preview, and
-everything after matches the original block chain exactly (measured parity stays
-at the documented ~1.5e-3 / relDb ~ -59 dB).
+path therefore runs a **ramp** of frame-0 blocks — `STREAM_RAMP = 8, 8, 16, 16,
+16, 32, 32, 32, 64` frames — and lets the (also strictly causal) SEANet emit a
+**partial** window at each target, so playback starts after `8` frames instead of
+64. The cumulative targets (`8, 16, 32, 48, 64, 96, 128, 160, 224`) deliberately
+land on frame 0 up to `F_BLK` and on `F_HOP` multiples after, so once the ramp
+reaches 64 the decoder continues with the canonical `F_HOP` block chain and the
+streaming features stay on the same arithmetic as the one-shot decode (measured
+parity stays at ~1.5e-3 / relDb ~ -59 dB). Sliding a block from a non-canonical
+offset instead changes which frames each block contributes and, through fp16
+block-boundary rounding, pushes parity to ~2.5e-2 — so the ramp never does that.
 
-`F_FIRST` is not just a latency knob: the first window's audio has to outlast the
-wait for the canonical 64-frame block, or playback underruns. At `1.5x`, 32 frames
-of output are ~1.7 s against ~0.9 s of LM time for the next 32 frames, which is the
-margin. A smaller preview starts sooner but starves.
+Each chunk has to outlast the wait for the next or playback starves. At `1.5x` a
+frame of output is ~53 ms against ~36 ms of LM time, so a chunk of `h` frames
+covers a hop of up to ~`1.5h` frames. The ramp keeps every hop within that except
+the `8 -> 16` step, which is ~150 ms short on the Pixel 10 (a brief underrun);
+inserting an 8-frame hop there (`8, 8, 8, 16, ...`) removes it at the cost of one
+more SEANet run.
 
 The service also runs generation on a worker thread and drains a queue on the
 framework thread (`PocketTtsService`): `audioAvailable()` blocks while the
@@ -68,8 +71,7 @@ playback buffer is full, and if that happened on the generation thread the LM
 could not begin the next block until the current window had drained. With the
 worker, chunk *n+1* is ready before chunk *n* finishes playing.
 
-The result: the first audio chunk lands after the LM has produced `F_FIRST`
-frames, not 64.
+The result: the first audio chunk lands after the LM has produced 8 frames, not 64.
 
 ## Where the `max|d| 1.465e-03` comes from
 
@@ -90,15 +92,14 @@ bit-exact take is ever wanted.
 
 ## Granularity
 
-The first chunk is `F_FIRST = 32` frames (2.56 s at 1x, 1.7 s at 1.5x) so playback
-starts early but does not starve while the next block is generated; the SEANet
-then slides by `w - STREAM_L` positions (2.56 s at `w=512`) and the tail is
-whatever remains. Time-to-first-audio is dominated by the LM work for the prompt
-plus those 32 frames, not by the decoder, so it is flat across sentence lengths
-(only the prompt grows with the text). The 64-frame `dec_tx` graph is invoked
-twice up front — once as the neutral-padded preview, once as the canonical
-64-frame block — so a dedicated small export would trim that redundant work but
-not the latency.
+The first chunk is `8` frames (0.64 s at 1x, 0.43 s at 1.5x) so playback starts
+early; the ramp then grows the chunks to 16/32/64 frames and the SEANet slides by
+`w - STREAM_L` positions (2.56 s at `w=512`) with the tail whatever remains.
+Time-to-first-audio is dominated by the LM work for the prompt plus those 8
+frames, not by the decoder, so it is flat across sentence lengths (only the prompt
+grows with the text). The 64-frame `dec_tx` graph is invoked once per ramp target
+plus once per `F_HOP` after that, so the small early chunks cost a few extra
+invocations but buy ~0.5 s of latency.
 
 ## Reproduce
 
