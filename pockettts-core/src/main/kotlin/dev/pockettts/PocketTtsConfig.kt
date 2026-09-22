@@ -22,20 +22,6 @@ class PocketTtsConfig(
     val streamW: Int = PocketTts.STREAM_W,
     /** When set, every synthesis reseeds the noise RNG so repeats are identical. */
     val noiseSeed: Long? = null,
-    /**
-     * EXPERIMENTAL, off by default. Reuse the flow-LM KV cache across the
-     * sentences of one utterance instead of resetting to the voice prefix, so a
-     * sentence conditions on the previous ones. The cache is a fixed
-     * [PocketTts.PMAX]-position buffer, not a growing one, and a sentence that
-     * would not fit is generated after a reset, so reuse cannot overflow.
-     *
-     * Tried on device and it does not work: with a prior sentence's audio in the
-     * KV the model emits EOS at the first step, so the next sentence collapses
-     * to ~3 frames. The EOS tail is trimmed from the context, which does not
-     * help. Left here as a switch for further experiments; the production path
-     * is the per-sentence reset.
-     */
-    val keepContext: Boolean = false,
     /** When set, GPU graphs serialize their compiled program cache here. */
     val gpuCache: File? = null,
     /**

@@ -284,10 +284,10 @@ class PocketTtsSession internal constructor(
         loadVoice(voice)
         val audio = ArrayList<FloatArray>()
         var frames = 0
-        for ((ci, chunk) in splitIntoBestSentences(text).withIndex()) {
+        for (chunk in splitIntoBestSentences(text)) {
             val (prepared, eosGuess) = prepareTextPrompt(chunk)
             val ids = engine.tokenizer.encode(prepared)
-            val latents = generateChunk(ids, framesAfterEos = eosGuess + 2, continuation = ci > 0)
+            val latents = generateChunk(ids, framesAfterEos = eosGuess + 2)
             android.util.Log.i("PocketTTS", "chunk: ${ids.size} tokens -> ${latents.size} frames")
             frames += latents.size
             sPrompt += ids.size; sFrames += latents.size; sChunks++
@@ -339,9 +339,7 @@ class PocketTtsSession internal constructor(
                 }
             }
             val genT = System.nanoTime()
-            val lats = generateChunk(ids, framesAfterEos = eosGuess + 2, continuation = ci > 0) {
-                dec.push(it)
-            }
+            val lats = generateChunk(ids, framesAfterEos = eosGuess + 2) { dec.push(it) }
             val genMs = (System.nanoTime() - genT) / 1_000_000
             val flushT = System.nanoTime()
             dec.flush()
@@ -529,26 +527,12 @@ class PocketTtsSession internal constructor(
     private fun generateChunk(
         ids: IntArray,
         framesAfterEos: Int,
-        continuation: Boolean = false,
         sink: ((FloatArray) -> Unit)? = null,
     ): List<FloatArray> {
-        val estimate = ceil(
-            (ids.size / PocketTts.TOKENS_PER_SECOND + PocketTts.GEN_SECONDS_PADDING) *
-                PocketTts.FRAME_RATE,
-        ).toInt()
-        // Reuse the previous sentences' KV only when this one fits the fixed
-        // PMAX capacity; otherwise fall back to the voice prefix. The cache can
-        // fill but never grow past PMAX, because this check resets first.
-        val keep = continuation && engine.config.keepContext &&
-            pos + ids.size + estimate <= PMAX - 1
-        if (!keep) resetToVoice()
-        android.util.Log.i(
-            "PocketTTSTime",
-            "generateChunk: ${ids.size} tokens, est=$estimate, pos=$pos, keep=$keep",
-        )
-        val basePos = pos
+        resetToVoice()
         for (id in ids) step(embRow(id), zeroNoise)
-        val maxGen = minOf(estimate, PMAX - pos - 1)
+        val estimate = ceil((ids.size / PocketTts.TOKENS_PER_SECOND + PocketTts.GEN_SECONDS_PADDING) * PocketTts.FRAME_RATE)
+        val maxGen = minOf(estimate.toInt(), PMAX - pos - 1)
         val latents = ArrayList<FloatArray>(maxGen)
         var emb = engine.bosInput
         var eosStep = -1
@@ -572,20 +556,6 @@ class PocketTtsSession internal constructor(
                 latents.add(lat); sink?.invoke(lat)
                 emb = projectLatent(lat)
                 g++
-            }
-        }
-        // Drop the EOS tail from the reusable context: feeding a sentence's EOS
-        // back in makes the model emit EOS immediately on the next one. Trim on
-        // every chunk (not just continuing ones) when reuse is enabled, so the
-        // context always ends at the last content frame.
-        if (engine.config.keepContext && eosStep >= 0) {
-            val contentEnd = basePos + ids.size + eosStep
-            if (contentEnd < pos) {
-                for (h in 0 until NH) {
-                    val base = h * (PMAX + 1)
-                    for (p in contentEnd until pos) mask[base + p] = PocketTts.MASK_NEG
-                }
-                pos = contentEnd
             }
         }
         return latents
