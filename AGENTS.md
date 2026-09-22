@@ -151,6 +151,11 @@ fills `models.json`; upload them as a `models-<version>` GitHub release, which
 `lm-fp16`, `npu-g5`). `scripts/serve_models.py` + `adb reverse` tests that path
 locally.
 
+Speech rate and pitch are host-side DSP over the decoded PCM, not a graph change.
+The time-stretch/pitch-shift is the vendored [Sonic](https://github.com/waywardgeek/sonic)
+library (`pockettts-core/src/main/java/sonic/Sonic.java`, Apache-2.0, © Bill Cox),
+wrapped by `SonicStretcher` in `:pockettts-core`.
+
 The app can benchmark placements and compare audio quality against the
 CPU/CPU/CPU gold — see the "Benchmark" button (or
 `adb shell am start -n com.pockettts/.MainActivity --ez bench true`).

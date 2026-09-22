@@ -1,4 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <string name="pockettts_engine_name">Pocket TTS</string>
+    <string name="pockettts_settings_voice">Voice</string>
+    <string name="pockettts_settings_rate">Speech rate</string>
+    <string name="pockettts_settings_rate_value">%1$.2fx</string>
+    <string name="pockettts_settings_pitch">Pitch</string>
+    <string name="pockettts_settings_pitch_value">%1$.2fx</string>
+    <string name="pockettts_settings_note">Rate changes tempo with pitch unchanged; pitch changes tone with the duration unchanged.</string>
 </resources>

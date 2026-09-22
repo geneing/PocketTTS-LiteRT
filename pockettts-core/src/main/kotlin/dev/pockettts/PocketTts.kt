@@ -84,8 +84,58 @@ object PocketTts {
 
     fun voiceFile(name: String) = "pt_voice_$name.bin"
 
-    /** Locale voices bundled with the model (CC-BY-4.0 / CC0 only). */
-    val VOICES = listOf("alba", "marius", "javert", "charles", "mary", "eve")
+    /**
+     * Locale voices bundled with the model (CC-BY-4.0 / CC0 only), in the order
+     * the engine and the TTS service present them. The first is the default.
+     */
+    val VOICES = Voice.all().map { it.name }
+
+    /**
+     * Cross-engine stable identifiers for the bundled voices, so a client can
+     * keep speaking a character when it switches engines. The name after
+     * `pockettts-` is matched case-insensitively against [VOICES].
+     */
+    fun voiceId(name: String) = "pockettts-$name"
+
+    /** The voice [name] names, or null: `"alba"`, `"alba#female_1"`, `"pockettts-alba"`. */
+    fun voiceNamed(name: String?): Voice? {
+        val bare = name?.trim()?.lowercase()?.substringBefore('#')?.removePrefix("pockettts-") ?: return null
+        return Voice.all().firstOrNull { it.name == bare }
+    }
+
+    /** hts/piper-sounding voice names, accepted as aliases when standard is skipped. */
+    val HTS_ALIASES: Map<String, String> = mapOf("female_1" to "alba", "male_1" to "marius")
+}
+
+/**
+ * A synthesis voice: the engine's [name] (also its asset file stem), the locale
+ * it speaks, and the TTS-engine metadata the framework needs to publish it.
+ *
+ * [features] is the standard voice feature set. The `pockettts-*` IDs are the
+ * cross-engine-stable names a client can persist instead of the bare [name].
+ */
+data class Voice(
+    val name: String,
+    val locale: java.util.Locale = java.util.Locale.US,
+    val quality: Int = 400,
+    val latency: Int = 300,
+    val features: Set<String> = emptySet(),
+    val id: String = PocketTts.voiceId(name),
+) {
+    /** The name as Python's `pocket_tts` writes it, i.e. the `.bin` stem. */
+    override fun toString(): String = name
+
+    companion object {
+        /** All voices that ship with the model, with their published metadata. */
+        fun all(): List<Voice> = listOf(
+            Voice("alba"),
+            Voice("marius"),
+            Voice("javert"),
+            Voice("charles"),
+            Voice("mary"),
+            Voice("eve"),
+        )
+    }
 }
 
 /** Stage timings for one synthesis call (ms unless noted). */

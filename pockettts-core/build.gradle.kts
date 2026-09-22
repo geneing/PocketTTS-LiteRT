@@ -32,4 +32,6 @@ dependencies {
     // Exposed transitively: every consumer needs the same 2.2.0 runtime the
     // Google Tensor dispatch shim and AOT compiler are pinned to.
     api("com.google.ai.edge.litert:litert:2.2.0")
+
+    testImplementation("junit:junit:4.13.2")
 }

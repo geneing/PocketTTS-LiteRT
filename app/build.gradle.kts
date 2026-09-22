@@ -13,6 +13,7 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "1.0"
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk { abiFilters += setOf("arm64-v8a") }
     }
     compileOptions {
@@ -43,4 +44,9 @@ dependencies {
     implementation(project(":pockettts-core"))
     implementation(project(":pockettts-service"))
     implementation("androidx.core:core-ktx:1.15.0")
+
+    // Instrumented check of the TTS engine through the real android.speech.tts
+    // client (rate/pitch/voices/ISO-3), run on a device.
+    androidTestImplementation("androidx.test:runner:1.7.0")
+    androidTestImplementation("androidx.test.ext:junit:1.3.0")
 }

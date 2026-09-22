@@ -1,6 +1,7 @@
 package dev.pockettts
 
 import android.content.Context
+import sonic.Sonic
 import java.io.File
 
 /**
@@ -22,8 +23,25 @@ class PocketTtsConfig(
     val noiseSeed: Long? = null,
     /** When set, GPU graphs serialize their compiled program cache here. */
     val gpuCache: File? = null,
+    /**
+     * The voices this engine offers, defaulting to every bundled voice whose
+     * `.bin` is actually resolvable through [models]. Narrow it to hide voices;
+     * the first entry is the default. An empty list is never returned: at least
+     * one voice file must be present or synthesis cannot work at all.
+     */
+    val voices: List<Voice> = defaultVoices(models),
 ) {
+    init {
+        require(voices.isNotEmpty()) { "a config needs at least one voice" }
+    }
+
     companion object {
+        /** Every bundled voice whose state file is installed, else all of them. */
+        fun defaultVoices(models: PocketTtsModels): List<Voice> {
+            val installed = Voice.all().filter { models.store.exists(PocketTts.voiceFile(it.name)) }
+            return installed.ifEmpty { Voice.all() }
+        }
+
         /**
          * The device policy: adb-pushed models first, GitHub release fallback,
          * and [Placement.default] for the accelerator split.
@@ -35,5 +53,103 @@ class PocketTtsConfig(
             val dir = context.getExternalFilesDir(null) ?: context.filesDir
             return PocketTtsConfig(models, Placement.default(context, dir))
         }
+    }
+}
+
+/**
+ * Post-generation speech shaping: independent tempo (rate) and pitch, applied to
+ * the decoded 24 kHz float PCM. It is a separate pass, so the LM/Mimi graphs
+ * never see a different sampling rate.
+ *
+ * Backed by the vendored [sonic.Sonic] library (see docs/library.md for the
+ * attribution): `rate` is a constant-pitch time-stretch, `pitch` a pitch shift
+ * that keeps the duration. They compose, so any mixture works and `1f, 1f` is an
+ * exact pass-through.
+ *
+ * @return the shaped audio; the input itself when both are 1.
+ */
+fun sonicStretch(audio: FloatArray, rate: Float, pitch: Float = 1f): FloatArray {
+    if (audio.isEmpty()) return audio
+    val s = SonicStretcher(rate, pitch)
+    val out = s.push(audio)
+    val tail = s.finish()
+    return if (tail.isEmpty()) out else out + tail
+}
+
+/**
+ * Streaming wrapper over [sonic.Sonic]. Feed decoded chunks with [push]; the
+ * result grows as input arrives. Call [finish] once at the end for the tail.
+ *
+ * Mapping: Sonic's stream input runs at `s = speed/pitch` (time-stretch) and then
+ * `r = rate*pitch` (resample) when chord pitch is off. Setting `speed = rate`,
+ * `pitch = pitch`, `rate = 1` therefore gives a total speed of `rate` and a total
+ * pitch of `pitch`, independently.
+ *
+ * Sonic is internally 16-bit, so anything other than the identity path is
+ * requantized. It buffers ~31 ms (`2*maxPeriod`) before producing output, so
+ * [push] can legitimately return nothing.
+ */
+class SonicStretcher(
+    rate: Float,
+    pitch: Float,
+    private val sampleRate: Int = PocketTts.SAMPLE_RATE,
+) {
+    private val speed = rate.coerceIn(MIN_SPEED, MAX_SPEED)
+    private val shifted = pitch.coerceIn(MIN_PITCH, MAX_PITCH)
+    private val passthrough = speed == 1f && shifted == 1f
+
+    private val stream: Sonic? = if (passthrough) {
+        null
+    } else {
+        Sonic(sampleRate, 1).apply {
+            // Qualified: inside apply, `speed` would resolve to Sonic's own
+            // synthetic getSpeed()/setSpeed() property and set nothing.
+            setSpeed(this@SonicStretcher.speed)
+            setPitch(this@SonicStretcher.shifted)
+            setRate(1f)
+            setChordPitch(false)
+            setQuality(0)
+        }
+    }
+
+    /** Reused read buffer; [read] fills it and copies out only what it got. */
+    private val scratch = FloatArray(SCRATCH)
+
+    /** Shape [chunk]; returns it unchanged on the identity path. */
+    fun push(chunk: FloatArray): FloatArray {
+        val s = stream ?: return chunk
+        if (chunk.isEmpty()) return chunk
+        s.writeFloatToStream(chunk, chunk.size)
+        return read(s)
+    }
+
+    /** Flush Sonic's internal buffers and return the tail. */
+    fun finish(): FloatArray {
+        val s = stream ?: return FloatArray(0)
+        s.flushStream()
+        return read(s)
+    }
+
+    /** Drain everything Sonic currently has, concatenating the pieces. */
+    private fun read(s: Sonic): FloatArray {
+        var out = FloatArray(0)
+        while (true) {
+            val n = s.readFloatFromStream(scratch, scratch.size)
+            if (n <= 0) break
+            val part = FloatArray(n)
+            System.arraycopy(scratch, 0, part, 0, n)
+            out = if (out.isEmpty()) part else out + part
+        }
+        return out
+    }
+
+    companion object {
+        const val MIN_SPEED = 0.5f
+        const val MAX_SPEED = 2.0f
+        const val MIN_PITCH = 0.5f
+        const val MAX_PITCH = 2.0f
+
+        /** Sonic's read buffer is caller-owned; 4096 is ample per drain call. */
+        private const val SCRATCH = 4096
     }
 }

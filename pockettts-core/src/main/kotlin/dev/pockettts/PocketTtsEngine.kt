@@ -34,6 +34,9 @@ class PocketTtsEngine(
     val lmSteps: Int = config.lmSteps
     val streamW: Int = config.streamW
     val noiseSeed: Long? = config.noiseSeed
+
+    /** The voices this engine can speak, first = default. */
+    val voices: List<Voice> = config.voices
     private val gpuCache: File? = config.gpuCache
 
     /** Per-graph compile time (ms), keyed lm/lm_ms/dectx/dec/dec_w. */
@@ -147,22 +150,22 @@ class PocketTtsEngine(
     }
 
     /** A fresh utterance. Sessions are cheap; the graphs stay here. */
-    fun newSession(voice: String = PocketTts.VOICES.first()): PocketTtsSession =
+    fun newSession(voice: String = voices.first().name): PocketTtsSession =
         PocketTtsSession(this, voice)
 
     /** One-shot convenience: synthesize [text] fully, blocking. */
-    fun synthesize(text: String, voice: String = PocketTts.VOICES.first()): TtsResult =
+    fun synthesize(text: String, voice: String = voices.first().name): TtsResult =
         newSession(voice).use { it.synthesize(text) }
 
     /** Streaming convenience: [onChunk] fires per decoded chunk, blocking. */
     fun stream(
         text: String,
-        voice: String = PocketTts.VOICES.first(),
+        voice: String = voices.first().name,
         onChunk: (FloatArray) -> Unit,
     ): TtsResult = newSession(voice).use { it.stream(text, onChunk) }
 
     /** LM-only micro-benchmark (no decode); see [PocketTtsSession.microBenchLm]. */
-    fun microBenchLm(steps: Int, voice: String = PocketTts.VOICES.first()): TtsProfile =
+    fun microBenchLm(steps: Int, voice: String = voices.first().name): TtsProfile =
         newSession(voice).use { it.microBenchLm(steps) }
 
     /** Download any required file the configured release source can provide. */
@@ -201,7 +204,7 @@ class PocketTtsEngine(
                 PocketTts.EMBED, PocketTts.INPUT_LINEAR, PocketTts.BOS,
                 PocketTts.NEUTRAL, PocketTts.TOKENIZER,
             )
-            PocketTts.VOICES.forEach { f += PocketTts.voiceFile(it) }
+            f += config.voices.map { PocketTts.voiceFile(it.name) }
             return f.toList()
         }
     }

@@ -27,6 +27,35 @@ class PocketTtsSession internal constructor(
     val voice: String,
 ) : Closeable {
 
+    /**
+     * Playback tempo, 1.0 = natural. Applied as a host-side constant-pitch
+     * time-stretch on the decoded PCM ([SonicStretcher]), so the graphs and the
+     * RNG stream are unaffected: the same [noiseSeed] gives the same utterance
+     * at any rate. A rate below 1 makes the audio longer, like slower speech.
+     *
+     * Captured when a call starts, so changing it mid-utterance takes effect on
+     * the next call.
+     */
+    @Volatile
+    var rate: Float = 1f
+        set(value) {
+            field = value.coerceIn(SonicStretcher.MIN_SPEED, SonicStretcher.MAX_SPEED)
+        }
+
+    /**
+     * Voice pitch, 1.0 = natural, applied alongside [rate]. Because the stretch
+     * is duration-preserving, changing it alone shifts pitch without changing
+     * how long the utterance takes. Captured at call start, like [rate].
+     */
+    @Volatile
+    var pitch: Float = 1f
+        set(value) {
+            field = value.coerceIn(SonicStretcher.MIN_PITCH, SonicStretcher.MAX_PITCH)
+        }
+
+    /** Voices this engine can speak; the engine holds the graphs, the set the files. */
+    val voices: List<Voice> get() = engine.voices
+
     private val G = PocketTts.G
     private val PMAX = PocketTts.PMAX
     private val HD = PocketTts.HD
@@ -268,7 +297,7 @@ class PocketTtsSession internal constructor(
             sPrompt += ids.size; sFrames += latents.size; sChunks++
             if (latents.isNotEmpty()) audio.add(decode(latents))
         }
-        val out = concat(audio)
+        val out = applyShaping(concat(audio))
         TtsResult(out, frames, (System.nanoTime() - t0) / 1_000_000, snapshotProfile())
     }
 
@@ -290,13 +319,18 @@ class PocketTtsSession internal constructor(
         loadVoice(voice)
         val all = ArrayList<FloatArray>()
         var frames = 0
+        // Capture both at call start: changing them mid-utterance applies next call.
+        val stretcher = SonicStretcher(rate, pitch)
         for (chunk in splitIntoBestSentences(text)) {
             val (prepared, eosGuess) = prepareTextPrompt(chunk)
             val ids = engine.tokenizer.encode(prepared)
             val dec = StreamDecoder { c ->
                 if (sFirstChunk < 0) sFirstChunk = (System.nanoTime() - t0) / 1_000_000
-                all.add(c)
-                onChunk(c)
+                val shaped = stretcher.push(c)
+                if (shaped.isNotEmpty()) {
+                    all.add(shaped)
+                    onChunk(shaped)
+                }
             }
             val lats = generateChunk(ids, framesAfterEos = eosGuess + 2) { dec.push(it) }
             dec.flush()
@@ -306,6 +340,11 @@ class PocketTtsSession internal constructor(
             )
             frames += lats.size
             sPrompt += ids.size; sFrames += lats.size; sChunks++
+        }
+        val tail = stretcher.finish()
+        if (tail.isNotEmpty()) {
+            all.add(tail)
+            onChunk(tail)
         }
         TtsResult(concat(all), frames, (System.nanoTime() - t0) / 1_000_000, snapshotProfile())
     }
@@ -642,6 +681,12 @@ class PocketTtsSession internal constructor(
     }
 
     // ---- small helpers ----------------------------------------------------
+
+    /** Post-shape a finished utterance when rate or pitch is not 1.0. */
+    private fun applyShaping(audio: FloatArray): FloatArray {
+        if (audio.isEmpty()) return audio
+        return sonicStretch(audio, rate, pitch)
+    }
 
     private fun concat(parts: List<FloatArray>): FloatArray {
         val total = parts.sumOf { it.size }

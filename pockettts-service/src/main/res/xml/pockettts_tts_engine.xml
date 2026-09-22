@@ -2,6 +2,11 @@
 <!--
   Engine metadata pointed at by the TTS_SERVICE declaration. Pocket TTS is fully
   on-device and streams 24 kHz mono PCM.
+
+  settingsActivity is where the system TTS settings screen (and the
+  "Engine settings" entry) sends the user; it edits the persisted default voice
+  and rate. The legacy initialValues/config attributes are not read by the
+  platform any more, so settings live in SharedPreferences instead.
 -->
 <tts-engine xmlns:android="http://schemas.android.com/apk/res/android"
-    android:value="pockettts" />
+    android:settingsActivity="dev.pockettts.service.PocketTtsSettingsActivity" />

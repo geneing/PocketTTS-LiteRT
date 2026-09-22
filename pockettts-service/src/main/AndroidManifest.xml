@@ -15,11 +15,27 @@
             android:permission="android.permission.BIND_TTS_SERVICE">
             <intent-filter>
                 <action android:name="android.intent.action.TTS_SERVICE" />
+                <!-- Required: the framework queries engines with
+                     MATCH_DEFAULT_ONLY, so an action-only filter is invisible
+                     to TextToSpeech and the engine silently falls back. -->
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
             <meta-data
                 android:name="android.speech.tts"
                 android:resource="@xml/pockettts_tts_engine" />
         </service>
+
+        <!--
+          Opened by the system TTS settings via android:settingsActivity in the
+          engine metadata: the framework resolves the class name and the
+          Settings app calls startActivity on it, so it has to be exported.
+          It touches only this app's preferences, which the caller cannot read.
+        -->
+        <activity
+            android:name="dev.pockettts.service.PocketTtsSettingsActivity"
+            android:exported="true"
+            android:label="@string/pockettts_engine_name"
+            android:theme="@android:style/Theme.DeviceDefault.Settings" />
 
     </application>
 

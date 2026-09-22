@@ -87,6 +87,26 @@ u.cancel()
 the first utterance), so measure it on a warm engine. On a Pixel 10 the flow-LM is
 the floor at ~0.86 s, and first audio lands at ~1.2 s once the engine is loaded.
 
+### Speech rate and pitch
+
+`session.rate` (tempo, 1.0 = natural) and `session.pitch` (tone, 1.0 = natural) are
+independent post-processing on the decoded 24 kHz PCM, applied after the graphs so
+the LM/Mimi graphs and the RNG stream never see a different rate. Rate changes
+tempo with pitch unchanged; pitch changes tone with the duration unchanged; the two
+compose, and `1f, 1f` is an exact pass-through. Both are captured when a call
+starts (so changing them mid-utterance applies to the next call) and are clamped to
+0.5x–2x.
+
+```kotlin
+session.rate = 0.8f    // slower, same voice
+session.pitch = 1.2f   // higher, same duration
+```
+
+The DSP is the vendored [Sonic](https://github.com/waywardgeek/sonic) library
+(`pockettts-core/src/main/java/sonic/Sonic.java`, Apache-2.0, © Bill Cox), used as a
+constant-pitch time-stretch plus a resample. It is 16-bit internally, so anything
+other than the identity path is requantized.
+
 ### Voice agent: push text as the LLM emits it
 
 `begin()` returns a push interface: feed fragments, and each complete sentence is
@@ -115,7 +135,10 @@ except provisioning the models (bundled assets, adb push, or `ensureModels`).
 It implements `onSynthesizeText` by streaming PCM-16 chunks, so playback starts at
 the first SEANet window rather than after the utterance, and `onStop` maps to
 session cancellation. It advertises `eng` only; the voices are exposed through
-`PocketTts.VOICES` and passed as the request's voice name.
+`PocketTts.VOICES` and passed as the request's voice name. `request.speechRate` and
+`request.pitch` are honoured independently; when a client sends the framework
+default (100, "no preference"), the engine's persisted rate/pitch from the settings
+screen apply instead.
 
 ## Development loop
 
