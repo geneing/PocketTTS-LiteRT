@@ -321,22 +321,40 @@ class PocketTtsSession internal constructor(
         var frames = 0
         // Capture both at call start: changing them mid-utterance applies next call.
         val stretcher = SonicStretcher(rate, pitch)
-        for (chunk in splitIntoBestSentences(text)) {
+        val textChunks = splitIntoBestSentences(text)
+        android.util.Log.i(
+            "PocketTTSTime",
+            "stream: ${text.length} chars -> ${textChunks.size} text chunk(s), rate=$rate pitch=$pitch",
+        )
+        for ((ci, chunk) in textChunks.withIndex()) {
+            val chunkT0 = System.nanoTime()
             val (prepared, eosGuess) = prepareTextPrompt(chunk)
             val ids = engine.tokenizer.encode(prepared)
+            var chunkFirstAudio = -1L
+            var chunkAudioChunks = 0
             val dec = StreamDecoder { c ->
                 if (sFirstChunk < 0) sFirstChunk = (System.nanoTime() - t0) / 1_000_000
+                if (chunkFirstAudio < 0) chunkFirstAudio = (System.nanoTime() - chunkT0) / 1_000_000
                 val shaped = stretcher.push(c)
                 if (shaped.isNotEmpty()) {
                     all.add(shaped)
                     onChunk(shaped)
+                    chunkAudioChunks++
                 }
             }
+            val genT = System.nanoTime()
             val lats = generateChunk(ids, framesAfterEos = eosGuess + 2) { dec.push(it) }
+            val genMs = (System.nanoTime() - genT) / 1_000_000
+            val flushT = System.nanoTime()
             dec.flush()
+            val flushMs = (System.nanoTime() - flushT) / 1_000_000
             android.util.Log.i(
-                "PocketTTS",
-                "chunk: ${ids.size} tokens -> ${lats.size} frames, ${dec.chunks} audio chunks",
+                "PocketTTSTime",
+                "text chunk $ci/${textChunks.size - 1}: ${ids.size} tokens -> ${lats.size} frames " +
+                    "gen=${genMs}ms flush=${flushMs}ms firstAudio=${chunkFirstAudio}ms " +
+                    "audioChunks=$chunkAudioChunks wall=${
+                        (System.nanoTime() - chunkT0) / 1_000_000
+                    }ms",
             )
             frames += lats.size
             sPrompt += ids.size; sFrames += lats.size; sChunks++
@@ -346,7 +364,14 @@ class PocketTtsSession internal constructor(
             all.add(tail)
             onChunk(tail)
         }
-        TtsResult(concat(all), frames, (System.nanoTime() - t0) / 1_000_000, snapshotProfile())
+        val totalMs = (System.nanoTime() - t0) / 1_000_000
+        android.util.Log.i(
+            "PocketTTSTime",
+            "stream done: ${totalMs}ms frames=$frames audioChunks=${all.size} " +
+                "firstAudio=${sFirstChunk}ms lm=${sLmRun / 1_000_000}ms " +
+                "decTx=${sDecTx / 1_000_000}ms seanet=${sSeanet / 1_000_000}ms ${stretcher.stats()}",
+        )
+        TtsResult(concat(all), frames, totalMs, snapshotProfile())
     }
 
     /**
@@ -611,7 +636,14 @@ class PocketTtsSession internal constructor(
             lats.add(lat)
             advance(final = false)
             val w = engine.streamW
-            while (featPos - emitted >= w - PocketTts.STREAM_L) emitWindow()
+            // Emit the first window as soon as the first block exists: a partial
+            // window is exact because the SEANet is causal. After that, slide by
+            // w - STREAM_L as before.
+            while (featPos > emitted &&
+                (emitted == 0 || featPos - emitted >= w - PocketTts.STREAM_L)
+            ) {
+                emitWindow()
+            }
         }
 
         fun flush() {
@@ -623,11 +655,20 @@ class PocketTtsSession internal constructor(
             val n = lats.size
             if (n == 0) return
             if (kept == 0) {
-                if (n < PocketTts.F_BLK && !final) return
+                if (n < PocketTts.F_FIRST && !final) return
                 block(n, 0, engine.neutral)
             }
             while (kept < n && (final || n - kept >= PocketTts.F_HOP)) {
-                block(n, kept - PocketTts.F_HOP, lats[kept - PocketTts.F_HOP - 1])
+                val start = kept - PocketTts.F_HOP
+                if (start >= 1) {
+                    block(n, start, lats[start - 1])
+                } else {
+                    // Fewer than F_HOP frames are valid so far; rerun the first
+                    // block once more frames exist. It is causal, so the
+                    // recomputed prefix is identical and any audio already
+                    // emitted for it stays valid.
+                    block(n, 0, engine.neutral)
+                }
             }
         }
 
@@ -641,9 +682,14 @@ class PocketTtsSession internal constructor(
             val t0 = System.nanoTime()
             engine.dectx.run(engine.dectxIn, engine.dectxOut)
             val out = engine.dectxOut[0].readFloat()
+            val ms = (System.nanoTime() - t0) / 1_000_000
             sDecTx += System.nanoTime() - t0
             val drop = if (start == 0) 0 else PocketTts.F_HOP
             val keepN = minOf(PocketTts.F_BLK, size - start) - drop
+            android.util.Log.i(
+                "PocketTTSTime",
+                "  dec_tx block start=$start size=$size drop=$drop keep=$keepN ms=$ms",
+            )
             for (c in 0 until PocketTts.MIMI_D) {
                 System.arraycopy(
                     out, c * PocketTts.S_BLK + drop * PocketTts.UPS,
@@ -669,6 +715,7 @@ class PocketTtsSession internal constructor(
             val t0 = System.nanoTime()
             model.run(ins, outs)
             val wav = outs[0].readFloat()
+            val ms = (System.nanoTime() - t0) / 1_000_000
             sSeanet += System.nanoTime() - t0
             val keep = minOf(start + w, featPos) - emitted
             val off = (emitted - start) * PocketTts.SPP
@@ -676,6 +723,11 @@ class PocketTtsSession internal constructor(
             emitted += keep
             chunks++
             sAudioChunks++
+            android.util.Log.i(
+                "PocketTTSTime",
+                "  audio chunk $chunks: ${keep} pos / ${out.size} samples, seanet=${ms}ms, " +
+                    "emitted=${emitted / PocketTts.UPS} frames",
+            )
             onChunk(out)
         }
     }

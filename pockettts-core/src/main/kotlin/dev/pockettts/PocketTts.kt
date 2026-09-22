@@ -27,6 +27,15 @@ object PocketTts {
     const val MIMI_D = 512
     const val F_BLK = 64             // dec_tx block payload frames
     const val F_HOP = 32             // dec_tx block hop
+    /**
+     * Frames the *first* dec_tx block waits for. The graph is 64 frames wide, but
+     * the block is causal (sliding-window, ~31-frame receptive field), so it can
+     * run with fewer real frames and neutral padding. Starting at 64 makes
+     * time-to-first-audio scale with the sentence up to 64 frames; starting at
+     * [F_FIRST] keeps it flat. Must be >= 2 so the next block has a previous
+     * frame to seed it.
+     */
+    const val F_FIRST = 8
     const val S_BLK = F_BLK * UPS
     const val DEC_FRAMES = 256       // one-shot deconly window frames
     const val S_DEC = DEC_FRAMES * UPS

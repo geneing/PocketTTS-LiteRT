@@ -101,6 +101,12 @@ class PocketTtsService : TextToSpeechService() {
             if (requestedPitch == DEFAULT_PITCH) defaultPitch() else requestedPitch / 100f
             ).coerceIn(PocketTtsSettings.MIN_PITCH, PocketTtsSettings.MAX_PITCH)
 
+        val t0 = System.nanoTime()
+        android.util.Log.i(
+            "PocketTTSTime",
+            "service synth: ${text.length} chars voice=${voice.name} rate=$rate pitch=$pitch",
+        )
+
         val session: PocketTtsSession
         try {
             session = engine().newSession(voice.name)
@@ -119,6 +125,7 @@ class PocketTtsService : TextToSpeechService() {
         // audioAvailable() must never receive more than this many bytes.
         val out = PcmBuffer(callback.maxBufferSize.coerceAtLeast(2))
         var failed = false
+        var firstAudio = -1L
         try {
             if (callback.start(PocketTts.SAMPLE_RATE, AudioFormat.ENCODING_PCM_16BIT, 1)
                 == TextToSpeech.STOPPED
@@ -126,6 +133,13 @@ class PocketTtsService : TextToSpeechService() {
                 return
             }
             session.stream(text) { chunk ->
+                if (firstAudio < 0) {
+                    firstAudio = (System.nanoTime() - t0) / 1_000_000
+                    android.util.Log.i(
+                        "PocketTTSTime",
+                        "service first audio at ${firstAudio}ms (${chunk.size} samples)",
+                    )
+                }
                 // The framework stops calling back once the utterance is
                 // stopped or done; stop generating as soon as it does.
                 if (callback.hasFinished() == true || !out.put(chunk, callback)) {
@@ -133,6 +147,10 @@ class PocketTtsService : TextToSpeechService() {
                 }
             }
             if (!out.flush(callback)) session.cancel()
+            android.util.Log.i(
+                "PocketTTSTime",
+                "service done: ${(System.nanoTime() - t0) / 1_000_000}ms firstAudio=${firstAudio}ms",
+            )
         } catch (e: Throwable) {
             failed = true
             android.util.Log.e(TAG, "synthesis failed", e)

@@ -17,6 +17,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    testOptions {
+        // android.util.Log (used for the PocketTTSTime timing traces) is a stub
+        // in local unit tests; return defaults instead of throwing.
+        unitTests.isReturnDefaultValues = true
+    }
     packaging {
         jniLibs {
             pickFirsts += setOf(

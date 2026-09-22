@@ -42,11 +42,19 @@ for every `L >= 8` with real dec_tx features at `W` = 512/1024/2048.
 **dec_tx is already block-structured.** Its 64-frame blocks overlap by
 `F_HOP = 32`, and only the region the overlap makes valid is kept, so running
 blocks incrementally as frames arrive is the same arithmetic as running them all
-at the end. Block 0 needs all 64 frames; later blocks fire as soon as 32 more
-exist.
+at the end. Later blocks fire as soon as 32 more frames exist.
 
-The result: the first audio chunk lands after the LM has produced the first
-dec_tx block, i.e. 64 frames.
+The first block is special: it is *causal* (sliding-window transformer, ~31-frame
+left receptive field), so running it with fewer than 64 real frames and neutral
+padding produces exactly the same output for the frames that do exist. It
+therefore fires as soon as `F_FIRST = 8` frames are available, and the SEANet
+window (also strictly causal) emits a **partial** first window immediately. That
+keeps time-to-first-audio flat instead of scaling with the sentence up to 64
+frames. A block that cannot yet seed a 32-frame overlap reruns block 0, which is
+free of consequences because the recomputed prefix is bit-identical.
+
+The result: the first audio chunk lands after the LM has produced `F_FIRST`
+frames, not 64.
 
 ## Where the `max|d| 1.465e-03` comes from
 
@@ -67,11 +75,13 @@ bit-exact take is ever wanted.
 
 ## Granularity
 
-Chunks are bounded below by `F_BLK = 64` frames (2.56 s of audio) because the
-first dec_tx block cannot run earlier, so at `w=512` the three chunks are
-2.56 s + 2.56 s + 0.48 s. Time-to-first-audio is therefore dominated by the LM
-work for the prompt plus 64 frames (~0.86 s measured), not by the decoder — a
-smaller first block would need a dec_tx variant exported at 32 frames.
+The first chunk is `F_FIRST = 8` frames (0.64 s) so playback can start early; the
+SEANet then slides by `w - STREAM_L` positions (2.56 s at `w=512`) and the tail is
+whatever remains. Time-to-first-audio is dominated by the LM work for the prompt
+plus those 8 frames, not by the decoder, so it is constant across sentence
+lengths. The 64-frame `dec_tx` graph is still invoked (with neutral padding) for
+that first block; a dedicated 8- or 32-frame export would trim the wasted compute
+but not the latency.
 
 ## Reproduce
 
@@ -106,7 +116,8 @@ window list. The stage prints a prefix-parity line per window against the full
 
 ## Next levers
 
-- A 32-frame dec_tx variant to cut the first chunk and time-to-first-audio.
+- A small (8- or 32-frame) dec_tx export to avoid the wasted padding compute in
+  the first block; it would not change latency, only the decoder cost.
 - Overlapping the SEANet window with the LM on separate threads (the LM is
   0.86 s of the 1.7 s and currently runs strictly ahead of the decoder).
 - `w=2048` when bit-exactness matters more than the ~1.5x RTF difference.

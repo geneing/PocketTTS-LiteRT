@@ -1,6 +1,7 @@
 package dev.pockettts
 
 import android.content.Context
+import android.util.Log
 import sonic.Sonic
 import java.io.File
 
@@ -115,13 +116,43 @@ class SonicStretcher(
     /** Reused read buffer; [read] fills it and copies out only what it got. */
     private val scratch = FloatArray(SCRATCH)
 
+    // ---- timing (see [stats]) --------------------------------------------
+    private var pushes = 0
+    internal var sonicMs = 0L
+        private set
+    internal var inSamples = 0L
+        private set
+    internal var outSamples = 0L
+        private set
+
     /** Shape [chunk]; returns it unchanged on the identity path. */
     fun push(chunk: FloatArray): FloatArray {
         val s = stream ?: return chunk
         if (chunk.isEmpty()) return chunk
+        val t = System.nanoTime()
         s.writeFloatToStream(chunk, chunk.size)
-        return read(s)
+        val out = read(s)
+        val ms = (System.nanoTime() - t) / 1_000_000
+        sonicMs += ms
+        inSamples += chunk.size
+        outSamples += out.size
+        pushes++
+        Log.i(
+            "PocketTTSTime",
+            "sonic push#$pushes in=${chunk.size} out=${out.size} ${ms}ms " +
+                "(speed=$speed pitch=$shifted)",
+        )
+        return out
     }
+
+    /** One-line aggregate for the end of an utterance. */
+    fun stats(): String =
+        if (passthrough) {
+            "sonic passthrough"
+        } else {
+            "sonic ${pushes} pushes ${sonicMs}ms in=$inSamples out=$outSamples " +
+                "(speed=$speed pitch=$shifted)"
+        }
 
     /** Flush Sonic's internal buffers and return the tail. */
     fun finish(): FloatArray {
@@ -130,17 +161,23 @@ class SonicStretcher(
         return read(s)
     }
 
-    /** Drain everything Sonic currently has, concatenating the pieces. */
+    /**
+     * Drain everything Sonic currently has. Sonic reports the total up front, so
+     * the result is sized once instead of concatenating per read (which is
+     * quadratic when a chunk yields many buffers).
+     */
     private fun read(s: Sonic): FloatArray {
-        var out = FloatArray(0)
-        while (true) {
-            val n = s.readFloatFromStream(scratch, scratch.size)
+        val total = s.samplesAvailable()
+        if (total <= 0) return FloatArray(0)
+        val out = FloatArray(total)
+        var o = 0
+        while (o < total) {
+            val n = s.readFloatFromStream(scratch, minOf(scratch.size, total - o))
             if (n <= 0) break
-            val part = FloatArray(n)
-            System.arraycopy(scratch, 0, part, 0, n)
-            out = if (out.isEmpty()) part else out + part
+            System.arraycopy(scratch, 0, out, o, n)
+            o += n
         }
-        return out
+        return if (o == total) out else out.copyOf(o)
     }
 
     companion object {
