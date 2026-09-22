@@ -49,10 +49,11 @@ implement `Downloader` to plug in OkHttp.
 
 ## Engine and session
 
-One `PocketTtsEngine` per process — it owns the graphs, the mapped host assets and
-the worker thread. `newSession(voice)` is cheap and holds only per-utterance state
-(KV cache, position, RNG), so an app can keep one engine for its lifetime and take
-a session per request.
+One `PocketTtsEngine` per process — it owns the graphs, the mapped host assets, the
+K/V + decoder scratch buffers, a small LRU of repacked voice states, and the
+worker thread. `newSession(voice)` is cheap: it adds only per-utterance position
+and RNG, not ~25 MB of buffers or a re-read of the voice file, so an app can keep
+one engine for its lifetime and take a session per request.
 
 ```kotlin
 val engine = PocketTtsEngine(context)                     // seconds, ~150 MB native

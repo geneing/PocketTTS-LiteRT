@@ -10,6 +10,7 @@ import java.io.RandomAccessFile
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.nio.channels.FileChannel
+import java.util.LinkedHashMap
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
@@ -135,6 +136,48 @@ class PocketTtsEngine(
     internal val endTokens: Set<Int> = tokenizer.encode(".!...?").drop(1).toSet()
     internal val fallbackTokens: Set<Int> = tokenizer.encode(",;:").drop(1).toSet()
 
+    // ---- shared scratch ---------------------------------------------------
+    // Every entry point runs under [lock] (or on the single worker), so one set
+    // of buffers serves all sessions. Allocating per session cost ~25 MB and a
+    // GC per utterance; the decoder arrays were re-allocated per text chunk.
+    internal val pk = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
+    internal val pv = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
+    internal val mask = FloatArray(PocketTts.NH * (PocketTts.PMAX + 1))
+    internal val decFeat = FloatArray(PocketTts.MIMI_D * PocketTts.S_DEC)
+    internal val decBlk = FloatArray((1 + PocketTts.F_BLK) * PocketTts.LDIM)
+    internal val streamWin = FloatArray(PocketTts.MIMI_D * streamW)
+
+    // ---- voice cache ------------------------------------------------------
+    /** A repacked voice state, shared by every session that speaks it. */
+    internal class VoiceState(val k: FloatArray, val v: FloatArray, val len: Int)
+
+    /** LRU: switching voices should not re-read the ~3 MB file every request. */
+    private val voiceCache = object : LinkedHashMap<String, VoiceState>(VOICE_CACHE, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, VoiceState>?): Boolean =
+            size > VOICE_CACHE
+    }
+
+    internal fun voiceState(name: String): VoiceState = synchronized(voiceCache) {
+        voiceCache.getOrPut(name) {
+            val bb = ByteBuffer
+                .wrap(models.store.file(PocketTts.voiceFile(name)).readBytes())
+                .order(ByteOrder.LITTLE_ENDIAN)
+            val t = bb.int
+            check(t <= PocketTts.PMAX) { "voice state longer than KV capacity: $t > ${PocketTts.PMAX}" }
+            val n = PocketTts.G * t * PocketTts.HD
+            VoiceState(
+                FloatArray(n) { android.util.Half.toFloat(bb.short) },
+                FloatArray(n) { android.util.Half.toFloat(bb.short) },
+                t,
+            ).also {
+                android.util.Log.i(
+                    "PocketTTSTime",
+                    "voice loaded: $name (${it.len} frames, cache=${voiceCache.size}/$VOICE_CACHE)",
+                )
+            }
+        }
+    }
+
     // ---- concurrency ------------------------------------------------------
     internal val lock = Any()
     private val executor: ExecutorService =
@@ -188,6 +231,9 @@ class PocketTtsEngine(
     }
 
     companion object {
+        /** Voices kept repacked in memory (each ~3 MB as fp32). */
+        private const val VOICE_CACHE = 3
+
         /** Every model file a config needs, for `ensure()` and packaging. */
         fun requiredFiles(config: PocketTtsConfig): List<String> {
             val f = LinkedHashSet<String>()

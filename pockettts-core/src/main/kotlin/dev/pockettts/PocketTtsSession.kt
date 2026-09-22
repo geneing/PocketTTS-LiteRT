@@ -1,8 +1,6 @@
 package dev.pockettts
 
 import java.io.Closeable
-import java.nio.ByteBuffer
-import java.nio.ByteOrder
 import java.util.Random
 import kotlin.math.ceil
 import kotlin.math.cos
@@ -63,9 +61,11 @@ class PocketTtsSession internal constructor(
     private val LDIM = PocketTts.LDIM
 
     // ---- utterance state --------------------------------------------------
-    private val pk = FloatArray(G * PMAX * HD)
-    private val pv = FloatArray(G * PMAX * HD)
-    private val mask = FloatArray(NH * (PMAX + 1))
+    // K/V, mask and decoder scratch are the engine's; access is serialized, so
+    // they are reset (not re-allocated) per utterance.
+    private val pk = engine.pk
+    private val pv = engine.pv
+    private val mask = engine.mask
     private var pos = 0
 
     private var voiceName = ""
@@ -105,18 +105,14 @@ class PocketTtsSession internal constructor(
     private var sFirstChunk = -1L
     private var sAudioChunks = 0
 
-    /** Load a repacked voice state: int32 T, then k and v as fp16 `[96][T][64]`. */
+    /** Bind a repacked voice state; the engine caches the decoded arrays. */
     fun loadVoice(name: String) {
         if (name == voiceName) return
-        val bb = ByteBuffer
-            .wrap(engine.config.models.store.file(PocketTts.voiceFile(name)).readBytes())
-            .order(ByteOrder.LITTLE_ENDIAN)
-        val t = bb.int
-        check(t <= PMAX) { "voice state longer than KV capacity: $t > $PMAX" }
-        val n = G * t * HD
-        voiceK = FloatArray(n) { android.util.Half.toFloat(bb.short) }
-        voiceV = FloatArray(n) { android.util.Half.toFloat(bb.short) }
-        voiceLen = t; voiceName = name
+        val state = engine.voiceState(name)
+        voiceK = state.k
+        voiceV = state.v
+        voiceLen = state.len
+        voiceName = name
     }
 
     private fun resetToVoice() {
@@ -569,8 +565,8 @@ class PocketTtsSession internal constructor(
     private fun decode(latents: List<FloatArray>): FloatArray {
         val tDec = System.nanoTime()
         val t = minOf(latents.size, PocketTts.DEC_FRAMES)
-        val feat = FloatArray(PocketTts.MIMI_D * PocketTts.S_DEC)
-        val blk = FloatArray((1 + PocketTts.F_BLK) * LDIM)
+        val feat = engine.decFeat
+        val blk = engine.decBlk
         val neutral = engine.neutral
 
         fun runBlock(prev: FloatArray, start: Int): FloatArray {
@@ -622,9 +618,9 @@ class PocketTtsSession internal constructor(
      */
     private inner class StreamDecoder(private val onChunk: (FloatArray) -> Unit) {
         private val lats = ArrayList<FloatArray>()
-        private val feat = FloatArray(PocketTts.MIMI_D * PocketTts.S_DEC)
-        private val win = FloatArray(PocketTts.MIMI_D * engine.streamW)
-        private val blk = FloatArray((1 + PocketTts.F_BLK) * LDIM)
+        private val feat = engine.decFeat
+        private val win = engine.streamWin
+        private val blk = engine.decBlk
         private var kept = 0
         private var featPos = 0
         private var emitted = 0
