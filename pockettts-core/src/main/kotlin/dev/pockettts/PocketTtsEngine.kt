@@ -4,6 +4,7 @@ import android.content.Context
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
+import com.google.ai.edge.litert.TensorBuffer
 import java.io.Closeable
 import java.io.File
 import java.io.RandomAccessFile
@@ -109,8 +110,40 @@ class PocketTtsEngine(
         null
     }
 
-    internal val lmIn = lm.createInputBuffers()
-    internal val lmOut = lm.createOutputBuffers()
+    /**
+     * `litert_torch` lays named signatures before the default one, so in a file
+     * that carries the prefill the fused step is index 1 and the prefill is
+     * index 0. Buffers belong to a signature, so the step's must be created
+     * explicitly; a single-signature file (older drops) has only index 0.
+     * Created once and kept -- probing with a throwaway set would transiently
+     * double the ~25 MB packed-KV inputs.
+     */
+    private val lmStepIn: List<TensorBuffer>? =
+        runCatching { lm.createInputBuffers(1) }.getOrNull()
+
+    internal val lmIn: List<TensorBuffer> = lmStepIn ?: lm.createInputBuffers()
+    internal val lmOut: List<TensorBuffer> =
+        if (lmStepIn != null) lm.createOutputBuffers(1) else lm.createOutputBuffers()
+
+    /**
+     * Prompt prefill is a second signature of [lm], not a separate graph: it
+     * shares the backbone's weight buffers, so it costs no extra storage. Null
+     * on model drops that predate it, in which case the prompt falls back to a
+     * fused step per token.
+     */
+    internal val prefillIn: List<TensorBuffer>? =
+        if (config.usePrefill && lmStepIn != null) {
+            runCatching { lm.createInputBuffers(0) }.getOrNull()
+        } else null
+    internal val prefillOut: List<TensorBuffer>? =
+        if (config.usePrefill && lmStepIn != null) {
+            runCatching { lm.createOutputBuffers(0) }.getOrNull()
+        } else null
+
+    /** Run the fused step on buffers created above (last signature when named). */
+    internal fun runLm(ins: List<TensorBuffer>, outs: List<TensorBuffer>) {
+        if (lmStepIn != null) lm.run(ins, outs, 1) else lm.run(ins, outs)
+    }
     internal val lmMsIn = lmMs?.createInputBuffers()
     internal val lmMsOut = lmMs?.createOutputBuffers()
     internal val dectxIn = dectx.createInputBuffers()
@@ -143,6 +176,12 @@ class PocketTtsEngine(
     internal val pk = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
     internal val pv = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
     internal val mask = FloatArray(PocketTts.NH * (PocketTts.PMAX + 1))
+    // Batched prompt prefill scratch (see PocketTtsSession.prefill).
+    internal val prefillEmb = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.H)
+    internal val prefillCos = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.HD)
+    internal val prefillSin = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.HD)
+    internal val prefillMask = FloatArray(PocketTts.PREFILL_TOKENS * (PocketTts.PMAX + 1))
+    internal val prefillWrite = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.PMAX)
     internal val decFeat = FloatArray(PocketTts.MIMI_D * PocketTts.S_DEC)
     internal val decBlk = FloatArray((1 + PocketTts.F_BLK) * PocketTts.LDIM)
     internal val streamWin = FloatArray(PocketTts.MIMI_D * streamW)
@@ -188,7 +227,11 @@ class PocketTtsEngine(
     init {
         android.util.Log.i(
             "PocketTTS",
-            "engine ${placement.label} @ ${Placement.renderer()} (${lmGraphName})",
+            "engine ${placement.label} @ ${Placement.renderer()} (${lmGraphName}) " +
+                "lmSig=${if (lmStepIn != null) 1 else 0} " +
+                "prefill=${if (prefillIn != null) "${PocketTts.PREFILL_SIGNATURE}/${prefillIn.size}" else "none"} " +
+                "heap=${Runtime.getRuntime().totalMemory() shr 20}MiB " +
+                "native=${android.os.Debug.getNativeHeapAllocatedSize() shr 20}MiB",
         )
     }
 
@@ -217,8 +260,10 @@ class PocketTtsEngine(
 
     override fun close() {
         executor.shutdownNow()
-        listOf(lmIn, lmOut, lmMsIn, lmMsOut, dectxIn, dectxOut, deconlyIn, deconlyOut, deconlyWIn, deconlyWOut)
-            .forEach { l -> l?.forEach { it.close() } }
+        listOf(
+            lmIn, lmOut, lmMsIn, lmMsOut, dectxIn, dectxOut, deconlyIn, deconlyOut,
+            deconlyWIn, deconlyWOut, prefillIn, prefillOut,
+        ).forEach { l -> l?.forEach { it.close() } }
         lm.close(); lmMs?.close(); dectx.close(); deconly.close(); deconlyW?.close()
         embChannel.close()
         npuEnvironment?.close()

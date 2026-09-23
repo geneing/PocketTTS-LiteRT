@@ -59,6 +59,14 @@ object PocketTts {
     const val LM = "pt_flowlm_fused_fp16.tflite"
 
     /**
+     * Name `litert_torch` gives the fused graph's default signature. The
+     * head-less prompt batch is a second signature ([PREFILL_SIGNATURE]) in the
+     * same file; named signatures are laid out before the default one, so both
+     * must be selected by name rather than by index.
+     */
+    const val LM_SIGNATURE = "serving_default"
+
+    /**
      * Dynamic-range int8 flow-LM: int8 weights, fp32 activations, so the host
      * protocol is unchanged. ~2.3x faster per frame than [LM] on XNNPACK.
      */
@@ -69,6 +77,22 @@ object PocketTts {
 
     /** N-step fused decode graph: N frames per invocation. */
     fun msGraph(n: Int) = "pt_flowlm_ms${n}_fp16.tflite"
+
+    /**
+     * Prompt tokens the `prefill` signature consumes per invocation. A chunk's
+     * prompt is capped at [MAX_TOKENS_PER_CHUNK], so 16 covers it in a few
+     * invocations with little padding waste.
+     */
+    const val PREFILL_TOKENS = 16
+
+    /**
+     * Named signature of the fused flow-LM graph that appends the text prompt to
+     * the packed KV in batches, without the flow head a prompt token discards.
+     * It shares the graph's weight buffers, so it costs no extra storage or
+     * accelerator memory; model drops that predate it fall back to a fused step
+     * per prompt token.
+     */
+    const val PREFILL_SIGNATURE = "prefill"
 
     const val DEC_TX = "pt_mimi_dec_tx_fp16.tflite"
 

@@ -88,7 +88,8 @@ to an invalid value or clear `~/.cache/huggingface/hub/models--kyutai--pocket-tt
 |---|---|
 | `pt_flowlm_step{,_fp16}.tflite` | one AR step, packed-KV I/O (reference; not loaded by the app) |
 | `pt_flow_head{,_fp16}.tflite` | flow head alone (reference; not loaded by the app) |
-| `pt_flowlm_fused{,_fp16}.tflite` | step + head fused — **the app's frame graph** |
+| `pt_flowlm_fused{,_fp16}.tflite` | step + head fused — **the app's frame graph**; also carries a head-less batched `prefill` signature for the text prompt, sharing the backbone's weight buffers |
+| `pt_flowlm_prefill{N}{,_fp16}.tflite` | standalone head-less batched prefill, `N` tokens per invocation (`build_pockettts.py prefill`, `PT_PREFILL_TOKENS`, default 16) — a diagnostic; the app uses the fused graph's `prefill` signature |
 | `pt_mimi_dec_tx{,_fp16}.tflite` | Mimi decoder transformer block (app runs CPU) |
 | `pt_mimi_deconly{,_fp16}.tflite` | SEANet decoder |
 | `pt_embed_f16.bin`, `pt_input_linear_f32.bin`, `pt_bos_input_f32.bin`, `pt_neutral_latent_f32.bin` | host assets |
@@ -112,12 +113,13 @@ autoregressively). Correlation is the acceptance signal.
 | flow-LM step vs eager (teacher-forced, 41 steps) | latent max\|d\| ~1.4e-2, cond corr 1.000000 |
 | flow head vs eager `lsd_decode` | max\|d\| ~2e-7 |
 | fused vs split step+head (12 free-run steps) | max\|d\| 0.0 |
+| fused `prefill` signature vs per-token step | new-k max\|d\| ~1.2e-5 |
 | dec_tx blocks vs full-sequence eager | corr 1.000000, max\|d\| ~5e-4 |
 | deconly + dec_tx vs eager decode | corr 1.000000, max\|d\| ~2e-4 |
 | full tflite pipeline vs eager (same noise) | audio corr ~0.997 |
 | tokenizer pieces | 4000 |
 
-Stages run individually: `flowlm | head | fused | dectx | deconly | assets | pipeline`.
+Stages run individually: `flowlm | head | fused | prefill | dectx | deconly | assets | pipeline`.
 `PT_OUT` must be a POSIX path (do not point it at a Windows-style `C:\...` path
 from inside WSL — it becomes a literal relative directory named `C:...`).
 

@@ -18,6 +18,15 @@ class PocketTtsConfig(
     val lmGraph: String? = null,
     /** Frames per LM invocation; >1 needs the matching `pt_flowlm_ms{N}` graph. */
     val lmSteps: Int = 1,
+    /**
+     * Prefill the text prompt in batches through the fused graph's head-less
+     * `prefill` signature instead of one fused step per token. Measured on a
+     * Pixel 10 with the int8 LM it is *not* a win -- the fixed batch pads short
+     * prompts (7 tokens: ~140 ms per-token vs ~280 ms batched) and only breaks
+     * even near 28 -- so it is off by default. The signature costs almost no
+     * storage (it shares the graph's weight buffers).
+     */
+    val usePrefill: Boolean = false,
     /** SEANet window (feature positions) for streaming. */
     val streamW: Int = PocketTts.STREAM_W,
     /** When set, every synthesis reseeds the noise RNG so repeats are identical. */

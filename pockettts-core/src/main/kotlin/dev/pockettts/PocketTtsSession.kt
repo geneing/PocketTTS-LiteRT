@@ -164,6 +164,85 @@ class PocketTtsSession internal constructor(
     }
 
     /**
+     * Append the prompt tokens to the packed KV. With the fused graph's
+     * head-less `prefill` signature this is one invocation per
+     * [PocketTts.PREFILL_TOKENS] tokens instead of one fused step (flow head
+     * included) per token -- the latent a prompt step computes is discarded --
+     * and the host never uploads the ~25 MB packed KV per token. Falls back to
+     * the per-token fused step on model drops that predate the signature.
+     */
+    private fun prefill(ids: IntArray) {
+        val ins = engine.prefillIn
+        val outs = engine.prefillOut
+        if (ins == null || outs == null) {
+            for (id in ids) step(embRow(id), zeroNoise)
+            return
+        }
+        check(pos + ids.size <= PMAX) { "KV cache overflow at $pos + ${ids.size}" }
+        val p = PocketTts.PREFILL_TOKENS
+        val emb = engine.prefillEmb
+        val cos = engine.prefillCos
+        val sin = engine.prefillSin
+        val msk = engine.prefillMask
+        val wr = engine.prefillWrite
+        val t0 = System.nanoTime()
+        var runNs = 0L
+        var i = 0
+        while (i < ids.size && !cancelled) {
+            val n = minOf(p, ids.size - i)
+            java.util.Arrays.fill(emb, 0f)
+            java.util.Arrays.fill(msk, PocketTts.MASK_NEG)
+            java.util.Arrays.fill(wr, 0f)
+            for (j in 0 until n) {
+                var b = ids[i + j] * PocketTts.H * 2
+                val eb = j * PocketTts.H
+                for (h in 0 until PocketTts.H) {
+                    emb[eb + h] = android.util.Half.toFloat(engine.embMap.getShort(b)); b += 2
+                }
+                ropeFill(pos + j)
+                System.arraycopy(cosArr, 0, cos, j * HD, HD)
+                System.arraycopy(sinArr, 0, sin, j * HD, HD)
+                val mb = j * (PMAX + 1)
+                for (q in 0 until pos + j) msk[mb + q] = 0f
+                msk[mb + PMAX] = 0f
+                wr[j * PMAX + pos + j] = 1f
+            }
+            ins[0].writeFloat(emb)
+            ins[1].writeFloat(cos)
+            ins[2].writeFloat(sin)
+            ins[3].writeFloat(msk)
+            ins[4].writeFloat(wr)
+            ins[5].writeFloat(pk)
+            ins[6].writeFloat(pv)
+            val rt = System.nanoTime()
+            engine.lm.run(ins, outs, 0)
+            runNs += System.nanoTime() - rt
+            val out = outs[0].readFloat()
+            var o = 0
+            for (j in 0 until n) {
+                for (g in 0 until G) {
+                    System.arraycopy(out, o, pk, g * PMAX * HD + (pos + j) * HD, HD); o += HD
+                }
+            }
+            for (j in 0 until n) {
+                for (g in 0 until G) {
+                    System.arraycopy(out, o, pv, g * PMAX * HD + (pos + j) * HD, HD); o += HD
+                }
+            }
+            for (j in 0 until n) {
+                for (h in 0 until NH) mask[h * (PMAX + 1) + pos + j] = 0f
+            }
+            pos += n
+            i += n
+        }
+        val t1 = System.nanoTime()
+        sLmIn += (t1 - t0) - runNs
+        sLmRun += runNs
+        sLmSteps += ids.size
+        sLmInv += (ids.size + p - 1) / p
+    }
+
+    /**
      * One fused frame: flow-LM step + flow head in a single invocation.
      * Output layout: eos(1) | latent(32) | new-k(96*64) | new-v(96*64).
      */
@@ -179,7 +258,7 @@ class PocketTtsSession internal constructor(
         engine.lmIn[5].writeFloat(pv)
         engine.lmIn[6].writeFloat(noise)
         val t1 = System.nanoTime()
-        engine.lm.run(engine.lmIn, engine.lmOut)
+        engine.runLm(engine.lmIn, engine.lmOut)
         val t2 = System.nanoTime()
         val out = engine.lmOut[0].readFloat()
         val eos = out[0]
@@ -322,11 +401,26 @@ class PocketTtsSession internal constructor(
             "PocketTTSTime",
             "stream: ${text.length} chars -> ${textChunks.size} text chunk(s), rate=$rate pitch=$pitch",
         )
+        for ((si, s) in textChunks.withIndex()) {
+            android.util.Log.i(
+                "PocketTTSTime",
+                "TRACE split #$si/${textChunks.size - 1} chars=${s.length} text=\"${trace(s)}\"",
+            )
+        }
+        var lastAudioAt = 0L
         for ((ci, chunk) in textChunks.withIndex()) {
             val chunkT0 = System.nanoTime()
+            val chunkGap = if (lastAudioAt > 0) (chunkT0 - lastAudioAt) / 1_000_000 else -1L
+            android.util.Log.i(
+                "PocketTTSTime",
+                "TRACE chunk #$ci/${textChunks.size - 1} start at " +
+                    "${(chunkT0 - t0) / 1_000_000}ms gapSincePrevAudio=${chunkGap}ms " +
+                    "text=\"${trace(chunk)}\"",
+            )
             val (prepared, eosGuess) = prepareTextPrompt(chunk)
             val ids = engine.tokenizer.encode(prepared)
             var chunkFirstAudio = -1L
+            var chunkFirstFrame = -1L
             var chunkAudioChunks = 0
             val dec = StreamDecoder { c ->
                 if (sFirstChunk < 0) sFirstChunk = (System.nanoTime() - t0) / 1_000_000
@@ -336,10 +430,14 @@ class PocketTtsSession internal constructor(
                     all.add(shaped)
                     onChunk(shaped)
                     chunkAudioChunks++
+                    lastAudioAt = System.nanoTime()
                 }
             }
             val genT = System.nanoTime()
-            val lats = generateChunk(ids, framesAfterEos = eosGuess + 2) { dec.push(it) }
+            val lats = generateChunk(ids, framesAfterEos = eosGuess + 2) { lat ->
+                if (chunkFirstFrame < 0) chunkFirstFrame = System.nanoTime()
+                dec.push(lat)
+            }
             val genMs = (System.nanoTime() - genT) / 1_000_000
             val flushT = System.nanoTime()
             dec.flush()
@@ -350,7 +448,7 @@ class PocketTtsSession internal constructor(
                     "gen=${genMs}ms flush=${flushMs}ms firstAudio=${chunkFirstAudio}ms " +
                     "audioChunks=$chunkAudioChunks wall=${
                         (System.nanoTime() - chunkT0) / 1_000_000
-                    }ms",
+                    }ms firstFrame=${if (chunkFirstFrame < 0) -1L else (chunkFirstFrame - chunkT0) / 1_000_000}ms",
             )
             frames += lats.size
             sPrompt += ids.size; sFrames += lats.size; sChunks++
@@ -456,6 +554,11 @@ class PocketTtsSession internal constructor(
 
         override fun push(text: String) {
             if (ended) return
+            android.util.Log.i(
+                "PocketTTSTime",
+                "TRACE agent push chars=${text.length} pending=${pending.length} " +
+                    "text=\"${trace(text, 400)}\"",
+            )
             pending.append(text)
             while (true) {
                 val sentence = takeSentence() ?: break
@@ -494,7 +597,11 @@ class PocketTtsSession internal constructor(
                 frames += r.frames
                 ms += r.ms
                 profile = r.profile
-                android.util.Log.i("PocketTTS", "agent sentence -> ${r.frames} frames in ${r.ms} ms (total ${ms} ms)")
+                android.util.Log.i(
+                    "PocketTTSTime",
+                    "TRACE agent sentence -> ${r.frames} frames in ${r.ms}ms (total ${ms}ms) " +
+                        "text=\"${trace(sentence, 400)}\"",
+                )
             } catch (e: Throwable) {
                 ended = true
                 listener.onError(e)
@@ -530,9 +637,17 @@ class PocketTtsSession internal constructor(
         sink: ((FloatArray) -> Unit)? = null,
     ): List<FloatArray> {
         resetToVoice()
-        for (id in ids) step(embRow(id), zeroNoise)
+        val promptT = System.nanoTime()
+        prefill(ids)
+        val promptMs = (System.nanoTime() - promptT) / 1_000_000
         val estimate = ceil((ids.size / PocketTts.TOKENS_PER_SECOND + PocketTts.GEN_SECONDS_PADDING) * PocketTts.FRAME_RATE)
         val maxGen = minOf(estimate.toInt(), PMAX - pos - 1)
+        if (sink != null) {
+            android.util.Log.i(
+                "PocketTTSTime",
+                "TRACE generateChunk prompt ${ids.size} tokens in ${promptMs}ms maxGen=$maxGen",
+            )
+        }
         val latents = ArrayList<FloatArray>(maxGen)
         var emb = engine.bosInput
         var eosStep = -1
@@ -777,6 +892,11 @@ class PocketTtsSession internal constructor(
 
     // ---- text preparation (ports of pocket_tts.models.tts_model) ----------
 
+    /** Cap/sanitize a text payload so it stays on one readable log line. */
+    private fun trace(s: String, max: Int = 1200): String =
+        (if (s.length <= max) s else s.substring(0, max) + "…(+" + (s.length - max) + " chars)")
+            .replace('\n', ' ')
+
     internal fun prepareTextPrompt(raw: String): Pair<String, Int> {
         var text = raw.trim()
         require(text.isNotEmpty()) { "Text prompt cannot be empty" }
@@ -813,13 +933,40 @@ class PocketTtsSession internal constructor(
                 part.size to engine.tokenizer.decode(part)
             }
 
+        /** Last resort for a segment with no `,;:` to break on: split at spaces
+         *  so no chunk exceeds the LM's per-chunk token budget. A single word
+         *  longer than the cap cannot be split further and stays as-is. */
+        fun splitOnSpace(text: String): List<Pair<Int, String>> {
+            val words = text.trim().split(Regex("\\s+")).filter { it.isNotEmpty() }
+            val out = ArrayList<Pair<Int, String>>()
+            var cur = StringBuilder()
+            var count = 0
+            for (w in words) {
+                val cand = if (cur.isEmpty()) w else "$cur $w"
+                val n = engine.tokenizer.encode(cand).size
+                if (count > 0 && n > PocketTts.MAX_TOKENS_PER_CHUNK) {
+                    out.add(count to cur.toString())
+                    cur = StringBuilder(w)
+                    count = engine.tokenizer.encode(w).size
+                } else {
+                    cur = StringBuilder(cand)
+                    count = n
+                }
+            }
+            if (count > 0) out.add(count to cur.toString())
+            return out
+        }
+
         val sentences = segments(tokens, boundaries(tokens, engine.endTokens))
         val refined = ArrayList<Pair<Int, String>>()
         for ((n, textSeg) in sentences) {
             if (n <= PocketTts.MAX_TOKENS_PER_CHUNK) { refined.add(n to textSeg); continue }
             val sub = engine.tokenizer.encode(textSeg.trim()).toList()
             val subSegs = segments(sub, boundaries(sub, engine.fallbackTokens))
-            if (subSegs.size > 1) refined.addAll(subSegs) else refined.add(n to textSeg)
+            for ((sn, st) in subSegs) {
+                if (sn <= PocketTts.MAX_TOKENS_PER_CHUNK) refined.add(sn to st)
+                else refined.addAll(splitOnSpace(st))
+            }
         }
 
         val chunks = ArrayList<String>()

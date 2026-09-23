@@ -61,6 +61,13 @@ HD = 64
 FFN = 4096
 LDIM = 32
 PMAX = 512            # flow-LM KV capacity: voice (~142) + text (~55) + gen (~235)
+# Text tokens the fused graph's optional head-less `prefill` signature consumes
+# per invocation (`PT_PREFILL_TOKENS`). 0 -- the default -- exports the fused
+# graph on its own. The signature shares the backbone's weight buffers, so it
+# costs almost no storage, but its extra subgraph does add runtime memory, and
+# measured on a Pixel 10 with the int8 LM the batching is not a win (the fixed
+# batch pads short prompts), so it is opt-in.
+PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "0"))
 FLOW_DIM = 512
 FLOW_DEPTH = 6
 
@@ -128,6 +135,49 @@ def convert(mod, example_inputs, out):
     litert_torch.convert(mod.eval(), example_inputs).export(out)
     print(f"exported {out} ({os.path.getsize(out)/1e6:.1f} MB)")
     return out
+
+
+def convert_multi(default_mod, default_args, extra, out):
+    """Export [default_mod] as the default `serving_default` signature plus each
+    `(name, module, args)` in [extra] as a named signature, into one file.
+
+    Signatures that share a submodule share its weight buffers, so a graph pair
+    like "fused step" + "head-less prefill" stores the backbone once. Both the
+    fp16 and the int8 quantizers keep every signature (verified: the extra one
+    stays listed and the file does not grow by the shared weights).
+    """
+    import litert_torch
+    builder = None
+    for name, mod, args in extra:
+        builder = (litert_torch.signature(name, mod.eval(), args) if builder is None
+                   else builder.signature(name, mod.eval(), args))
+    em = (builder.convert(default_mod.eval(), default_args) if builder is not None
+          else litert_torch.convert(default_mod.eval(), default_args))
+    if os.path.exists(out):
+        os.remove(out)
+    em.export(out)
+    print(f"exported {out} ({os.path.getsize(out)/1e6:.1f} MB)")
+    return out
+
+
+def run_signature(path, name, args, out_floats):
+    """Run one signature of a graph whose I/O is float32.
+
+    [name] is a signature name, an explicit index, or None for the first
+    signature. Returns [out_floats] flat float32 values per output, in order.
+    """
+    from ai_edge_litert.compiled_model import CompiledModel
+    m = CompiledModel.from_file(path)
+    idx = 0 if name is None else (name if isinstance(name, int)
+                                  else m.get_signature_index(name))
+    if idx < 0:
+        raise ValueError(f"{path} has no signature {name!r}: {list(m.get_signature_list())}")
+    ins = m.create_input_buffers(idx)
+    outs = m.create_output_buffers(idx)
+    for buf, a in zip(ins, args):
+        buf.write(np.ascontiguousarray(a, dtype=np.float32).ravel())
+    m.run_by_index(idx, ins, outs)
+    return [np.array(buf.read(n, np.float32)) for buf, n in zip(outs, out_floats)]
 
 
 def to_fp16(fp32_path, fp16_path):
@@ -587,22 +637,79 @@ def stage_fused(model):
                torch.zeros(1, N_LAYERS * N_HEADS, PMAX, HD),
                torch.zeros(1, N_LAYERS * N_HEADS, PMAX, HD),
                torch.zeros(1, LDIM))
-    p = convert(fused, example, os.path.join(OUT, "pt_flowlm_fused.tflite"))
-    opcheck(p, "flowlm_fused")
-    to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
-    opcheck(os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"), "flowlm_fused_fp16")
 
-    cm = CM(p)
+    # Opt-in second signature: the head-less batched prompt prefill. It shares
+    # the backbone's weight buffers, so the file grows by ~1 MB, not by a second
+    # copy of the weights (170.5 MB vs 169.2 MB + 133.5 MB as two files). It is
+    # off by default because the extra subgraph still costs *runtime* memory at
+    # load, and a 3 GB app memory limit does not always have that to spare.
+    P = PREFILL_TOKENS
+    extra = []
+    if P > 0:
+        pre = PrefillStep(flm, P).eval()
+        # FlowLMStep clones the backbone weights, so hand the prefill the *same*
+        # step instance: both signatures then reference one parameter set and the
+        # converter stores its buffers once.
+        pre.step = fused.step
+        pids = [(i * 7 + 3) % emb_w.shape[0] for i in range(P)]
+        pre_emb = torch.stack([emb_w[t] for t in pids], dim=0).view(1, P, -1)
+        pre_cos = torch.zeros(1, P, 1, HD)
+        pre_sin = torch.zeros(1, P, 1, HD)
+        pre_mask = torch.zeros(1, P, PMAX + 1)
+        pre_write = torch.zeros(1, P, PMAX, 1)
+        for i in range(P):
+            c, s = rope_cos_sin_deint(off0 + i)
+            pre_cos[0, i, 0] = torch.from_numpy(c)
+            pre_sin[0, i, 0] = torch.from_numpy(s)
+            pre_mask[0, i] = torch.from_numpy(make_mask(off0 + i)[0, 0, 0])
+            pre_write[0, i, off0 + i, 0] = 1.0
+        pre_args = (pre_emb, pre_cos, pre_sin, pre_mask, pre_write, pk, pv)
+        extra.append(("prefill", pre, pre_args))
+
+        # eager reference for the prefill rows: the per-token step it replaces
+        pk_r, pv_r = pk.clone(), pv.clone()
+        with torch.no_grad():
+            for i in range(P):
+                c, s = rope_cos_sin_deint(off0 + i)
+                _, _, nk, nv = step(emb_w[pids[i]].view(1, 1, -1),
+                                    torch.from_numpy(c).view(1, 1, 1, HD),
+                                    torch.from_numpy(s).view(1, 1, 1, HD),
+                                    torch.from_numpy(make_mask(off0 + i)), pk_r, pv_r)
+                pk_r[0, :, off0 + i] = nk[0, :, 0]
+                pv_r[0, :, off0 + i] = nv[0, :, 0]
+
+    p = convert_multi(fused, example, extra, os.path.join(OUT, "pt_flowlm_fused.tflite"))
+    opcheck(p, "flowlm_fused")
+    fp16 = to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
+    opcheck(fp16, "flowlm_fused_fp16")
+
+    # The step signature, on the fp16 file that actually ships.
     c, s = rope_cos_sin_deint(off0)
     with torch.no_grad():
         ref = fused(bos_in.view(1, 1, -1), torch.from_numpy(c).view(1, 1, 1, HD),
                     torch.from_numpy(s).view(1, 1, 1, HD),
                     torch.from_numpy(make_mask(off0)), pk, pv, noises[0])
-    outs = cm(bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
-              s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
-              noises[0].numpy())
-    print(f"tflite fused one-step corr {corr(outs[0], ref.numpy()):.6f} "
+    outs = run_signature(
+        fp16, None,
+        (bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
+         s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
+         noises[0].numpy()),
+        [1 + LDIM + 2 * G_KV])
+    print(f"fp16 fused one-step corr {corr(outs[0], ref.numpy()):.6f} "
           f"max|d| {maxd(outs[0], ref.numpy()):.2e}")
+
+    if P > 0:
+        # A named signature is laid out *before* the default, so the step is
+        # index 1 and the prefill is index 0.
+        got = run_signature(fp16, 1, tuple(a.numpy() for a in pre_args),
+                            [2 * P * G_KV])[0]
+        nk_p = got[:P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
+        nv_p = got[P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)
+        nk_ref = pk_r[0, :, off0:off0 + P].permute(1, 0, 2).unsqueeze(0)
+        nv_ref = pv_r[0, :, off0:off0 + P].permute(1, 0, 2).unsqueeze(0)
+        print(f"fp16 prefill signature vs per-token step  new-k max|d| "
+              f"{maxd(nk_p, nk_ref.numpy()):.2e}  new-v max|d| "
+              f"{maxd(nv_p, nv_ref.numpy()):.2e}")
 
 
 G_KV = N_LAYERS * N_HEADS * HD
@@ -745,6 +852,119 @@ def stage_multistep(model, steps_list):
               f"{corr(outs16[0], out3.numpy()):.6f}  max|d| "
               f"{maxd(outs16[0], out3.numpy()):.2e}")
         del ms
+
+
+# ============================================================== prompt prefill
+class PrefillStep(nn.Module):
+    """Append P text tokens to the packed KV in ONE head-less invocation.
+
+    A prompt token needs the flow-LM backbone only -- its audio-head output is
+    discarded -- and on the phone the per-token host<->GPU round trip dominates
+    the math, so P token embeddings go through in a single run. Padding rows are
+    inert as long as their write mask is 0: their K/V is never stored and their
+    output is ignored.
+
+    I/O (all fixed shape):
+      emb   [1,P,1024]      one embedding per prompt position
+      cos   [1,P,1,64]      RoPE at positions off..off+P-1
+      sin   [1,P,1,64]
+      mask  [1,P,PMAX+1]    per-position additive attention mask
+      write [1,P,PMAX,1]    one-hot at off+i (fp32, exactly 0/1; 0 = padding)
+      pk/pv [1,96,PMAX,64]  packed KV before the run
+    ->  one flat [1, 2*P*96*64] = new-k[1,P,96,64] | new-v[1,P,96,64],
+        position-major (single readback).
+    """
+
+    def __init__(self, flow_lm, tokens):
+        super().__init__()
+        self.tokens = tokens
+        self.step = FlowLMStep(flow_lm)
+
+    def forward(self, emb, cos, sin, mask, write, pk, pv):
+        pkv, pvv = pk, pv
+        nks, nvs = [], []
+        for i in range(self.tokens):
+            mi = mask[:, i:i + 1].unsqueeze(2)              # [1,1,1,PMAX+1]
+            wi = write[:, i:i + 1]                          # [1,1,PMAX,1]
+            _, _, nk, nv = self.step(emb[:, i:i + 1], cos[:, i:i + 1], sin[:, i:i + 1],
+                                     mi, pkv, pvv)
+            pkv = pkv * (1.0 - wi) + nk * wi
+            pvv = pvv * (1.0 - wi) + nv * wi
+            nks.append(nk)
+            nvs.append(nv)
+        nk_all = torch.cat(nks, dim=1).permute(0, 2, 1, 3)  # [1,P,96,64]
+        nv_all = torch.cat(nvs, dim=1).permute(0, 2, 1, 3)
+        return torch.cat([nk_all.reshape(1, -1), nv_all.reshape(1, -1)], dim=-1)
+
+
+def stage_prefill(model, tokens_list):
+    """Export the head-less batched prompt graph and check every real row against
+    the sequential per-token step it replaces."""
+    print(f"\n=== prompt prefill graph (head-less, P={tokens_list}) ===")
+    flm = model.flow_lm
+    step = FlowLMStep(flm).eval()
+    ks, vs, off0 = load_voice_state("alba")
+    pk0, pv0 = pack_voice(ks, vs, off0)
+    emb_w = flm.conditioner.embed.weight.detach()
+
+    rec, _ = record_reference(model, "alba",
+                              "Hello world. I am Pocket TTS running on a phone.")
+    prompt = rec["tokens"][0].tolist()
+    print(f"prompt tokens={len(prompt)}")
+
+    for P in tokens_list:
+        assert off0 + P <= PMAX, f"P={P} overflows the KV cache at off={off0}"
+        pre = PrefillStep(flm, P).eval()
+        real = min(P, len(prompt))
+        ids = (prompt + [0] * P)[:P]
+        emb = torch.stack([emb_w[t] for t in ids], dim=0).view(1, P, -1)
+        cos = torch.zeros(1, P, 1, HD)
+        sin = torch.zeros(1, P, 1, HD)
+        mask = torch.zeros(1, P, PMAX + 1)
+        write = torch.zeros(1, P, PMAX, 1)
+        for i in range(P):
+            c, s = rope_cos_sin_deint(off0 + i)
+            cos[0, i, 0] = torch.from_numpy(c)
+            sin[0, i, 0] = torch.from_numpy(s)
+            mask[0, i] = torch.from_numpy(make_mask(off0 + i)[0, 0, 0])
+            if i < real:
+                write[0, i, off0 + i, 0] = 1.0
+
+        # eager reference: the per-token step the host used to call P times
+        pk_a, pv_a = pk0.clone(), pv0.clone()
+        with torch.no_grad():
+            for i in range(real):
+                c, s = rope_cos_sin_deint(off0 + i)
+                _, _, nk, nv = step(emb[:, i:i + 1], torch.from_numpy(c).view(1, 1, 1, HD),
+                                    torch.from_numpy(s).view(1, 1, 1, HD),
+                                    torch.from_numpy(make_mask(off0 + i)), pk_a, pv_a)
+                pk_a[0, :, off0 + i] = nk[0, :, 0]
+                pv_a[0, :, off0 + i] = nv[0, :, 0]
+
+        args = (emb, cos, sin, mask, write, pk0, pv0)
+        with torch.no_grad():
+            out = pre(*args)
+        nk_p = out[:, :P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
+        nv_p = out[:, P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)
+        nk_ref = pk_a[0, :, off0:off0 + real].permute(1, 0, 2).unsqueeze(0)
+        nv_ref = pv_a[0, :, off0:off0 + real].permute(1, 0, 2).unsqueeze(0)
+        print(f"P={P}: prefill vs per-token step  new-k max|d| "
+              f"{maxd(nk_p[:, :real].numpy(), nk_ref.numpy()):.2e}  new-v max|d| "
+              f"{maxd(nv_p[:, :real].numpy(), nv_ref.numpy()):.2e}")
+
+        p = convert(pre, args, os.path.join(OUT, f"pt_flowlm_prefill{P}.tflite"))
+        opcheck(p, f"flowlm_prefill{P}")
+        to_fp16(p, os.path.join(OUT, f"pt_flowlm_prefill{P}_fp16.tflite"))
+        opcheck(os.path.join(OUT, f"pt_flowlm_prefill{P}_fp16.tflite"), f"flowlm_prefill{P}_fp16")
+        cm = CM(p)
+        outs = cm(*[a.numpy() for a in args])
+        print(f"P={P}: tflite vs eager  corr {corr(outs[0], out.numpy()):.6f}  "
+              f"max|d| {maxd(outs[0], out.numpy()):.2e}")
+        cm16 = CM(os.path.join(OUT, f"pt_flowlm_prefill{P}_fp16.tflite"))
+        outs16 = cm16(*[a.numpy() for a in args])
+        print(f"P={P}: fp16 tflite vs eager  corr {corr(outs16[0], out.numpy()):.6f}  "
+              f"max|d| {maxd(outs16[0], out.numpy()):.2e}")
+        del pre
 
 
 # ============================================================ mimi dec graphs
@@ -1483,10 +1703,18 @@ def stage_quant(model):
                   f"parity skipped")
             continue
         print(f"[{tag}] io {sorted(dts)}")
-        cm = CM(dst)
-        outs = cm(bos_in.numpy(), c.reshape(1, 1, 1, HD), s.reshape(1, 1, 1, HD),
-                  mask, pk.numpy(), pv.numpy(), noise.numpy())
-        o, r = outs[0][0], ref[0]
+        # A fused graph that carries the prefill signature lays it out first, so
+        # the step is index 1; a plain graph has only index 0.
+        step_idx = 1 if PREFILL_TOKENS > 0 else 0
+        try:
+            o = run_signature(
+                dst, step_idx,
+                (bos_in.numpy(), c.reshape(1, 1, 1, HD), s.reshape(1, 1, 1, HD),
+                 mask, pk.numpy(), pv.numpy(), noise.numpy()), [ref.size])[0]
+        except Exception as e:
+            print(f"[{tag}] parity check skipped: {type(e).__name__}: {e}")
+            continue
+        r = ref[0]
         slices = [("eos", slice(0, 1)), ("lat", slice(1, 1 + LDIM)),
                   ("k", slice(1 + LDIM, 1 + LDIM + G_KV)),
                   ("v", slice(1 + LDIM + G_KV, None))]
@@ -1513,9 +1741,13 @@ def main():
         stage_assets(model)
     if stage in ("pipeline", "all"):
         stage_pipeline(model)
-    if stage == "multistep":
+    if stage in ("multistep",):
         steps = [int(s) for s in os.environ.get("PT_MS_STEPS", "4,8").split(",")]
         stage_multistep(model, steps)
+    if stage == "prefill":
+        tokens = [int(s) for s in
+                  os.environ.get("PT_PREFILL_TOKENS", str(PREFILL_TOKENS)).split(",")]
+        stage_prefill(model, tokens)
     if stage == "quant":
         stage_quant(model)
     if stage == "stream":

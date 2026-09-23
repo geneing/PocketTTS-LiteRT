@@ -103,15 +103,26 @@ class PocketTtsService : TextToSpeechService() {
             ).coerceIn(PocketTtsSettings.MIN_PITCH, PocketTtsSettings.MAX_PITCH)
 
         val t0 = System.nanoTime()
+        val utt = UTTERANCE.incrementAndGet()
         android.util.Log.i(
             "PocketTTSTime",
-            "service synth: ${text.length} chars voice=${voice.name} rate=$rate pitch=$pitch " +
-                "maxBuf=${callback.maxBufferSize}",
+            "service synth#$utt TRACE enter text(${text.length})=\"${preview(text)}\" " +
+                "voice=${voice.name} rate=$rate pitch=$pitch maxBuf=${callback.maxBufferSize} " +
+                "@${android.os.SystemClock.elapsedRealtime()}",
         )
 
         val session: PocketTtsSession
         try {
+            val loadT = System.nanoTime()
             session = engine().newSession(voice.name)
+            val loadMs = (System.nanoTime() - loadT) / 1_000_000
+            if (loadMs >= 30) {
+                android.util.Log.i(
+                    "PocketTTSTime",
+                    "service #$utt TRACE engine+session load=${loadMs}ms " +
+                        "t=${(System.nanoTime() - t0) / 1_000_000}ms",
+                )
+            }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "engine load failed", e)
             // start() must have been called before error() on some frameworks.
@@ -136,8 +147,24 @@ class PocketTtsService : TextToSpeechService() {
         val sentinel = FloatArray(0)
         var producerError: Throwable? = null
         val producer = Thread({
+            var produced = 0
+            android.util.Log.i(
+                "PocketTTSTime",
+                "service #$utt TRACE producer start t=${(System.nanoTime() - t0) / 1_000_000}ms",
+            )
             try {
-                session.stream(text) { queue.put(it) }
+                session.stream(text) { chunk ->
+                    val putT = System.nanoTime()
+                    queue.put(chunk)
+                    val putMs = (System.nanoTime() - putT) / 1_000_000
+                    produced++
+                    android.util.Log.i(
+                        "PocketTTSTime",
+                        "service #$utt TRACE producer put#$produced ${chunk.size} samples " +
+                            "blocked=${putMs}ms queue=${queue.size}/$QUEUE_CHUNKS " +
+                            "t=${(System.nanoTime() - t0) / 1_000_000}ms",
+                    )
+                }
             } catch (e: Throwable) {
                 producerError = e
             } finally {
@@ -163,10 +190,19 @@ class PocketTtsService : TextToSpeechService() {
             }
             producer.start()
             var stopped = false
+            var consumed = 0
             while (true) {
+                val takeT = System.nanoTime()
                 val chunk = queue.take()
+                val takeMs = (System.nanoTime() - takeT) / 1_000_000
                 if (chunk === sentinel) break
                 if (stopped) continue
+                consumed++
+                android.util.Log.i(
+                    "PocketTTSTime",
+                    "service #$utt TRACE consumer chunk#$consumed waited=${takeMs}ms " +
+                        "queue=${queue.size}/$QUEUE_CHUNKS t=${(System.nanoTime() - t0) / 1_000_000}ms",
+                )
                 if (firstAudio < 0) {
                     firstAudio = (System.nanoTime() - t0) / 1_000_000
                     android.util.Log.i(
@@ -228,12 +264,14 @@ class PocketTtsService : TextToSpeechService() {
                     buf[o++] = ((s shr 8) and 0xFF).toByte()
                 }
                 i += take
+                val callT = System.nanoTime()
                 val stopped = callback.audioAvailable(buf, 0, o) == TextToSpeech.STOPPED
+                val callMs = (System.nanoTime() - callT) / 1_000_000
                 bytes += o
                 android.util.Log.i(
                     "PocketTTSTime",
                     "  audioAvailable#${++calls} ${o}B total=${bytes}B " +
-                        "at ${(System.nanoTime() - t0) / 1_000_000}ms",
+                        "clientCall=${callMs}ms at ${(System.nanoTime() - t0) / 1_000_000}ms",
                 )
                 if (stopped) return false
             }
@@ -372,5 +410,12 @@ class PocketTtsService : TextToSpeechService() {
          * cover the decode gap; a few more absorb jitter without much memory.
          */
         private const val QUEUE_CHUNKS = 8
+
+        /** Monotonic id per [onSynthesizeText], so log lines can be correlated. */
+        private val UTTERANCE = java.util.concurrent.atomic.AtomicLong()
+
+        /** Cap a text payload so a single log line stays readable. */
+        internal fun preview(s: String, max: Int = 1200): String =
+            if (s.length <= max) s else s.substring(0, max) + "…(+" + (s.length - max) + " chars)"
     }
 }
