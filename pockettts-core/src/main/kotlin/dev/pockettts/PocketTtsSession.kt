@@ -408,6 +408,8 @@ class PocketTtsSession internal constructor(
             )
         }
         var lastAudioAt = 0L
+        // The previous sentence's decoder tail, so each new chunk starts warm.
+        var codecTail = engine.codecTailFor(voice)
         for ((ci, chunk) in textChunks.withIndex()) {
             val chunkT0 = System.nanoTime()
             val chunkGap = if (lastAudioAt > 0) (chunkT0 - lastAudioAt) / 1_000_000 else -1L
@@ -433,6 +435,7 @@ class PocketTtsSession internal constructor(
                     lastAudioAt = System.nanoTime()
                 }
             }
+            dec.prime(codecTail)
             val genT = System.nanoTime()
             val lats = generateChunk(ids, framesAfterEos = eosGuess + 2) { lat ->
                 if (chunkFirstFrame < 0) chunkFirstFrame = System.nanoTime()
@@ -442,6 +445,7 @@ class PocketTtsSession internal constructor(
             val flushT = System.nanoTime()
             dec.flush()
             val flushMs = (System.nanoTime() - flushT) / 1_000_000
+            codecTail = if (engine.codecContinuity) dec.tail() else null
             android.util.Log.i(
                 "PocketTTSTime",
                 "text chunk $ci/${textChunks.size - 1}: ${ids.size} tokens -> ${lats.size} frames " +
@@ -453,6 +457,7 @@ class PocketTtsSession internal constructor(
             frames += lats.size
             sPrompt += ids.size; sFrames += lats.size; sChunks++
         }
+        engine.rememberCodecTail(codecTail)
         val tail = stretcher.finish()
         if (tail.isNotEmpty()) {
             all.add(tail)
@@ -673,6 +678,10 @@ class PocketTtsSession internal constructor(
                 g++
             }
         }
+        android.util.Log.i(
+            "PocketTTSTime",
+            "TRACE generateChunk done: eosStep=$eosStep frames=${latents.size} maxGen=$maxGen",
+        )
         return latents
     }
 
@@ -740,6 +749,13 @@ class PocketTtsSession internal constructor(
         private var featPos = 0
         private var emitted = 0
 
+        /**
+         * Feature-buffer origin, in positions, of frame [kept]. Zero normally;
+         * [prime] makes it negative so the primer's frames land *before* the
+         * window's context instead of pushing the sentence past the buffer.
+         */
+        private var featBase = 0
+
         /** Next emission target in frames: cumulative chunk sizes. */
         private var emitAt = PocketTts.STREAM_RAMP[0]
         private var ramp = 1
@@ -748,6 +764,53 @@ class PocketTtsSession internal constructor(
         private val maxHop = (engine.streamW - PocketTts.STREAM_L) / PocketTts.UPS
         var chunks = 0
             private set
+
+        /**
+         * Decode the previous sentence's tail as warm-up before any new frames.
+         * The primer fills the first block with real content -- without it the
+         * opening frames are decoded in a block whose only context is neutral
+         * padding, which is the onset transient -- and its feature tail is
+         * spliced in as the SEANet window's left context. The primer's own audio
+         * is not emitted.
+         */
+        fun prime(prev: PocketTtsEngine.CodecTail?) {
+            if (prev == null) return
+            // The sliding block chain only starts once the primer is longer than
+            // one block, so pad a short tail at the front with neutral latents;
+            // the frames next to the new sentence stay real either way.
+            repeat((PocketTts.F_BLK - prev.lats.size).coerceAtLeast(0)) {
+                lats.add(engine.neutral)
+            }
+            lats.addAll(prev.lats)
+            decodeTo(lats.size)
+            if (prev.feat.size == PocketTts.MIMI_D * PocketTts.STREAM_L) {
+                for (c in 0 until PocketTts.MIMI_D) {
+                    System.arraycopy(
+                        prev.feat, c * PocketTts.STREAM_L,
+                        feat, c * PocketTts.S_DEC, PocketTts.STREAM_L,
+                    )
+                }
+            }
+            featBase = PocketTts.STREAM_L - lats.size * PocketTts.UPS
+            featPos = PocketTts.STREAM_L
+            emitted = PocketTts.STREAM_L
+            emitAt = lats.size + PocketTts.STREAM_RAMP[0]
+        }
+
+        /** The tail the next sentence primes from: latents + emitted features. */
+        fun tail(): PocketTtsEngine.CodecTail {
+            val f = FloatArray(PocketTts.MIMI_D * PocketTts.STREAM_L)
+            val at = emitted - PocketTts.STREAM_L
+            if (at >= 0) {
+                for (c in 0 until PocketTts.MIMI_D) {
+                    System.arraycopy(
+                        feat, c * PocketTts.S_DEC + at,
+                        f, c * PocketTts.STREAM_L, PocketTts.STREAM_L,
+                    )
+                }
+            }
+            return PocketTtsEngine.CodecTail(voice, lats.takeLast(PocketTts.F_BLK), f)
+        }
 
         fun push(lat: FloatArray) {
             if (cancelled) return
@@ -804,6 +867,10 @@ class PocketTtsSession internal constructor(
             sDecTx += System.nanoTime() - t0
             val drop = if (start == 0) 0 else PocketTts.F_HOP
             val keepN = minOf(PocketTts.F_BLK, size - start) - drop
+            val at = featBase + (start + drop) * PocketTts.UPS
+            check(at >= 0 && at + keepN * PocketTts.UPS <= PocketTts.S_DEC) {
+                "streaming feature buffer overrun at $at + ${keepN * PocketTts.UPS}"
+            }
             android.util.Log.i(
                 "PocketTTSTime",
                 "  dec_tx block start=$start size=$size drop=$drop keep=$keepN ms=$ms",
@@ -811,11 +878,11 @@ class PocketTtsSession internal constructor(
             for (c in 0 until PocketTts.MIMI_D) {
                 System.arraycopy(
                     out, c * PocketTts.S_BLK + drop * PocketTts.UPS,
-                    feat, c * PocketTts.S_DEC + (start + drop) * PocketTts.UPS, keepN * PocketTts.UPS,
+                    feat, c * PocketTts.S_DEC + at, keepN * PocketTts.UPS,
                 )
             }
             kept = start + drop + keepN
-            featPos = kept * PocketTts.UPS
+            featPos = featBase + kept * PocketTts.UPS
         }
 
         private fun emitWindow() {

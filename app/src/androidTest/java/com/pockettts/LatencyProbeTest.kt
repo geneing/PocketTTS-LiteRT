@@ -8,6 +8,7 @@ import dev.pockettts.PocketTtsConfig
 import dev.pockettts.PocketTtsEngine
 import dev.pockettts.PocketTtsModels
 import dev.pockettts.sonicStretch
+import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -98,5 +99,104 @@ class LatencyProbeTest {
             )
         }
         engine.close()
+    }
+
+    /**
+     * Codec continuity: with [PocketTtsConfig.codecContinuity] the decoder is
+     * primed from the previous sentence's tail. The primer is context, not
+     * output, so the amount of audio must not change; and a single-sentence text
+     * has nothing to prime from, so it must still match the one-shot take.
+     */
+    @Test
+    fun continuity() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val models = PocketTtsModels.default(ctx)
+        val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+        val engine = PocketTtsEngine(
+            ctx,
+            PocketTtsConfig(
+                models, Placement.default(ctx, dir), noiseSeed = 42L, codecContinuity = true,
+            ),
+        )
+        for ((label, text) in texts) {
+            val streamed = engine.newSession("alba").use { it.stream(text) {}.audio }
+            val oneShot = engine.newSession("alba").use { it.synthesize(text).audio }
+            val db = relDb(oneShot, streamed)
+            Log.i(
+                "Probe",
+                "continuity $label: oneShot=${oneShot.size} streamed=${streamed.size} relDb=$db",
+            )
+            assertEquals("continuity $label length", oneShot.size, streamed.size)
+            assertTrue("continuity $label finite", streamed.all { it.isFinite() })
+            if (label == "short") {
+                // One text chunk, so nothing was primed: full parity is expected.
+                assertTrue("continuity $label relDb $db", db < -40.0)
+            }
+        }
+        engine.close()
+    }
+
+    /**
+     * Diagnostic for the two prompt-prefill paths. Batching the prompt through
+     * the fused graph's `prefill` signature is *supposed* to reproduce the
+     * per-token fused step, but on the shipped int8 graph it does not: with the
+     * same text and seed the two takes are uncorrelated and the batched one
+     * truncates short prompts (a six-word sentence collapses to three frames).
+     * That is why [PocketTtsConfig.usePrefill] is off. This logs the gap and
+     * asserts only what does hold: the per-token path is bit-reproducible,
+     * because every utterance starts from a full KV reset.
+     */
+    @Test
+    fun prefillPaths() {
+        val ctx = InstrumentationRegistry.getInstrumentation().targetContext
+        val models = PocketTtsModels.default(ctx)
+        val dir = ctx.getExternalFilesDir(null) ?: ctx.filesDir
+        val cases = listOf("short" to texts[0].second, "medium" to texts[1].second)
+        val takes = HashMap<String, FloatArray>()
+        for ((label, prefill) in listOf("batched" to true, "perToken" to false)) {
+            // One engine at a time: each holds ~1 GB of native weights.
+            val engine = PocketTtsEngine(
+                ctx,
+                PocketTtsConfig(
+                    models, Placement.default(ctx, dir), noiseSeed = 42L, usePrefill = prefill,
+                ),
+            )
+            for ((name, text) in cases) {
+                val a = engine.newSession("alba").use { it.stream(text) {} }
+                val b = engine.newSession("alba").use { it.stream(text) {} }
+                Log.i(
+                    "Probe",
+                    "prefillPaths $label $name frames=${a.frames}/${b.frames} " +
+                        "samples=${a.audio.size}/${b.audio.size} " +
+                        "sec=${a.audio.size / 24000f} repeatRelDb=${relDb(a.audio, b.audio)}",
+                )
+                if (!prefill) {
+                    assertArrayEquals("perToken $name repeat", a.audio, b.audio, 0f)
+                }
+                takes["$label/$name"] = b.audio
+            }
+            engine.close()
+        }
+        for ((name, _) in cases) {
+            val batched = takes.getValue("batched/$name")
+            val perToken = takes.getValue("perToken/$name")
+            Log.i(
+                "Probe",
+                "prefillPaths $name batched-vs-perToken samples=${batched.size}/" +
+                    "${perToken.size} relDb=${relDb(batched, perToken)}",
+            )
+        }
+    }
+
+    private fun relDb(a: FloatArray, b: FloatArray): Double {
+        val n = minOf(a.size, b.size)
+        var diffSq = 0.0
+        var sigSq = 0.0
+        for (i in 0 until n) {
+            val d = (a[i] - b[i]).toDouble()
+            diffSq += d * d
+            sigSq += a[i].toDouble() * a[i]
+        }
+        return 20 * kotlin.math.log10(kotlin.math.sqrt(diffSq / n) / kotlin.math.sqrt(sigSq / n))
     }
 }

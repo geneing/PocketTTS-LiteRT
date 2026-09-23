@@ -61,13 +61,11 @@ HD = 64
 FFN = 4096
 LDIM = 32
 PMAX = 512            # flow-LM KV capacity: voice (~142) + text (~55) + gen (~235)
-# Text tokens the fused graph's optional head-less `prefill` signature consumes
-# per invocation (`PT_PREFILL_TOKENS`). 0 -- the default -- exports the fused
-# graph on its own. The signature shares the backbone's weight buffers, so it
-# costs almost no storage, but its extra subgraph does add runtime memory, and
-# measured on a Pixel 10 with the int8 LM the batching is not a win (the fixed
-# batch pads short prompts), so it is opt-in.
-PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "0"))
+# Text tokens the fused graph's head-less `prefill` signature consumes per
+# invocation (`PT_PREFILL_TOKENS`). The signature shares the backbone's weight
+# buffers, so it costs almost no storage, and the app batches the prompt through
+# it. Set 0 to export the fused graph without it.
+PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "16"))
 FLOW_DIM = 512
 FLOW_DEPTH = 6
 
@@ -700,8 +698,10 @@ def stage_fused(model):
 
     if P > 0:
         # A named signature is laid out *before* the default, so the step is
-        # index 1 and the prefill is index 0.
-        got = run_signature(fp16, 1, tuple(a.numpy() for a in pre_args),
+        # index 1 and the prefill is index 0. (This read 1 for a while, which
+        # ran the *step* with the prefill's inputs and made the number below
+        # meaningless -- the prefill signature went unverified.)
+        got = run_signature(fp16, 0, tuple(a.numpy() for a in pre_args),
                             [2 * P * G_KV])[0]
         nk_p = got[:P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
         nv_p = got[P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)

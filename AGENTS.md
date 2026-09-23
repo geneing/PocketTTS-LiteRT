@@ -88,8 +88,10 @@ to an invalid value or clear `~/.cache/huggingface/hub/models--kyutai--pocket-tt
 |---|---|
 | `pt_flowlm_step{,_fp16}.tflite` | one AR step, packed-KV I/O (reference; not loaded by the app) |
 | `pt_flow_head{,_fp16}.tflite` | flow head alone (reference; not loaded by the app) |
-| `pt_flowlm_fused{,_fp16}.tflite` | step + head fused — **the app's frame graph**; also carries a head-less batched `prefill` signature for the text prompt, sharing the backbone's weight buffers |
-| `pt_flowlm_prefill{N}{,_fp16}.tflite` | standalone head-less batched prefill, `N` tokens per invocation (`build_pockettts.py prefill`, `PT_PREFILL_TOKENS`, default 16) — a diagnostic; the app uses the fused graph's `prefill` signature |
+| `pt_flowlm_fused.tflite` | step + head fused, fp32 reference |
+| `pt_flowlm_fused_dyn8_all.tflite` | the same graph dynamic-range int8 — **the app's LM**; also carries a head-less batched `prefill` signature sharing the backbone's weight buffers, but the app does **not** use it: on this graph the batched rows do not reproduce the per-token step (uncorrelated audio, short prompts truncated), so `usePrefill` is off and each prompt is one fused step per token |
+| `pt_flowlm_fused_fp16.tflite` | fp16 sibling of the fp32 graph, kept for quantizer comparison only — not packed, not loaded |
+| `pt_flowlm_prefill{N}{,_fp16}.tflite` | standalone head-less batched prefill (`build_pockettts.py prefill`, `PT_PREFILL_TOKENS`) — a diagnostic for the prefill math; not packed, and nothing loads it (the app prefills per token) |
 | `pt_mimi_dec_tx{,_fp16}.tflite` | Mimi decoder transformer block (app runs CPU) |
 | `pt_mimi_deconly{,_fp16}.tflite` | SEANet decoder |
 | `pt_embed_f16.bin`, `pt_input_linear_f32.bin`, `pt_bos_input_f32.bin`, `pt_neutral_latent_f32.bin` | host assets |
@@ -98,8 +100,11 @@ to an invalid value or clear `~/.cache/huggingface/hub/models--kyutai--pocket-tt
 | `pipeline_{tflite,eager}.wav` | parity artifacts, not shipped |
 
 `_fp16` files are weight-only fp16 (fp32 compute) via `ai-edge-quantizer`'s
-`FLOAT_CASTING` recipe. The Android app loads only the fp16 graphs plus the four
-host `.bin` assets, the tokenizer and the voices.
+`FLOAT_CASTING` recipe; `_dyn8_all` is dynamic-range int8 (int8 weights, fp32
+activations, so the host protocol is unchanged) from the same tool. The Android
+app loads the int8 LM plus the fp16 Mimi graphs, the four host `.bin` assets, the
+tokenizer and the voices, and prefills each prompt one fused step per token
+(`usePrefill = false`); the fp16 flow-LM is a build byproduct, not a fallback.
 
 ## Verifying success
 
@@ -113,13 +118,14 @@ autoregressively). Correlation is the acceptance signal.
 | flow-LM step vs eager (teacher-forced, 41 steps) | latent max\|d\| ~1.4e-2, cond corr 1.000000 |
 | flow head vs eager `lsd_decode` | max\|d\| ~2e-7 |
 | fused vs split step+head (12 free-run steps) | max\|d\| 0.0 |
-| fused `prefill` signature vs per-token step | new-k max\|d\| ~1.2e-5 |
+| fused `prefill` signature vs per-token step | **not verified.** This row read ~1.2e-5 until the check was fixed: it passed signature index 1 (the step) with the prefill's *inputs*, so it measured nothing. Now index 0; expect it to report the mismatch that keeps `usePrefill` off |
 | dec_tx blocks vs full-sequence eager | corr 1.000000, max\|d\| ~5e-4 |
 | deconly + dec_tx vs eager decode | corr 1.000000, max\|d\| ~2e-4 |
 | full tflite pipeline vs eager (same noise) | audio corr ~0.997 |
 | tokenizer pieces | 4000 |
 
-Stages run individually: `flowlm | head | fused | prefill | dectx | deconly | assets | pipeline`.
+Stages run individually: `flowlm | head | fused | prefill | dectx | deconly | assets | pipeline`,
+plus `quant | multistep | stream` for the optional variants.
 `PT_OUT` must be a POSIX path (do not point it at a Windows-style `C:\...` path
 from inside WSL — it becomes a literal relative directory named `C:...`).
 
@@ -147,11 +153,26 @@ loads (`PocketTtsEngine` constants in `:pockettts-core`) into
 resolves first — that directory source is what makes model iteration a plain
 `adb push` with no APK rebuild.
 
+Beware: `:app:connectedDebugAndroidTest` **uninstalls the app** when it finishes,
+which deletes `/sdcard/Android/data/com.pockettts/files/` and every pushed model.
+For on-device test runs install first and drive the runner directly:
+
+```bash
+./gradlew :app:installDebug :app:installDebugAndroidTest
+adb shell am instrument -w -e class com.pockettts.LatencyProbeTest \
+    com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+`LatencyProbeTest` covers the engine (`probe` one-shot-vs-streamed parity,
+`continuity`, and `prefillPaths`, which logs the batched-vs-per-token prefill
+gap); `TtsServiceInstrumentedTest` drives the real framework client.
+
 To distribute models instead, `scripts/pack_models.py` builds the stored zips and
 fills `models.json`; upload them as a `models-<version>` GitHub release, which
 `ReleaseModelSource` then downloads on demand (variants: `base`, `lm-int8`,
-`lm-fp16`, `npu-g5`). `scripts/serve_models.py` + `adb reverse` tests that path
-locally.
+`npu-g5`; `lm-quant-variants` and `lm-multistep` are declared in `models.json` but
+still `PENDING`, so the packer exits 1 with warnings).
+`scripts/serve_models.py` + `adb reverse` tests that path locally.
 
 Speech rate and pitch are host-side DSP over the decoded PCM, not a graph change.
 The time-stretch/pitch-shift is the vendored [Sonic](https://github.com/waywardgeek/sonic)

@@ -35,6 +35,7 @@ class PocketTtsEngine(
     val placement: Placement = config.placement
     val lmSteps: Int = config.lmSteps
     val streamW: Int = config.streamW
+    val codecContinuity: Boolean = config.codecContinuity
     val noiseSeed: Long? = config.noiseSeed
 
     /** The voices this engine can speak, first = default. */
@@ -96,8 +97,7 @@ class PocketTtsEngine(
     }
 
     // ---- graphs -----------------------------------------------------------
-    val lmGraphName: String = config.lmGraph
-        ?: if (models.store.exists(PocketTts.LM_INT8)) PocketTts.LM_INT8 else PocketTts.LM
+    val lmGraphName: String = config.lmGraph ?: PocketTts.LM
 
     internal val lm: CompiledModel = load(lmGraphName, "lm", placement.lm)
     internal val lmMs: CompiledModel? =
@@ -217,6 +217,28 @@ class PocketTtsEngine(
         }
     }
 
+    // ---- codec continuity -------------------------------------------------
+    /**
+     * The tail of the previous utterance: its last [PocketTts.F_BLK] latents and
+     * the last [PocketTts.STREAM_L] feature positions it emitted. Priming the
+     * next sentence with them keeps the dec_tx chain and the SEANet window warm,
+     * which is what removes the cold-block onset transient at a sentence start.
+     *
+     * Engine-scoped rather than session-scoped because the TTS service issues
+     * one request per sentence with a fresh session each. Guarded by the voice,
+     * since splicing two different voices' tails would be wrong.
+     */
+    internal class CodecTail(val voice: String, val lats: List<FloatArray>, val feat: FloatArray)
+
+    private var codecTail: CodecTail? = null
+
+    internal fun codecTailFor(voice: String): CodecTail? =
+        if (codecContinuity) codecTail?.takeIf { it.voice == voice } else null
+
+    internal fun rememberCodecTail(tail: CodecTail?) {
+        if (codecContinuity) codecTail = tail
+    }
+
     // ---- concurrency ------------------------------------------------------
     internal val lock = Any()
     private val executor: ExecutorService =
@@ -282,8 +304,7 @@ class PocketTtsEngine(
         /** Every model file a config needs, for `ensure()` and packaging. */
         fun requiredFiles(config: PocketTtsConfig): List<String> {
             val f = LinkedHashSet<String>()
-            f += config.lmGraph
-                ?: if (config.models.store.exists(PocketTts.LM_INT8)) PocketTts.LM_INT8 else PocketTts.LM
+            f += config.lmGraph ?: PocketTts.LM
             if (config.lmSteps > 1) f += PocketTts.msGraph(config.lmSteps)
             if (config.placement.dectx == Accel.NPU) {
                 f += PocketTts.g5Variant(PocketTts.DEC_TX)

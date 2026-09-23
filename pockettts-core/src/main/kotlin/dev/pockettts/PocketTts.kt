@@ -1,7 +1,5 @@
 package dev.pockettts
 
-import java.io.File
-
 /**
  * Pocket TTS (Kyutai, ~100M) — a flow-matching language model over continuous
  * 32-dim Mimi latents, plus a tiny Mimi codec, running on LiteRT
@@ -55,25 +53,22 @@ object PocketTts {
     const val MASK_NEG = -1e4f
 
     // ---- graph file names -------------------------------------------------
-    /** Step + flow head fused, fp16. */
-    const val LM = "pt_flowlm_fused_fp16.tflite"
+    /**
+     * The flow-LM: step + flow head fused, dynamic-range int8 -- int8 weights
+     * with fp32 activations, so the host protocol is unchanged. ~2.3x faster per
+     * frame than the fp16 graph on XNNPACK and 3.9x smaller. It also carries the
+     * head-less `prefill` signature ([PREFILL_SIGNATURE]) in the same file,
+     * sharing the backbone's weight buffers. This is the only LM shipped.
+     */
+    const val LM = "pt_flowlm_fused_dyn8_all.tflite"
 
     /**
      * Name `litert_torch` gives the fused graph's default signature. The
      * head-less prompt batch is a second signature ([PREFILL_SIGNATURE]) in the
-     * same file; named signatures are laid out before the default one, so both
-     * must be selected by name rather than by index.
+     * same file; named signatures are laid out before the default one, so the
+     * step is addressed by index 1 and the prefill by index 0.
      */
     const val LM_SIGNATURE = "serving_default"
-
-    /**
-     * Dynamic-range int8 flow-LM: int8 weights, fp32 activations, so the host
-     * protocol is unchanged. ~2.3x faster per frame than [LM] on XNNPACK.
-     */
-    const val LM_INT8 = "pt_flowlm_fused_dyn8_all.tflite"
-
-    /** int8 when it has been pushed/provisioned, else fp16. */
-    fun lmGraphFor(dir: File): String = if (File(dir, LM_INT8).exists()) LM_INT8 else LM
 
     /** N-step fused decode graph: N frames per invocation. */
     fun msGraph(n: Int) = "pt_flowlm_ms${n}_fp16.tflite"

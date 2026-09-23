@@ -30,19 +30,10 @@
     {
       "name": "lm-int8",
       "zip": "pockettts-lm-int8-2026.09.zip",
-      "sha256": "1e3a0a15fca56c43fe2dabc5a9ce9962b28e55172e9127b3009858e91da2cce6",
-      "bytes": 85656304,
+      "sha256": "6190386ca6dd97a7aff6a4956f8cf98537adfe589a71e4aed1f7c49c8a8c94a2",
+      "bytes": 87504448,
       "files": [
         "pt_flowlm_fused_dyn8_all.tflite"
-      ]
-    },
-    {
-      "name": "lm-fp16",
-      "zip": "pockettts-lm-fp16-2026.09.zip",
-      "sha256": "3e977187ff99ded63bbda123dd8a4ea3456724490f8d42ac985306087efe9a4c",
-      "bytes": 169234280,
-      "files": [
-        "pt_flowlm_fused_fp16.tflite"
       ]
     },
     {

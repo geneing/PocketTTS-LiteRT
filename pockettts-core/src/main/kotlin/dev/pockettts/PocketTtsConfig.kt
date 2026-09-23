@@ -14,19 +14,37 @@ class PocketTtsConfig(
     val models: PocketTtsModels,
     /** Per-graph accelerator choice. */
     val placement: Placement,
-    /** Override the flow-LM graph filename (e.g. a quantized variant). null = auto. */
+    /** Override the flow-LM graph filename (e.g. another quantized variant). null = [PocketTts.LM]. */
     val lmGraph: String? = null,
     /** Frames per LM invocation; >1 needs the matching `pt_flowlm_ms{N}` graph. */
     val lmSteps: Int = 1,
     /**
      * Prefill the text prompt in batches through the fused graph's head-less
-     * `prefill` signature instead of one fused step per token. Measured on a
-     * Pixel 10 with the int8 LM it is *not* a win -- the fixed batch pads short
-     * prompts (7 tokens: ~140 ms per-token vs ~280 ms batched) and only breaks
-     * even near 28 -- so it is off by default. The signature costs almost no
-     * storage (it shares the graph's weight buffers).
+     * `prefill` signature instead of one fused step per token. It shares the
+     * graph's weight buffers, so it costs almost no storage.
+     *
+     * Note the voice prefix is *not* part of this: it is a precomputed KV cache
+     * (`pt_voice_*.bin`) that [PocketTtsSession] copies in, never a prompt the LM
+     * has to re-process. What batching would remove is the flow head a prompt
+     * token discards and the per-token packed-KV upload.
+     *
+     * Off, for two independent reasons. The batch is a fixed
+     * [PocketTts.PREFILL_TOKENS] and padded, so it is *slower* than the
+     * per-token path on the int8 LM (7 tokens: ~140 ms per-token vs ~280 ms
+     * batched; break-even near 28). And the batched take does not currently
+     * reproduce the per-token latents on the shipped graph: with the same text
+     * and seed the two paths produce uncorrelated audio, the batched one
+     * truncating short prompts. See `LatencyProbeTest.prefillPaths`.
      */
     val usePrefill: Boolean = false,
+    /**
+     * Keep the Mimi decoder warm across sentences: carry the previous sentence's
+     * tail latents + features so the next one is not decoded from a cold dec_tx
+     * block (which is what gives each sentence its onset transient). Off by
+     * default: it is a deliberate quality/continuity trade, and it makes the
+     * streamed take differ from the one-shot one at the seams by design.
+     */
+    val codecContinuity: Boolean = false,
     /** SEANet window (feature positions) for streaming. */
     val streamW: Int = PocketTts.STREAM_W,
     /** When set, every synthesis reseeds the noise RNG so repeats are identical. */

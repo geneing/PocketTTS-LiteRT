@@ -5,9 +5,8 @@ CPU, decoder-transformer on the Tensor G5 NPU, SEANet on the GPU**
 (`lm:CPU dectx:NPU dec:GPU`).
 
 This is the fastest configuration measured on the Pixel 10 that passes the
-by-ear test, and it is what the app now loads by default
-(`PocketTtsSynthesizer.LM_INT8`, preferred by `lmGraphFor()` when the file has
-been pushed, with `pt_flowlm_fused_fp16.tflite` as the fallback).
+by-ear test, and it is the only flow-LM the app loads (`PocketTts.LM`); the fp16
+graph is a build byproduct now, not a fallback.
 
 The end-to-end numbers below are the **one-shot** path. The app now streams, which
 re-runs the same LM behind a sliding SEANet window and measures 3.1-3.3x RTF with
@@ -74,8 +73,8 @@ without any change to `PocketTtsSynthesizer`'s step loop.
 PYTHONPATH=$(pwd)/references/pocket-tts PT_OUT=$(pwd)/scripts/out \
     PT_QUANT=dyn8_all python scripts/build_pockettts.py quant
 
-./scripts/install_to_device.sh      # pushes it (it is in EXTRA)
-./gradlew :app:installDebug         # the app prefers it automatically
+./scripts/install_to_device.sh      # pushes it (it is in FILES)
+./gradlew :app:installDebug         # it is the only LM the app loads
 ```
 
 `PT_QUANT` takes a comma-separated list; omit it to build all eight variants.
@@ -155,8 +154,11 @@ degenerate scale.
 - `BLOCKWISE_64` int4 (fewer scales) or the `GPTQ` / `MSE` algorithms, all
   reachable through the `algorithm` key in `quant_recipe`.
 - int8 weights **plus** an int8 KV cache.
-- Combining with prompt prefill (`docs/multistep_lm_plan.md`, M3), which is
-  orthogonal and was worth 49.6 -> 2.4 ms/token on the prompt.
+- Combining with prompt prefill (`docs/multistep_lm_plan.md`, M3), which was
+  worth 49.6 -> 2.4 ms/token on the prompt in the fp32 graph. The fused int8
+  graph does carry the batched `prefill` signature, but on it the batched rows do
+  not reproduce the per-token step (uncorrelated audio, short prompts truncated),
+  so `usePrefill` is off and each prompt runs one fused step per token.
 
 Audio exhibits for the ear test are in `bench/audio/` (`ptt_i8_*.wav`); the
 joint CPU/GPU/NPU timing tables are in `RESULTS.md`.

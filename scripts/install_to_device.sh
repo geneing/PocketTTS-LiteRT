@@ -11,7 +11,7 @@ ADB="${ADB:-adb}"
 DST="/sdcard/Android/data/com.pockettts/files"
 
 FILES=(
-  pt_flowlm_fused_fp16.tflite
+  pt_flowlm_fused_dyn8_all.tflite
   pt_mimi_dec_tx_fp16.tflite
   pt_mimi_deconly_fp16.tflite
   pt_embed_f16.bin
@@ -29,8 +29,8 @@ FILES=(
 
 # Optional graphs, pushed only when present:
 #  * multi-step decode (`build_pockettts.py multistep`)
-#  * int8 flow-LM variants (`build_pockettts.py quant`), picked by the
-#    benchmark's lmGraph override
+#  * extra int8 flow-LM variants (`build_pockettts.py quant`) for the benchmark's
+#    lmGraph override; the app's LM itself is pt_flowlm_fused_dyn8_all.tflite
 #  * smaller-window SEANet decoders (`build_pockettts.py stream`) for streaming
 #    generation; the app prefers pt_mimi_deconly_w512_fp16.tflite
 #  * AOT-compiled Tensor G5 variants (`aot_tensor_g5.py`), which the app picks
@@ -38,7 +38,6 @@ FILES=(
 EXTRA=(
   pt_flowlm_ms4_fp16.tflite
   pt_flowlm_ms8_fp16.tflite
-  pt_flowlm_fused_dyn8_all.tflite
   pt_flowlm_fused_dyn8_body.tflite
   pt_flowlm_fused_dyn4_all.tflite
   pt_flowlm_fused_wo8_all.tflite
