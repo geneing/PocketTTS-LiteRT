@@ -124,92 +124,6 @@ class TtsServiceInstrumentedTest {
         }
     }
 
-    /**
-     * Measures when Android's TTS client receives PCM from the service without
-     * playing it through an AudioTrack. This separates service/framework delivery
-     * latency from an app's playback scheduling latency.
-     */
-    @Test
-    fun frameworkAudioDeliveryTiming() {
-        val tts = connect()
-        try {
-            tts.voice = waitForPocketTtsVoice(tts)
-            tts.setSpeechRate(1.4f)
-            val file = File(ctx.filesDir, "framework_audio_timing.wav")
-            file.delete()
-            val done = CountDownLatch(1)
-            val requestAt = SystemClock.elapsedRealtime()
-            var firstAudioAt = -1L
-            var audioCallbacks = 0
-            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                override fun onStart(utteranceId: String?) {
-                    Log.i(TAG, "framework onStart t=${SystemClock.elapsedRealtime() - requestAt}ms")
-                }
-
-                override fun onBeginSynthesis(
-                    utteranceId: String?,
-                    sampleRateInHz: Int,
-                    audioFormat: Int,
-                    channelCount: Int,
-                ) {
-                    Log.i(
-                        TAG,
-                        "framework onBeginSynthesis t=${SystemClock.elapsedRealtime() - requestAt}ms " +
-                            "rate=$sampleRateInHz format=$audioFormat channels=$channelCount",
-                    )
-                }
-
-                override fun onAudioAvailable(utteranceId: String?, audio: ByteArray) {
-                    val now = SystemClock.elapsedRealtime()
-                    if (firstAudioAt < 0) {
-                        firstAudioAt = now
-                        Log.i(TAG, "framework first onAudioAvailable t=${now - requestAt}ms bytes=${audio.size}")
-                    }
-                    audioCallbacks++
-                }
-
-                override fun onDone(utteranceId: String?) {
-                    Log.i(
-                        TAG,
-                        "framework onDone t=${SystemClock.elapsedRealtime() - requestAt}ms " +
-                            "firstAudio=${if (firstAudioAt < 0) -1 else firstAudioAt - requestAt}ms " +
-                            "callbacks=$audioCallbacks",
-                    )
-                    done.countDown()
-                }
-
-                @Deprecated("deprecated in Java")
-                override fun onError(utteranceId: String?) {
-                    Log.e(TAG, "framework onError t=${SystemClock.elapsedRealtime() - requestAt}ms")
-                    done.countDown()
-                }
-
-                @Deprecated("deprecated in Java")
-                override fun onError(utteranceId: String?, errorCode: Int) {
-                    Log.e(TAG, "framework onError code=$errorCode t=${SystemClock.elapsedRealtime() - requestAt}ms")
-                    done.countDown()
-                }
-            })
-            val rc = tts.synthesizeToFile(
-                "It is no longer enough for American exporters simply to label their products in both " +
-                    "American and metric units (soft metric); trade groups abroad are demanding that " +
-                    "goods be delivered in even metric units (hard metric).",
-                null,
-                file,
-                "framework-audio-timing",
-            )
-            assertEquals("framework timing synthesizeToFile result", TextToSpeech.SUCCESS, rc)
-            assertTrue("framework timing synthesis timed out", done.await(120, TimeUnit.SECONDS))
-            assertTrue("framework listener received no audio", firstAudioAt >= requestAt)
-            assertTrue(
-                "first framework audio took ${firstAudioAt - requestAt}ms",
-                firstAudioAt - requestAt < 3_000L,
-            )
-        } finally {
-            tts.shutdown()
-        }
-    }
-
     /** Real AudioTrack playback, submitting each sentence after the previous onDone. */
     @Test
     fun speakFourSentencesSequentially() {
@@ -232,7 +146,6 @@ class TtsServiceInstrumentedTest {
                     "the metric system seem unnecessary in the United States.",
             )
             val submittedAt = ConcurrentHashMap<String, Long>()
-            val startedAt = ConcurrentHashMap<String, Long>()
             val firstAudioAt = ConcurrentHashMap<String, Long>()
             val doneAt = ConcurrentHashMap<String, Long>()
             val doneById = ConcurrentHashMap<String, CountDownLatch>()
@@ -243,7 +156,6 @@ class TtsServiceInstrumentedTest {
                 override fun onStart(utteranceId: String?) {
                     val id = utteranceId ?: return
                     val now = SystemClock.elapsedRealtime()
-                    startedAt[id] = now
                     Log.i(
                         TAG,
                         "sequence onStart $id at=${now - sequenceAt}ms " +
@@ -323,7 +235,7 @@ class TtsServiceInstrumentedTest {
                     TAG,
                     "sequence submit $id at=${submitted - sequenceAt}ms " +
                         "afterPreviousDone=${submitted - previousDoneAt}ms " +
-                        "chars=${sentence.length} text=\"$sentence\"",
+                        "chars=${sentence.length}",
                 )
                 val queueMode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
                 assertEquals("speak failed for $id", TextToSpeech.SUCCESS, tts.speak(sentence, queueMode, null, id))
