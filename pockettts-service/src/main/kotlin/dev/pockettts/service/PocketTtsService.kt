@@ -35,6 +35,8 @@ import java.util.concurrent.ArrayBlockingQueue
 class PocketTtsService : TextToSpeechService() {
 
     private var engine: PocketTtsEngine? = null
+    @Volatile
+    private var destroyed = false
 
     @Volatile
     private var current: PocketTtsSession? = null
@@ -45,9 +47,8 @@ class PocketTtsService : TextToSpeechService() {
 
     /**
      * The voices the engine *will* be able to speak, resolved from the installed
-     * voice files without compiling any graph. The framework queries voices and
-     * languages on binder threads while the user browses settings, so this must
-     * not be the multi-second engine load.
+     * voice files without compiling any graph. Voice/language queries stay
+     * side-effect-free; graph loading is handled once during service startup.
      */
     private val installedVoices: List<TtsVoice> by lazy {
         val models = PocketTtsModels.default(this)
@@ -57,8 +58,35 @@ class PocketTtsService : TextToSpeechService() {
 
     // ---- lifecycle ---------------------------------------------------------
 
+    override fun onCreate() {
+        super.onCreate()
+        // Compile/load the LiteRT graphs before the first utterance. Do the work
+        // off the service main thread, but finish it before the framework can
+        // bind and submit synthesis requests; otherwise the first request pays
+        // this multi-second startup cost before it can receive even its first PCM.
+        val preload = Thread({
+            val started = System.nanoTime()
+            try {
+                engine()
+                android.util.Log.i(
+                    "PocketTTSTime",
+                    "service engine preload ready in ${(System.nanoTime() - started) / 1_000_000}ms",
+                )
+            } catch (e: Throwable) {
+                android.util.Log.e(TAG, "engine preload failed; synthesis will retry lazily", e)
+            }
+        }, "pockettts-engine-preload").apply { isDaemon = true }
+        preload.start()
+        try {
+            preload.join()
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+        }
+    }
+
     @Synchronized
     private fun engine(): PocketTtsEngine {
+        check(!destroyed) { "TTS service is shutting down" }
         engine?.let { return it }
         val e = PocketTtsEngine(this)
         engine = e
@@ -181,6 +209,7 @@ class PocketTtsService : TextToSpeechService() {
         }, "pockettts-tts").apply { isDaemon = true }
 
         var failed = false
+        var producerStarted = false
         var firstAudio = -1L
         try {
             if (callback.start(PocketTts.SAMPLE_RATE, AudioFormat.ENCODING_PCM_16BIT, 1)
@@ -189,6 +218,7 @@ class PocketTtsService : TextToSpeechService() {
                 return
             }
             producer.start()
+            producerStarted = true
             var stopped = false
             var consumed = 0
             while (true) {
@@ -228,13 +258,24 @@ class PocketTtsService : TextToSpeechService() {
             session.cancel()
             android.util.Log.e(TAG, "synthesis failed", e)
             // Let the producer finish so the join below cannot hang.
-            runCatching { while (queue.take() !== sentinel) { /* drain */ } }
+            if (producerStarted) {
+                runCatching { while (queue.take() !== sentinel) { /* drain */ } }
+            }
         } finally {
             current = null
-            producer.join(5_000)
-            // done() is mandatory once start() succeeded, errors included.
-            callback.done()
-            if (failed) callback.error(ERROR_SYNTHESIS)
+            try {
+                if (producerStarted) producer.join(5_000)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+            } finally {
+                try {
+                    if (failed) callback.error(ERROR_SYNTHESIS)
+                } finally {
+                    // done() closes the callback on success and failure; errors
+                    // must be reported before the terminal done notification.
+                    callback.done()
+                }
+            }
         }
     }
 
@@ -378,8 +419,11 @@ class PocketTtsService : TextToSpeechService() {
     fun setDefaultPitch(pitch: Float) = PocketTtsSettings.setPitch(this, pitch)
 
     override fun onDestroy() {
-        engine?.close()
-        engine = null
+        val toClose = synchronized(this) {
+            destroyed = true
+            engine.also { engine = null }
+        }
+        toClose?.close()
         super.onDestroy()
     }
 

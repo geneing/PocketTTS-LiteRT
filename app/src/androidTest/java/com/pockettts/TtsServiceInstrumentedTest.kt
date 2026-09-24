@@ -1,6 +1,7 @@
 package com.pockettts
 
 import android.content.Context
+import android.os.SystemClock
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -118,6 +119,220 @@ class TtsServiceInstrumentedTest {
             })
             tts.speak(SPEAK_TEXT, TextToSpeech.QUEUE_FLUSH, null, "speak")
             assertTrue("speak timed out", done.await(120, TimeUnit.SECONDS))
+        } finally {
+            tts.shutdown()
+        }
+    }
+
+    /**
+     * Measures when Android's TTS client receives PCM from the service without
+     * playing it through an AudioTrack. This separates service/framework delivery
+     * latency from an app's playback scheduling latency.
+     */
+    @Test
+    fun frameworkAudioDeliveryTiming() {
+        val tts = connect()
+        try {
+            tts.voice = waitForPocketTtsVoice(tts)
+            tts.setSpeechRate(1.4f)
+            val file = File(ctx.filesDir, "framework_audio_timing.wav")
+            file.delete()
+            val done = CountDownLatch(1)
+            val requestAt = SystemClock.elapsedRealtime()
+            var firstAudioAt = -1L
+            var audioCallbacks = 0
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    Log.i(TAG, "framework onStart t=${SystemClock.elapsedRealtime() - requestAt}ms")
+                }
+
+                override fun onBeginSynthesis(
+                    utteranceId: String?,
+                    sampleRateInHz: Int,
+                    audioFormat: Int,
+                    channelCount: Int,
+                ) {
+                    Log.i(
+                        TAG,
+                        "framework onBeginSynthesis t=${SystemClock.elapsedRealtime() - requestAt}ms " +
+                            "rate=$sampleRateInHz format=$audioFormat channels=$channelCount",
+                    )
+                }
+
+                override fun onAudioAvailable(utteranceId: String?, audio: ByteArray) {
+                    val now = SystemClock.elapsedRealtime()
+                    if (firstAudioAt < 0) {
+                        firstAudioAt = now
+                        Log.i(TAG, "framework first onAudioAvailable t=${now - requestAt}ms bytes=${audio.size}")
+                    }
+                    audioCallbacks++
+                }
+
+                override fun onDone(utteranceId: String?) {
+                    Log.i(
+                        TAG,
+                        "framework onDone t=${SystemClock.elapsedRealtime() - requestAt}ms " +
+                            "firstAudio=${if (firstAudioAt < 0) -1 else firstAudioAt - requestAt}ms " +
+                            "callbacks=$audioCallbacks",
+                    )
+                    done.countDown()
+                }
+
+                @Deprecated("deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    Log.e(TAG, "framework onError t=${SystemClock.elapsedRealtime() - requestAt}ms")
+                    done.countDown()
+                }
+
+                @Deprecated("deprecated in Java")
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    Log.e(TAG, "framework onError code=$errorCode t=${SystemClock.elapsedRealtime() - requestAt}ms")
+                    done.countDown()
+                }
+            })
+            val rc = tts.synthesizeToFile(
+                "It is no longer enough for American exporters simply to label their products in both " +
+                    "American and metric units (soft metric); trade groups abroad are demanding that " +
+                    "goods be delivered in even metric units (hard metric).",
+                null,
+                file,
+                "framework-audio-timing",
+            )
+            assertEquals("framework timing synthesizeToFile result", TextToSpeech.SUCCESS, rc)
+            assertTrue("framework timing synthesis timed out", done.await(120, TimeUnit.SECONDS))
+            assertTrue("framework listener received no audio", firstAudioAt >= requestAt)
+            assertTrue(
+                "first framework audio took ${firstAudioAt - requestAt}ms",
+                firstAudioAt - requestAt < 3_000L,
+            )
+        } finally {
+            tts.shutdown()
+        }
+    }
+
+    /** Real AudioTrack playback, submitting each sentence after the previous onDone. */
+    @Test
+    fun speakFourSentencesSequentially() {
+        val tts = connect()
+        try {
+            val voice = tts.voices?.firstOrNull { it.name.equals("pockettts-alba", ignoreCase = true) }
+                ?: waitForPocketTtsVoice(tts)
+            tts.voice = voice
+            tts.setSpeechRate(1.4f)
+            tts.setPitch(1.0f)
+
+            val sentences = listOf(
+                "Its car parts are sized in metric units.",
+                "So are its bicycles.",
+                "It is no longer enough for American exporters simply to label their products in both " +
+                    "American and metric units (soft metric); trade groups abroad are demanding that " +
+                    "goods be delivered in even metric units (hard metric).",
+                "Oddly, as more Americans are lured into using the metric system, it may be that the " +
+                    "nation will lose the very uniformity of weights and measures that has long made " +
+                    "the metric system seem unnecessary in the United States.",
+            )
+            val submittedAt = ConcurrentHashMap<String, Long>()
+            val startedAt = ConcurrentHashMap<String, Long>()
+            val firstAudioAt = ConcurrentHashMap<String, Long>()
+            val doneAt = ConcurrentHashMap<String, Long>()
+            val doneById = ConcurrentHashMap<String, CountDownLatch>()
+            val errors = ConcurrentHashMap<String, String>()
+            val sequenceAt = SystemClock.elapsedRealtime()
+
+            tts.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                override fun onStart(utteranceId: String?) {
+                    val id = utteranceId ?: return
+                    val now = SystemClock.elapsedRealtime()
+                    startedAt[id] = now
+                    Log.i(
+                        TAG,
+                        "sequence onStart $id at=${now - sequenceAt}ms " +
+                            "afterSubmit=${now - (submittedAt[id] ?: now)}ms",
+                    )
+                }
+
+                override fun onBeginSynthesis(
+                    utteranceId: String?,
+                    sampleRateInHz: Int,
+                    audioFormat: Int,
+                    channelCount: Int,
+                ) {
+                    val id = utteranceId ?: return
+                    val now = SystemClock.elapsedRealtime()
+                    Log.i(
+                        TAG,
+                        "sequence onBegin $id at=${now - sequenceAt}ms " +
+                            "afterSubmit=${now - (submittedAt[id] ?: now)}ms " +
+                            "rate=$sampleRateInHz format=$audioFormat channels=$channelCount",
+                    )
+                }
+
+                override fun onAudioAvailable(utteranceId: String?, audio: ByteArray) {
+                    val id = utteranceId ?: return
+                    val now = SystemClock.elapsedRealtime()
+                    if (firstAudioAt.putIfAbsent(id, now) == null) {
+                        Log.i(
+                            TAG,
+                            "sequence firstAudio $id at=${now - sequenceAt}ms " +
+                                "afterSubmit=${now - (submittedAt[id] ?: now)}ms bytes=${audio.size}",
+                        )
+                    }
+                }
+
+                override fun onDone(utteranceId: String?) {
+                    val id = utteranceId ?: return
+                    val now = SystemClock.elapsedRealtime()
+                    val submitted = submittedAt[id] ?: now
+                    val firstAudio = firstAudioAt[id] ?: -1L
+                    Log.i(
+                        TAG,
+                        "sequence onDone $id at=${now - sequenceAt}ms " +
+                            "afterSubmit=${now - submitted}ms " +
+                            "afterFirstAudio=${if (firstAudio < 0) -1 else now - firstAudio}ms",
+                    )
+                    doneAt[id] = now
+                    doneById[id]?.countDown()
+                }
+
+                @Deprecated("deprecated in Java")
+                override fun onError(utteranceId: String?) {
+                    val id = utteranceId ?: "unknown"
+                    errors[id] = "error"
+                    Log.e(TAG, "sequence onError $id")
+                    doneById[id]?.countDown()
+                }
+
+                @Deprecated("deprecated in Java")
+                override fun onError(utteranceId: String?, errorCode: Int) {
+                    val id = utteranceId ?: "unknown"
+                    errors[id] = "error $errorCode"
+                    Log.e(TAG, "sequence onError $id code=$errorCode")
+                    doneById[id]?.countDown()
+                }
+            })
+
+            Log.i(TAG, "sequence using engine=$ENGINE voice=${voice.name} rate=1.4 pitch=1.0")
+            var previousDoneAt = sequenceAt
+            for ((index, sentence) in sentences.withIndex()) {
+                val id = "evie-seq-$index"
+                val submitted = SystemClock.elapsedRealtime()
+                submittedAt[id] = submitted
+                val utteranceDone = CountDownLatch(1)
+                doneById[id] = utteranceDone
+                Log.i(
+                    TAG,
+                    "sequence submit $id at=${submitted - sequenceAt}ms " +
+                        "afterPreviousDone=${submitted - previousDoneAt}ms " +
+                        "chars=${sentence.length} text=\"$sentence\"",
+                )
+                val queueMode = if (index == 0) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+                assertEquals("speak failed for $id", TextToSpeech.SUCCESS, tts.speak(sentence, queueMode, null, id))
+                assertTrue("$id playback timed out", utteranceDone.await(120, TimeUnit.SECONDS))
+                assertTrue("TTS error for $id: ${errors[id]}", errors[id] == null)
+                previousDoneAt = doneAt[id] ?: SystemClock.elapsedRealtime()
+            }
+            assertTrue("TTS errors: $errors", errors.isEmpty())
+            Log.i(TAG, "sequence playback complete total=${SystemClock.elapsedRealtime() - sequenceAt}ms")
         } finally {
             tts.shutdown()
         }
