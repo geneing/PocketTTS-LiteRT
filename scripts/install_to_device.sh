@@ -62,4 +62,12 @@ for f in "${EXTRA[@]}"; do
   echo "push $f"
   "$ADB" push "$SRC/$f" "$DST/$f" >/dev/null
 done
+# Custom voice caches produced by create_voice.py can be installed without
+# changing the Android build or adding their names to the bundled voice list.
+for f in "$SRC"/pt_voice_*.bin; do
+  [ -f "$f" ] || continue
+  case " ${FILES[*]} " in *" $(basename "$f") "*) continue ;; esac
+  echo "push $(basename "$f")"
+  "$ADB" push "$f" "$DST/$(basename "$f")" >/dev/null
+done
 echo "done: $("$ADB" shell ls "$DST" | wc -l | tr -d ' ') files in $DST"

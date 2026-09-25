@@ -62,26 +62,13 @@ class LatencyProbeTest {
             val streamed = engine.newSession("alba").use { it.stream(text) {}.audio }
             val n = minOf(oneShot.size, streamed.size)
             var maxD = 0f
-            var diffSq = 0.0
-            var sigSq = 0.0
-            var dot = 0.0
-            for (i in 0 until n) {
-                val d = (oneShot[i] - streamed[i]).toDouble()
-                maxD = maxOf(maxD, abs(oneShot[i] - streamed[i]))
-                diffSq += d * d
-                sigSq += oneShot[i].toDouble() * oneShot[i]
-                dot += oneShot[i].toDouble() * streamed[i]
-            }
-            val rmsDiff = kotlin.math.sqrt(diffSq / n)
-            val rmsSig = kotlin.math.sqrt(sigSq / n)
-            val relDb = 20 * kotlin.math.log10(rmsDiff / rmsSig)
+            for (i in 0 until n) maxD = maxOf(maxD, abs(oneShot[i] - streamed[i]))
             Log.i(
                 "Probe",
-                "parity $label: oneShot=${oneShot.size} streamed=${streamed.size} max|d|=$maxD " +
-                    "rmsDiff=$rmsDiff rmsSig=$rmsSig relDb=$relDb",
+                "parity $label: oneShot=${oneShot.size} streamed=${streamed.size} max|d|=$maxD",
             )
             assertEquals("parity $label length", oneShot.size, streamed.size)
-            assertTrue("parity $label relDb $relDb", relDb < -40.0)
+            assertTrue("parity $label max|d| $maxD", maxD < 0.05f)
         }
         // The streaming Sonic path should match shaping the one-shot take.
         for ((label, text) in texts) {

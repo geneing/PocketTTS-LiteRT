@@ -1,7 +1,6 @@
 package dev.pockettts.service
 
 import android.content.Context
-import dev.pockettts.PocketTts
 
 /**
  * The TTS engine's user-visible settings, stored in a private
@@ -33,13 +32,10 @@ object PocketTtsSettings {
     /** The voice name to speak when a request does not name one. */
     fun voice(context: Context, fallback: String): String =
         prefs(context).getString(KEY_VOICE, null)
-            ?.let { PocketTts.voiceNamed(it)?.name }
             ?: fallback
 
     fun setVoice(context: Context, name: String) {
-        PocketTts.voiceNamed(name)?.let {
-            prefs(context).edit().putString(KEY_VOICE, it.name).apply()
-        }
+        prefs(context).edit().putString(KEY_VOICE, name).apply()
     }
 
     /** Speech rate, 1.0 = natural. Requests with the framework default use it. */

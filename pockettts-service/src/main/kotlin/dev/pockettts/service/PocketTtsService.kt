@@ -8,7 +8,6 @@ import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsEngine
-import dev.pockettts.PocketTtsModels
 import dev.pockettts.PocketTtsSession
 import dev.pockettts.Voice as TtsVoice
 import java.util.Locale
@@ -51,9 +50,7 @@ class PocketTtsService : TextToSpeechService() {
      * side-effect-free; graph loading is handled once during service startup.
      */
     private val installedVoices: List<TtsVoice> by lazy {
-        val models = PocketTtsModels.default(this)
-        val installed = TtsVoice.all().filter { models.store.exists(PocketTts.voiceFile(it.name)) }
-        installed.ifEmpty { TtsVoice.all() }
+        PocketTtsVoiceCatalog.installed(this)
     }
 
     // ---- lifecycle ---------------------------------------------------------
@@ -99,10 +96,13 @@ class PocketTtsService : TextToSpeechService() {
      */
     private fun voiceFor(request: SynthesisRequest): TtsVoice {
         val installed = installedVoices
-        val wanted = PocketTts.voiceNamed(request.voiceName)
-            ?: PocketTts.voiceNamed(selectedVoice)
-            ?: PocketTts.voiceNamed(PocketTtsSettings.voice(this, installed.first().name))
-        return wanted?.takeIf { w -> installed.any { it.name == w.name } } ?: installed.first()
+        return PocketTtsVoiceCatalog.named(installed, request.voiceName)
+            ?: PocketTtsVoiceCatalog.named(installed, selectedVoice)
+            ?: PocketTtsVoiceCatalog.named(
+                installed,
+                PocketTtsSettings.voice(this, installed.first().name),
+            )
+            ?: installed.first()
     }
 
     // ---- synthesis ---------------------------------------------------------
@@ -347,10 +347,14 @@ class PocketTtsService : TextToSpeechService() {
         .toMutableList()
 
     override fun onIsValidVoiceName(voiceName: String?): Int =
-        if (PocketTts.voiceNamed(voiceName) != null) TextToSpeech.SUCCESS else TextToSpeech.ERROR
+        if (PocketTtsVoiceCatalog.named(installedVoices, voiceName) != null) {
+            TextToSpeech.SUCCESS
+        } else {
+            TextToSpeech.ERROR
+        }
 
     override fun onLoadVoice(voiceName: String?): Int {
-        val v = PocketTts.voiceNamed(voiceName) ?: return TextToSpeech.ERROR
+        val v = PocketTtsVoiceCatalog.named(installedVoices, voiceName) ?: return TextToSpeech.ERROR
         selectedVoice = v.name
         return TextToSpeech.SUCCESS
     }

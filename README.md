@@ -90,6 +90,30 @@ The int8 flow-LM and the `_g5` AOT graph are produced by this branch and are **n
 in the published [mlboydaisuke/Pocket-TTS-LiteRT](https://huggingface.co/mlboydaisuke/Pocket-TTS-LiteRT)
 bundle, which carries the fp16 graphs.
 
+## Custom voice cloning
+
+With the conversion venv and pinned `references/pocket-tts` clone installed, make a
+custom Android voice cache from a clean WAV and its UTF-8 transcript:
+
+```bash
+PYTHONPATH="$PWD/references/pocket-tts" PT_OUT="$PWD/scripts/out" \
+  python scripts/create_voice.py sample.wav sample.txt my_voice --preview
+scripts/install_to_device.sh scripts/out
+```
+
+The script writes `pt_voice_my_voice.bin` in the app's existing fp16 KV-cache
+format and keeps the transcript as `pt_voice_my_voice.txt`. Pocket TTS computes
+the voice state from the WAV; the transcript is saved for reference and used for
+the optional `--preview` synthesis. The model weights used for cloning require
+access to `kyutai/pocket-tts` on Hugging Face; accept its terms and authenticate
+before running the script. Use only recordings you have permission to clone.
+
+Install this build of the app first. Custom caches in its external files directory
+are discovered by the Android TTS service after it restarts, and appear in the
+system voice list and engine settings. Names must start with a lowercase letter
+and contain only lowercase letters, digits, `_` or `-`. Use `--output-dir` to
+choose a different output directory, and `--force` to replace an existing voice.
+
 ## Graphs and placement
 
 Every graph is stateless; KV caches, RoPE tables, the token-embedding lookup, the
