@@ -16,6 +16,10 @@ local.properties
 # build outputs of the conversion scripts (models, assets, wavs)
 scripts/out/
 
+# scratch audio/transcript captures used while developing voice cloning
+scripts/reference_*.wav
+scripts/reference_*.txt
+
 # packed release zips built by scripts/pack_models.py (models.json is committed)
 scripts/dist/
 
