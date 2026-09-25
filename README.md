@@ -90,10 +90,20 @@ The int8 flow-LM and the `_g5` AOT graph are produced by this branch and are **n
 in the published [mlboydaisuke/Pocket-TTS-LiteRT](https://huggingface.co/mlboydaisuke/Pocket-TTS-LiteRT)
 bundle, which carries the fp16 graphs.
 
-## Custom voice cloning
+## Voices
 
-With the conversion venv and pinned `references/pocket-tts` clone installed, make a
-custom Android voice cache from a clean WAV and its UTF-8 transcript:
+Two ways to add a voice. Both write `pt_voice_<name>.bin`, and both are picked up
+by `scripts/install_to_device.sh`, the demo app and the Android TTS service.
+
+Fetch a preset that ships upstream (`--list` shows them, with licence notes):
+
+```bash
+PYTHONPATH="$PWD/references/pocket-tts" PT_OUT="$PWD/scripts/out" \
+  python scripts/download_voices.py            # permissive presets not bundled
+scripts/install_to_device.sh scripts/out
+```
+
+Or clone one from your own recording (a clean WAV plus its UTF-8 transcript):
 
 ```bash
 PYTHONPATH="$PWD/references/pocket-tts" PT_OUT="$PWD/scripts/out" \
@@ -101,18 +111,19 @@ PYTHONPATH="$PWD/references/pocket-tts" PT_OUT="$PWD/scripts/out" \
 scripts/install_to_device.sh scripts/out
 ```
 
-The script writes `pt_voice_my_voice.bin` in the app's existing fp16 KV-cache
-format and keeps the transcript as `pt_voice_my_voice.txt`. Pocket TTS computes
-the voice state from the WAV; the transcript is saved for reference and used for
-the optional `--preview` synthesis. The model weights used for cloning require
-access to `kyutai/pocket-tts` on Hugging Face; accept its terms and authenticate
-before running the script. Use only recordings you have permission to clone.
+Names must start with a lowercase letter and contain only lowercase letters,
+digits, `_` or `-`; add `--force` to replace an existing voice.
 
-Install this build of the app first. Custom caches in its external files directory
-are discovered by the Android TTS service after it restarts, and appear in the
-system voice list and engine settings. Names must start with a lowercase letter
-and contain only lowercase letters, digits, `_` or `-`. Use `--output-dir` to
-choose a different output directory, and `--force` to replace an existing voice.
+`create_voice.py` keeps the transcript as `pt_voice_my_voice.txt` and uses it for
+the optional `--preview`. Pocket TTS computes the voice state from the WAV alone,
+so the transcript never affects the embedding. Both scripts need the model
+weights, which live in the gated `kyutai/pocket-tts` on Hugging Face: accept its
+terms and authenticate first. Use only recordings you have permission to clone.
+
+The upstream embeddings are **not** redistributable wholesale: `download_voices.py`
+excludes the two names whose source datasets are CC-BY-NC, and asks for
+`--include-restricted` before fetching them. Installed voices appear in the
+engine's voice list and the system TTS settings without an app rebuild.
 
 ## Graphs and placement
 

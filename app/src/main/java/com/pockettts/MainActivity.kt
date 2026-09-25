@@ -15,6 +15,8 @@ import android.widget.Spinner
 import android.widget.TextView
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsEngine
+import dev.pockettts.PocketTtsModels
+import dev.pockettts.VoiceCatalog
 import dev.pockettts.Wav
 import java.io.File
 import java.util.concurrent.Executors
@@ -39,6 +41,13 @@ class MainActivity : Activity() {
     private lateinit var waveform: WaveformView
     private var benchRuns = 3
 
+    /**
+     * The intent that drove the current launch. Held so the request can be applied
+     * once the model finishes loading: [onCreate] starts that load on [bg] and the
+     * initial [intent] is not necessarily what [onNewIntent] last saw.
+     */
+    private var pendingIntent: android.content.Intent? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
@@ -59,7 +68,7 @@ class MainActivity : Activity() {
             adapter = ArrayAdapter(
                 this@MainActivity,
                 android.R.layout.simple_spinner_dropdown_item,
-                PocketTts.VOICES,
+                voiceNames(),
             )
         }
         button = Button(this).apply { text = "Generate"; isEnabled = false }
@@ -77,6 +86,7 @@ class MainActivity : Activity() {
             ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f).apply { topMargin = 24 })
         setContentView(root)
 
+        pendingIntent = intent
         bg.execute {
             val e = try {
                 PocketTtsEngine(this)
@@ -91,7 +101,7 @@ class MainActivity : Activity() {
                 status.text = "Ready (${e.placements})."
                 button.isEnabled = true
                 benchButton.isEnabled = true
-                runFromIntent(intent)
+                runFromIntent(pendingIntent)
             }
         }
 
@@ -169,14 +179,30 @@ class MainActivity : Activity() {
      *   adb shell am start -n com.pockettts/.MainActivity --es text "hi" --es voice alba
      *   adb shell am start -n com.pockettts/.MainActivity --ez bench true --ei runs 3
      * (singleTop, so a second am start re-runs without reloading the model.)
+     *
+     * The voice list is rebuilt per call from what is installed, so a cache pushed
+     * while the app is running becomes selectable without a restart.
      */
+    private fun voiceNames(): List<String> =
+        VoiceCatalog.installed(PocketTtsModels.default(this)).map { it.name }
+
     private fun runFromIntent(i: android.content.Intent?) {
         if (i == null) return
         i.getStringExtra("text")?.let { t ->
             input.setText(t)
             i.getStringExtra("voice")?.let { v ->
-                val idx = PocketTts.VOICES.indexOf(v)
-                if (idx >= 0) voices.setSelection(idx)
+                val names = voiceNames()
+                val idx = names.indexOfFirst { it.equals(v, ignoreCase = true) }
+                if (idx >= 0) {
+                    (voices.adapter as ArrayAdapter<String>).apply {
+                        clear()
+                        addAll(names)
+                        notifyDataSetChanged()
+                    }
+                    voices.setSelection(idx)
+                } else {
+                    android.util.Log.w("PocketTTS", "voice '$v' not installed; have $names")
+                }
             }
         }
         if (i.getBooleanExtra("bench", false)) {
@@ -184,11 +210,14 @@ class MainActivity : Activity() {
             if (benchButton.isEnabled) benchButton.performClick()
             return
         }
-        if (i.hasExtra("text") && button.isEnabled) button.performClick()
+        // Not gated on button.isEnabled: on a cold start this runs from the same
+        // UI callback that enables it, and the engine is what actually gates it.
+        if (i.hasExtra("text")) button.performClick()
     }
 
     override fun onNewIntent(intent: android.content.Intent) {
         super.onNewIntent(intent)
+        pendingIntent = intent
         runFromIntent(intent)
     }
 

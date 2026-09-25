@@ -18,11 +18,24 @@ import java.util.zip.ZipInputStream
  */
 interface ModelSource {
     fun locate(name: String): File?
+
+    /**
+     * Names this source can serve that start with [prefix] and end with [suffix].
+     *
+     * Optional: sources that cannot enumerate their contents (a bundled asset
+     * list, a release index) return an empty list rather than a wrong answer.
+     * Used by [VoiceCatalog] to find user-generated voice caches.
+     */
+    fun list(prefix: String, suffix: String): List<String> = emptyList()
 }
 
-/** Files already on disk — the external files dir (adb push) or an app dir. */
+/** Files already on disk - the external files dir (adb push) or an app dir. */
 class DirectorySource(private val dir: File) : ModelSource {
     override fun locate(name: String): File? = File(dir, name).takeIf { it.isFile }
+
+    override fun list(prefix: String, suffix: String): List<String> =
+        dir.listFiles().orEmpty().map { it.name }
+            .filter { it.startsWith(prefix) && it.endsWith(suffix) }
 }
 
 /**
@@ -239,6 +252,10 @@ class ModelStore(private val sources: List<ModelSource>) {
     }
 
     fun exists(name: String): Boolean = locate(name) != null
+
+    /** Names any source can serve matching [prefix]/[suffix], deduplicated. */
+    fun list(prefix: String, suffix: String): List<String> =
+        sources.flatMap { it.list(prefix, suffix) }.distinct()
 
     fun file(name: String): File =
         locate(name) ?: throw FileNotFoundException(

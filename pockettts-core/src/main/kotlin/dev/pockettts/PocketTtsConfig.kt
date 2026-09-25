@@ -64,11 +64,12 @@ class PocketTtsConfig(
     }
 
     companion object {
-        /** Every bundled voice whose state file is installed, else all of them. */
-        fun defaultVoices(models: PocketTtsModels): List<Voice> {
-            val installed = Voice.all().filter { models.store.exists(PocketTts.voiceFile(it.name)) }
-            return installed.ifEmpty { Voice.all() }
-        }
+        /**
+         * Every bundled voice whose state file is installed, plus any
+         * user-generated cache the models can see ([VoiceCatalog]). Falls back to
+         * [Voice.all] when nothing is installed.
+         */
+        fun defaultVoices(models: PocketTtsModels): List<Voice> = VoiceCatalog.installed(models)
 
         /**
          * The device policy: adb-pushed models first, GitHub release fallback,

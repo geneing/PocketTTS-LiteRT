@@ -114,7 +114,13 @@ object PocketTts {
      * keep speaking a character when it switches engines. The name after
      * `pockettts-` is matched case-insensitively against [VOICES].
      */
-    fun voiceId(name: String) = "pockettts-$name"
+    const val VOICE_ID_PREFIX = "pockettts-"
+
+    fun voiceId(name: String) = "$VOICE_ID_PREFIX$name"
+
+    /** Voice cache filename convention shared with `scripts/create_voice.py`. */
+    const val VOICE_PREFIX = "pt_voice_"
+    const val VOICE_SUFFIX = ".bin"
 
     /** The voice [name] names, or null: `"alba"`, `"alba#female_1"`, `"pockettts-alba"`. */
     fun voiceNamed(name: String?): Voice? {

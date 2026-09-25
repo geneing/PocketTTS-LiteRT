@@ -1221,12 +1221,20 @@ def record_reference(model, voice, text, seed=1234):
     return rec, audio
 
 
-def load_voice_state(name):
+def load_voice_state(name, repo="kyutai/pocket-tts-without-voice-cloning",
+                     language="english", revision="e81d79e8194ad4c7ce879c87a4258ef20cbf2487"):
+    """Fetch a preset voice's flow-LM KV cache.
+
+    The revision is pinned because the states are mutable: `main` has been
+    re-derived since (layer-0 K differs by max|d| 2.30), and the shipped
+    `pt_voice_*.bin` blobs match the pinned bytes exactly. Pass
+    ``revision=None`` to follow `main`, or another repo for presets the mirror
+    does not carry (see scripts/download_voices.py).
+    """
     from huggingface_hub import hf_hub_download
     import safetensors
-    p = hf_hub_download("kyutai/pocket-tts-without-voice-cloning",
-                        f"languages/english/embeddings/{name}.safetensors",
-                        revision="e81d79e8194ad4c7ce879c87a4258ef20cbf2487")
+    p = hf_hub_download(repo, f"languages/{language}/embeddings/{name}.safetensors",
+                        revision=revision)
     ks, vs, off = [], [], None
     with safetensors.safe_open(p, framework="pt") as f:
         for li in range(N_LAYERS):
@@ -1235,6 +1243,24 @@ def load_voice_state(name):
             vs.append(cache[1, 0])
             off = int(f.get_tensor(f"transformer.layers.{li}.self_attn/offset")[0])
     return ks, vs, off
+
+
+def write_voice_blob(path, ks, vs, off):
+    """Write one voice as int32 length + de-interleaved fp16 K + fp16 V.
+
+    The single definition of the `pt_voice_<name>.bin` layout, shared by
+    [stage_assets] and scripts/download_voices.py.
+    """
+    perm = deint_perm().numpy()
+    k = np.stack([ks[li][:off][:, :, perm].permute(1, 0, 2).numpy().astype(np.float16)
+                  for li in range(N_LAYERS)])    # [6,16,T,64]
+    v = np.stack([vs[li][:off].permute(1, 0, 2).numpy().astype(np.float16)
+                  for li in range(N_LAYERS)])
+    with open(path, "wb") as f:
+        np.array([off], dtype=np.int32).tofile(f)
+        k.reshape(N_LAYERS * N_HEADS, off, HD).tofile(f)
+        v.reshape(N_LAYERS * N_HEADS, off, HD).tofile(f)
+    return off
 
 
 def pack_voice(ks, vs, off):
@@ -1531,19 +1557,13 @@ def stage_assets(model):
     # Licensing gate: only CC-BY-4.0 (alba-mackenna, VCTK) and CC0
     # (voice-donations, voice-zero) voices ship. Expresso (cosette) and EARS
     # (jean) are CC-BY-NC in kyutai/tts-voices, so they are NOT bundled.
+    # scripts/download_voices.py pulls the rest of the permissive presets from
+    # kyutai/pocket-tts, which carries a wider selection than the mirror does.
     voices = ["alba", "marius", "javert", "charles", "mary", "eve"]
-    perm = deint_perm().numpy()
     for name in voices:
         ks, vs, off = load_voice_state(name)
-        k = np.stack([ks[li][:off][:, :, perm].permute(1, 0, 2).numpy().astype(np.float16)
-                      for li in range(N_LAYERS)])    # [6,16,T,64]
-        v = np.stack([vs[li][:off].permute(1, 0, 2).numpy().astype(np.float16)
-                      for li in range(N_LAYERS)])
         path = os.path.join(OUT, f"pt_voice_{name}.bin")
-        with open(path, "wb") as f:
-            np.array([off], dtype=np.int32).tofile(f)
-            k.reshape(N_LAYERS * N_HEADS, off, HD).tofile(f)
-            v.reshape(N_LAYERS * N_HEADS, off, HD).tofile(f)
+        write_voice_blob(path, ks, vs, off)
         print(f"{name}: T={off} -> {os.path.getsize(path)/1e6:.1f} MB")
 
     # tokenizer: pieces + scores + types for the Kotlin unigram encoder

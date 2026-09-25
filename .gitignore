@@ -20,6 +20,9 @@ scripts/out/
 scripts/reference_*.wav
 scripts/reference_*.txt
 
+# Python bytecode from running the scripts
+__pycache__/
+
 # packed release zips built by scripts/pack_models.py (models.json is committed)
 scripts/dist/
 

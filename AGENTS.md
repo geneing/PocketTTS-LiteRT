@@ -99,6 +99,15 @@ to an invalid value or clear `~/.cache/huggingface/hub/models--kyutai--pocket-tt
 | `pt_voice_{alba,marius,javert,charles,mary,eve}.bin` | preset voice KV caches (CC-BY-4.0 / CC0 only) |
 | `pipeline_{tflite,eager}.wav` | parity artifacts, not shipped |
 
+Voices come from `kyutai/pocket-tts` `languages/english/embeddings/*.safetensors`.
+`build_pockettts.py assets` repacks the six permissive presets; run
+`download_voices.py` to fetch the rest of the permissive selection (or `--list` to
+see it, `--all` for everything except the non-commercial pair). The upstream
+revision is pinned because the embeddings are mutable — `main` no longer matches
+the shipped blobs (layer-0 K differs by max\|d\| 2.30). Only
+`scripts/reference_*.{wav,txt}` sample captures and locally generated voices are
+ignored by git.
+
 `_fp16` files are weight-only fp16 (fp32 compute) via `ai-edge-quantizer`'s
 `FLOAT_CASTING` recipe; `_dyn8_all` is dynamic-range int8 (int8 weights, fp32
 activations, so the host protocol is unchanged) from the same tool. The Android
