@@ -47,6 +47,10 @@ SEANet windows) plus one LM pack (~86 MB int8). A 512 MB LM/decoder set is never
 downloaded for a device that runs int8. `HttpDownloader` is the default transport;
 implement `Downloader` to plug in OkHttp.
 
+Extra voices are not a pack: `scripts/download_voices.py` and
+`scripts/create_voice.py` write standalone `pt_voice_<name>.bin` files, which
+`:pockettts-core` discovers through the same store (see "Voices" below).
+
 ## Engine and session
 
 One `PocketTtsEngine` per process — it owns the graphs, the mapped host assets, the
@@ -135,11 +139,33 @@ except provisioning the models (bundled assets, adb push, or `ensureModels`).
 
 It implements `onSynthesizeText` by streaming PCM-16 chunks, so playback starts at
 the first SEANet window rather than after the utterance, and `onStop` maps to
-session cancellation. It advertises `eng` only; the voices are exposed through
-`PocketTts.VOICES` and passed as the request's voice name. `request.speechRate` and
+session cancellation. It advertises `eng` only. Voices are whatever
+`VoiceCatalog.installed(models)` finds — the bundled presets whose cache is
+installed, plus any `pt_voice_<name>.bin` next to them — and are addressed by the
+request's voice name (bare, or `pockettts-<name>`). `request.speechRate` and
 `request.pitch` are honoured independently; when a client sends the framework
 default (100, "no preference"), the engine's persisted rate/pitch from the settings
 screen apply instead.
+
+## Voices
+
+`VoiceCatalog.installed(models)` is the single answer to "what can this device
+speak", used by the engine defaults, the demo app and the TTS service, so they
+cannot disagree. It resolves through the `ModelStore` rather than by listing one
+directory, so a cache from a pushed directory, a bundled asset or a release zip is
+found the same way (`ModelSource.list` is the optional enumeration hook;
+`DirectorySource` implements it).
+
+```kotlin
+val voices = VoiceCatalog.installed(PocketTtsModels.default(context)).map { it.name }
+val voice = VoiceCatalog.named(voices.map { Voice(it) }, "pockettts-bob")  // null if absent
+```
+
+Two ways to add one, both writing `pt_voice_<name>.bin` (see the README):
+`scripts/download_voices.py` for a preset that ships upstream, and
+`scripts/create_voice.py` to clone from your own recording. Rebuild the list per
+request if you want a cache pushed while your app is running to appear without a
+restart.
 
 ## Development loop
 
