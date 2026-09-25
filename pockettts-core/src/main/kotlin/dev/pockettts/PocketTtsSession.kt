@@ -595,13 +595,13 @@ class PocketTtsSession internal constructor(
         resetToVoice()
         prefill(ids)
         val estimate = ceil((ids.size / PocketTts.TOKENS_PER_SECOND + PocketTts.GEN_SECONDS_PADDING) * PocketTts.FRAME_RATE)
-        val maxGen = minOf(estimate.toInt(), PMAX - pos - 1)
-        val latents = ArrayList<FloatArray>(maxGen)
+        val frameLimit = minOf(estimate.toInt(), PMAX - pos - 1)
+        val latents = ArrayList<FloatArray>(frameLimit)
         var emb = engine.bosInput
         var eosStep = -1
         var g = 0
-        while (g < maxGen && !cancelled) {
-            if (engine.lmSteps > 1 && g + engine.lmSteps <= maxGen && pos + engine.lmSteps <= PMAX) {
+        while (g < frameLimit && !cancelled) {
+            if (engine.lmSteps > 1 && g + engine.lmSteps <= frameLimit && pos + engine.lmSteps <= PMAX) {
                 val (lats, eoses) = stepMulti(emb, Array(engine.lmSteps) { gaussNoise() })
                 var stop = false
                 for (i in 0 until engine.lmSteps) {
@@ -695,12 +695,14 @@ class PocketTtsSession internal constructor(
          */
         private var featBase = 0
 
-        /** Next emission target in frames: cumulative chunk sizes. */
-        private var emitAt = PocketTts.STREAM_RAMP[0]
-        private var ramp = 1
-
-        /** Largest chunk one SEANet window can add: window minus its left context. */
-        private val maxHop = (engine.streamW - PocketTts.STREAM_L) / PocketTts.UPS
+        /**
+         * Next emission target in frames: the dec_tx hop, cumulatively. The first
+         * target is also how long the first dec_tx block waits, so the first audio
+         * lands once [PocketTts.F_HOP] frames exist. The SEANet then emits
+         * whatever one window covers (up to `streamW - STREAM_L` positions), so
+         * chunks come out F_HOP wide and then one window hop wide.
+         */
+        private var emitAt = PocketTts.F_HOP
 
         /**
          * Decode the previous sentence's tail as warm-up before any new frames.
@@ -731,7 +733,7 @@ class PocketTtsSession internal constructor(
             featBase = PocketTts.STREAM_L - lats.size * PocketTts.UPS
             featPos = PocketTts.STREAM_L
             emitted = PocketTts.STREAM_L
-            emitAt = lats.size + PocketTts.STREAM_RAMP[0]
+            emitAt = lats.size + PocketTts.F_HOP
         }
 
         /** The tail the next sentence primes from: latents + emitted features. */
@@ -754,13 +756,13 @@ class PocketTtsSession internal constructor(
             lats.add(lat)
             val n = lats.size
             // Decode up to each emission target as the LM reaches it and emit at
-            // once: a partial window is exact because the SEANet is causal, and
-            // the growing chunk sizes keep playback fed without stalling on a
-            // full window.
+            // once: a partial window is exact because the SEANet is causal, so
+            // audio goes out as soon as a target is reached instead of waiting
+            // for a full window.
             while (!cancelled && kept < n && n >= emitAt) {
                 decodeTo(emitAt)
                 emitWindow()
-                emitAt += nextChunk()
+                emitAt += PocketTts.F_HOP
             }
         }
 
@@ -770,18 +772,13 @@ class PocketTtsSession internal constructor(
             while (featPos > emitted && !cancelled) emitWindow()
         }
 
-        /** Next chunk size: the ramp while it lasts, then the steady window. */
-        private fun nextChunk(): Int {
-            if (ramp >= PocketTts.STREAM_RAMP.size) return maxHop
-            return PocketTts.STREAM_RAMP[ramp++]
-        }
-
         /** Run dec_tx blocks until [target] frames are decoded. */
         private fun decodeTo(target: Int) {
             while (kept < target && !cancelled) {
                 // Canonical block chain: frame 0 while the prefix is at most
                 // F_BLK (whole prefix present, so exact), then slide F_HOP back
-                // exactly like the one-shot decode, so the streaming features
+                // exactly like the one-shot decode, so every block runs the same
+                // arithmetic the one-shot decode runs and the streaming features
                 // match it instead of drifting through fp16 boundary rounding.
                 val start = if (target <= PocketTts.F_BLK) 0
                 else (kept - PocketTts.F_HOP).coerceAtLeast(0)

@@ -24,18 +24,7 @@ object PocketTts {
     const val UPS = 16               // 12.5 Hz -> 200 Hz
     const val MIMI_D = 512
     const val F_BLK = 64             // dec_tx block payload frames
-    const val F_HOP = 32             // dec_tx block hop
-    /**
-     * Emitted audio chunk sizes (frames) while ramping up, before the steady
-     * window. The first entry is also how long the first dec_tx block waits, so
-     * it is the time-to-first-audio knob. Small early chunks start playback
-     * sooner, but each has to outlast the wait for the next or playback starves,
-     * so the sizes grow. The cumulative targets (8, 16, 32, 48, 64, 96, 128,
-     * 160, 224) deliberately land on frame 0 up to [F_BLK] and on [F_HOP]
-     * multiples after, so the dec_tx stays on the canonical block chain the
-     * one-shot decode uses and the streaming audio keeps matching it.
-     */
-    val STREAM_RAMP = intArrayOf(8, 8, 16, 16, 16, 32, 32, 32, 64)
+    const val F_HOP = 32             // dec_tx block hop, and the streaming emit step
     const val S_BLK = F_BLK * UPS
     const val DEC_FRAMES = 256       // one-shot deconly window frames
     const val S_DEC = DEC_FRAMES * UPS
