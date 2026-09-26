@@ -62,12 +62,33 @@ for f in "${EXTRA[@]}"; do
   echo "push $f"
   "$ADB" push "$SRC/$f" "$DST/$f" >/dev/null
 done
-# Custom voice caches produced by create_voice.py can be installed without
-# changing the Android build or adding their names to the bundled voice list.
+# Extra voice caches (scripts/download_voices.py, scripts/create_voice.py) live in
+# a voices/ subdirectory, one level below the model files, so a model refresh
+# cannot clobber them and they need not be part of a model pack.
+#
+# The directory must be created BY THE APP, not here: on Android 11+ a
+# mkdir/push under /sdcard/Android/data creates it owned by `shell` with
+# `drwxrws---`, which the app process cannot traverse, so the voices in it are
+# invisible to it. The app makes it on startup (VoiceCatalog.ensureDir), so run it
+# once before the first voice push. Anything left in the root by an older install
+# is pushed too, so those voices keep working.
+VOICES_DIR="voices"
+if ! "$ADB" shell "[ -d '$DST/$VOICES_DIR' ]"; then
+  echo "note: $DST/$VOICES_DIR does not exist yet; launch the app once so it" >&2
+  echo "      creates it app-owned, then re-run this script." >&2
+fi
 for f in "$SRC"/pt_voice_*.bin; do
   [ -f "$f" ] || continue
   case " ${FILES[*]} " in *" $(basename "$f") "*) continue ;; esac
-  echo "push $(basename "$f")"
-  "$ADB" push "$f" "$DST/$(basename "$f")" >/dev/null
+  echo "push $VOICES_DIR/$(basename "$f")"
+  "$ADB" push "$f" "$DST/$VOICES_DIR/$(basename "$f")" >/dev/null
 done
-echo "done: $("$ADB" shell ls "$DST" | wc -l | tr -d ' ') files in $DST"
+if [ -d "$SRC/$VOICES_DIR" ]; then
+  for f in "$SRC/$VOICES_DIR"/pt_voice_*.bin; do
+    [ -f "$f" ] || continue
+    echo "push $VOICES_DIR/$(basename "$f")"
+    "$ADB" push "$f" "$DST/$VOICES_DIR/$(basename "$f")" >/dev/null
+  done
+fi
+echo "done: $("$ADB" shell ls "$DST" | wc -l | tr -d ' ') files in $DST, " \
+     "$("$ADB" shell ls "$DST/$VOICES_DIR" 2>/dev/null | wc -l | tr -d ' ') in $VOICES_DIR"

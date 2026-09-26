@@ -27,6 +27,10 @@ KV_CAPACITY = 512
 BUILTIN_VOICES = {"alba", "marius", "javert", "charles", "mary", "eve"}
 NAME_RE = re.compile(r"[a-z][a-z0-9_-]{0,63}\Z")
 
+# Extra caches live one level below the model files; mirrors PocketTts.VOICES_DIR
+# and download_voices.py.
+VOICES_DIR = "voices"
+
 
 def parse_args() -> argparse.Namespace:
     default_out = Path(__file__).resolve().parent / "out"
@@ -37,7 +41,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=Path,
         default=Path(os.environ.get("PT_OUT", default_out)),
-        help=f"output directory (default: PT_OUT or {default_out})",
+        help=f"model output directory; the voice goes in its {VOICES_DIR}/ "
+             f"subdirectory (default: PT_OUT or {default_out})",
     )
     parser.add_argument("--preview", action="store_true", help="also synthesize the transcript to a preview WAV")
     parser.add_argument("--force", action="store_true", help="replace output files if they already exist")
@@ -128,9 +133,10 @@ def main() -> int:
         print("error: transcript is empty", file=sys.stderr)
         return 2
 
-    voice_path = args.output_dir / f"pt_voice_{name}.bin"
-    transcript_path = args.output_dir / f"pt_voice_{name}.txt"
-    preview_path = args.output_dir / f"pt_voice_{name}_preview.wav"
+    voices_dir = args.output_dir / VOICES_DIR
+    voice_path = voices_dir / f"pt_voice_{name}.bin"
+    transcript_path = voices_dir / f"pt_voice_{name}.txt"
+    preview_path = voices_dir / f"pt_voice_{name}_preview.wav"
     destinations = [voice_path, transcript_path] + ([preview_path] if args.preview else [])
     existing = [path for path in destinations if path.exists()]
     if existing and not args.force:
@@ -158,11 +164,11 @@ def main() -> int:
         state = model.get_state_for_audio_prompt(str(args.wav))
         keys, values, length = voice_layers(state)
 
-        args.output_dir.mkdir(parents=True, exist_ok=True)
+        voices_dir.mkdir(parents=True, exist_ok=True)
         write_voice(voice_path, keys, values, length)
         transcript_path.write_text(transcript + "\n", encoding="utf-8")
-        print(f"Created {voice_path} ({length} frames)")
-        print(f"Saved transcript {transcript_path}")
+        print(f"Created {VOICES_DIR}/{voice_path.name} ({length} frames)")
+        print(f"Saved transcript {VOICES_DIR}/{transcript_path.name}")
 
         if args.preview:
             from scipy.io import wavfile

@@ -88,6 +88,9 @@ class MainActivity : Activity() {
 
         pendingIntent = intent
         bg.execute {
+            // Make voices/ app-owned before anything is pushed into it; adb cannot
+            // create a directory this process is allowed to read (see VoiceCatalog).
+            runCatching { VoiceCatalog.ensureDir(PocketTtsModels.default(this)) }
             val e = try {
                 PocketTtsEngine(this)
             } catch (e: Throwable) {

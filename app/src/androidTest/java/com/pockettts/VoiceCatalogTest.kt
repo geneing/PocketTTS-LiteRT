@@ -24,6 +24,8 @@ class VoiceCatalogTest {
     @Test
     fun discoversPushedVoices() {
         val models = PocketTtsModels.default(ctx)
+        // The app must own voices/, or adb-created files in it are unreadable.
+        Log.i("VoiceCatalog", "ensureDir=${VoiceCatalog.ensureDir(models)}")
         val installed = VoiceCatalog.installed(models)
         val names = installed.map { it.name }
         Log.i("VoiceCatalog", "installed=$names")

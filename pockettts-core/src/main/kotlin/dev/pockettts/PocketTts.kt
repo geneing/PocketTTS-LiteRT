@@ -104,6 +104,14 @@ object PocketTts {
     fun voiceFile(name: String) = "pt_voice_$name.bin"
 
     /**
+     * Subdirectory, one level below the model files, for voice caches that are
+     * fetched or cloned rather than bundled with the weights (`scripts/
+     * download_voices.py`, `scripts/create_voice.py`). Keeping them apart means a
+     * model refresh cannot clobber them and they need not be part of a model pack.
+     */
+    const val VOICES_DIR = "voices"
+
+    /**
      * Locale voices bundled with the model (CC-BY-4.0 / CC0 only), in the order
      * the engine and the TTS service present them. The first is the default.
      */

@@ -37,6 +37,10 @@ RESTRICTED = {"cosette", "jean"}
 # Shipped by `build_pockettts.py assets`; offered here for convenience only.
 BUNDLED = ["alba", "marius", "javert", "charles", "mary", "eve"]
 
+# Extra caches live one level below the model files, so a model refresh cannot
+# clobber them and a model pack need not carry them. Mirrors PocketTts.VOICES_DIR.
+VOICES_DIR = "voices"
+
 
 def parse_args() -> argparse.Namespace:
     default_out = Path(__file__).resolve().parent / "out"
@@ -60,7 +64,8 @@ def parse_args() -> argparse.Namespace:
                         help="language subdirectory (default: %(default)s)")
     parser.add_argument("--output-dir", type=Path,
                         default=Path(os.environ.get("PT_OUT", default_out)),
-                        help=f"output directory (default: PT_OUT or {default_out})")
+                        help=f"model output directory; voices go in its "
+                             f"{VOICES_DIR}/ subdirectory (default: PT_OUT or {default_out})")
     parser.add_argument("--force", action="store_true",
                         help="replace voice files that already exist")
     return parser.parse_args()
@@ -122,13 +127,14 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
+    voices_dir = args.output_dir / VOICES_DIR
+    voices_dir.mkdir(parents=True, exist_ok=True)
     written, skipped, failed = 0, 0, []
 
     for name in wanted:
-        path = args.output_dir / f"pt_voice_{name}.bin"
+        path = voices_dir / f"pt_voice_{name}.bin"
         if path.exists() and not args.force:
-            print(f"{name}: {path.name} exists, skipped (--force to replace)")
+            print(f"{name}: {VOICES_DIR}/{path.name} exists, skipped (--force to replace)")
             skipped += 1
             continue
         try:
@@ -139,14 +145,14 @@ def main() -> int:
             print(f"{name}: failed: {exc}", file=sys.stderr)
             failed.append(name)
             continue
-        print(f"{name}: T={off} -> {path.name} ({path.stat().st_size / 1e6:.1f} MB)")
+        print(f"{name}: T={off} -> {VOICES_DIR}/{path.name} ({path.stat().st_size / 1e6:.1f} MB)")
         written += 1
 
-    print(f"\n{written} written, {skipped} skipped, {len(failed)} failed in {args.output_dir}")
+    print(f"\n{written} written, {skipped} skipped, {len(failed)} failed in {voices_dir}")
     if failed:
         print(f"failed: {', '.join(failed)}", file=sys.stderr)
     if written:
-        print("To install: scripts/install_to_device.sh  (pushes every pt_voice_*.bin)")
+        print("To install: scripts/install_to_device.sh  (pushes models and voices/)")
     return 1 if failed else 0
 
 

@@ -198,9 +198,13 @@ class PocketTtsEngine(
 
     internal fun voiceState(name: String): VoiceState = synchronized(voiceCache) {
         voiceCache.getOrPut(name) {
-            val bb = ByteBuffer
-                .wrap(models.store.file(PocketTts.voiceFile(name)).readBytes())
-                .order(ByteOrder.LITTLE_ENDIAN)
+            val file = VoiceCatalog.fileFor(models, name)
+                ?: throw java.io.FileNotFoundException(
+                    "Missing voice cache '${PocketTts.voiceFile(name)}' under " +
+                        "${PocketTts.VOICES_DIR}/ or the model root. Install one with " +
+                        "scripts/download_voices.py or scripts/create_voice.py.",
+                )
+            val bb = ByteBuffer.wrap(file.readBytes()).order(ByteOrder.LITTLE_ENDIAN)
             val t = bb.int
             check(t <= PocketTts.PMAX) { "voice state longer than KV capacity: $t > ${PocketTts.PMAX}" }
             val n = PocketTts.G * t * PocketTts.HD

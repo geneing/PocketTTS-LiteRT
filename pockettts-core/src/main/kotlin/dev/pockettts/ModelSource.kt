@@ -24,7 +24,9 @@ interface ModelSource {
      *
      * Optional: sources that cannot enumerate their contents (a bundled asset
      * list, a release index) return an empty list rather than a wrong answer.
-     * Used by [VoiceCatalog] to find user-generated voice caches.
+     * Used by [VoiceCatalog] to find user-generated voice caches. A [prefix] may
+     * include a subdirectory (`voices/pt_voice_`), which a file-backed source
+     * resolves relative to itself.
      */
     fun list(prefix: String, suffix: String): List<String> = emptyList()
 }
@@ -33,9 +35,14 @@ interface ModelSource {
 class DirectorySource(private val dir: File) : ModelSource {
     override fun locate(name: String): File? = File(dir, name).takeIf { it.isFile }
 
-    override fun list(prefix: String, suffix: String): List<String> =
-        dir.listFiles().orEmpty().map { it.name }
-            .filter { it.startsWith(prefix) && it.endsWith(suffix) }
+    override fun list(prefix: String, suffix: String): List<String> {
+        // The prefix may name a subdirectory; enumerate that instead of the root.
+        val cut = prefix.lastIndexOf('/')
+        val root = if (cut < 0) dir else File(dir, prefix.substring(0, cut))
+        val stem = if (cut < 0) prefix else prefix.substring(cut + 1)
+        return root.listFiles().orEmpty().map { it.name }
+            .filter { it.startsWith(stem) && it.endsWith(suffix) }
+    }
 }
 
 /**
