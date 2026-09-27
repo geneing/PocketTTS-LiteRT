@@ -207,6 +207,12 @@ Full detail, the chunk-granularity analysis and the reproduce steps: `streaming.
   `w=2048` if a bit-exact take is wanted. See `streaming.md`.
 - **Do not** put the flow-LM on the GPU on PowerVR (0.79-1.01x), and do not use
   fp32 compute anywhere (GPU32 is the slowest row in every table).
+- **Do not** put the SEANet decoder on the NPU (57 ms vs 0.11 ms on GPU). It can be
+  exported — `RESIZE_NEAREST_NEIGHBOR` above ~33 MB output crashes the Tensor
+  compiler, so the zero-stuff upsample must be rewritten as reshape+PAD — but the
+  tail's huge activations make the NPU ~500x slower, and splitting the decoder at
+  the first upsample does not help either. Detail and the upstream crash report:
+  `seanet_npu.md` and `NPU_crash.txt`.
 
 By ear, every WAV in this sweep was acceptable; the audio exhibits are in
 `bench/audio/`. That makes timing the deciding axis for placement here, with the

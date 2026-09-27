@@ -1,0 +1,151 @@
+Google Tensor (G5) AOT compiler crashes (INTERNAL, no diagnostic) on a large
+nearest-neighbour resize — report to google-ai-edge/LiteRT
+================================================================================
+
+REPORT TO: https://github.com/google-ai-edge/LiteRT/issues
+WHY: the crash is in the Tensor AOT compiler plugin
+     (libLiteRtCompilerPlugin_google_tensor.so / compiler_worker); the error
+     string emitted by the plugin itself points at that tracker
+     ("Please file a support request at https://github.com/google-ai-edge/LiteRT/issues").
+     Existing Google Tensor SDK crash reports are tracked there under
+     `type:tensor sdk` (e.g. issue #8062).
+FALLBACK: the Google Tensor SDK distribution channel / ai-edge-litert-sdk-google-tensor.
+
+--------------------------------------------------------------------------------
+TITLE
+--------------------------------------------------------------------------------
+[Tensor SDK] INTERNAL compiler failure with no diagnostic on nearest-neighbour
+resize above ~33 MB output (TENSOR_G5, ai-edge-litert 2.2.0)
+
+--------------------------------------------------------------------------------
+SUMMARY
+--------------------------------------------------------------------------------
+AOT-compiling a TFLite graph for `SocModel.TENSOR_G5` fails with
+`error type: INTERNAL` and an empty MLIR error body whenever the graph contains a
+`RESIZE_NEAREST_NEIGHBOR` whose output tensor exceeds roughly 33.5 MB. All ops
+partition successfully (`Subgraph 0 fully compiled`), then the backend compiler
+worker dies, so there is no op-level diagnostic to act on. The same resize at
+smaller sizes compiles fine, and other large-tensor ops (CONV_2D, TRANSPOSE_CONV)
+at the same shapes compile fine.
+
+--------------------------------------------------------------------------------
+ENVIRONMENT
+--------------------------------------------------------------------------------
+  Host             Ubuntu (WSL2 on Windows 11), x86_64
+  Python           3.10
+  ai-edge-litert                   2.2.0
+  ai-edge-litert-sdk-google-tensor 2.2.0   (bundles liblitert_plugin_compiler.so)
+  Target SoC       Google Tensor G5 (Pixel 10)
+  Export side      litert-torch 0.9.3 / torch 2.12.1+cpu / ai-edge-litert 2.1.6
+  Plugin log says  "Applying plugin with unknown SDK version, because the targeted
+                    SoC Manufacturer does not report its SDK version."
+
+--------------------------------------------------------------------------------
+EXACT REPRODUCTION
+--------------------------------------------------------------------------------
+Standalone reproducer (no other dependencies, no model weights):
+  scripts/npu_crash_repro.py   (attached / inlined below)
+
+  # export (litert-torch environment)
+  python scripts/npu_crash_repro.py export \
+      --length 4096 --stride 6 --channels 512 \
+      --output nearest_L4096_s6.tflite
+
+  # AOT compile (ai-edge-litert + google-tensor SDK environment)
+  python scripts/npu_crash_repro.py aot nearest_L4096_s6.tflite
+
+Result: FAIL — ValueError: apply_plugin failed to apply plugin, and the
+/tmp/tmp*.error file ends in `Compilation has failed with error type: INTERNAL`.
+
+Size sweep:
+  python scripts/npu_crash_repro.py export --length L --stride 6 --channels 512 \
+      --output nearest_L{L}_s6.tflite      # for each L
+  python scripts/npu_crash_repro.py sweep --lengths 128 256 512 1024 2048 4096
+
+Observed on this machine for input [1,512,L] float32 resized by s=6:
+  L=2727 -> OK (output 33,509,376 bytes)
+  L=2728 -> FAIL (output 33,521,664 bytes)
+The transition is a property of this graph/environment, not a documented limit.
+
+--------------------------------------------------------------------------------
+MINIMAL REPRODUCER (inline)
+--------------------------------------------------------------------------------
+The exported graph is only:
+
+    def forward(self, x):                                   # x: [1, 512, L] fp32
+        y = F.interpolate(x.unsqueeze(2), size=(1, L * s), mode="nearest").squeeze(2)
+        return y                                            # [1, 512, L*s]
+
+i.e. a single RESIZE_NEAREST_NEIGHBOR on a rank-3 fp32 tensor, lowered through the
+2-D x2 path (RESHAPE/TRANSPOSE around the op). Nothing else is needed to trigger
+the crash — no conv, no mask, no crop.
+
+--------------------------------------------------------------------------------
+EXPECTED vs ACTUAL
+--------------------------------------------------------------------------------
+Expected: either a successful compilation, or a failure that names the offending
+op / reason ("RESIZE_NEAREST_NEIGHBOR unsupported at this size", "operand too
+large", etc.).
+
+Actual: `error type: INTERNAL`, empty error body, worker segfault. The
+`/tmp/tmp*.error` file contains only:
+
+  ERROR: [compiler_plugin.cc:876] Failed to compile model:
+  --- Compiler Debug Info ---
+  gnu_build_id: "19efe81838ed6ee060a3e167b906cd66"
+  memory_map: "... /tmp/compiler_worker_XXXX ..."
+  ---------------------------
+  Compilation has failed with error type: INTERNAL. Please file a support request
+  at https://github.com/google-ai-edge/LiteRT/issues
+
+and the Python API raises:
+  ValueError: apply_plugin failed to apply plugin. See /tmp/tmpXXXX.error for details.
+
+--------------------------------------------------------------------------------
+ISOLATION MATRIX (measured)
+--------------------------------------------------------------------------------
+Model context: the upsampling stages of a SEANet audio decoder. Each stage is
+`nearest resize` + constant zero-stuff mask + grouped conv1d + crop. Window L=4096
+unless noted; all inputs [1,512,4096] fp32.
+
+  full decoder (167 ops, 1 partition)                     FAIL
+  prefix conv 512->512 k7 (7 ops, 1 partition)            OK
+  prefix conv + ELU (13 ops, 1 partition)                 OK
+  prefix + first upsample stage (nearest s=6)             FAIL
+  every longer prefix                                     FAIL
+
+  single upsample layer, nearest resize + mask + conv + crop   FAIL
+  same minus the mask                                          FAIL
+  resize only (no conv, no crop)                               FAIL
+  resize + conv, no crop                                       FAIL
+  resize at L=512 (8x smaller, 14/14 ops)                      OK
+  F.pad instead of resize (= different semantics)              OK
+  reshape(B,C,L,1) + F.pad + reshape zero-stuff, then conv     OK, bit-identical
+  F.conv_transpose1d (TRANSPOSE_CONV), same shapes             OK, max|d| 4.8e-06
+
+So: the op that fails is the nearest resize at large output size. Removing the
+resize (keeping an equivalent computation) compiles. fp16 weights fail identically,
+so it is not a dtype issue. Other graphs in the same project — a 210-op
+decoder-transformer and the flow-LM graphs — compile fine on the same install, so
+the toolchain itself is healthy.
+
+--------------------------------------------------------------------------------
+ROOT-CAUSE HYPOTHESIS (unconfirmed)
+--------------------------------------------------------------------------------
+Either the Tensor op-support/lowering path for a large nearest-neighbour resize
+miscalculates a shape/tiling parameter, or the plugin tries to materialise the
+resized constant/tiling map and overflows a buffer in the compiler worker. The
+empty diagnostic makes it impossible to distinguish from the outside.
+
+--------------------------------------------------------------------------------
+IMPACT / WORKAROUND
+--------------------------------------------------------------------------------
+Workaround in use: implement the upsampling without `RESIZE_NEAREST_NEIGHBOR`
+(reshape to (B,C,L,1) + PAD on the last axis + reshape for zero-stuffing, or a
+real `TRANSPOSE_CONV`). Both compile for Tensor G5 at L=4096 and produce
+bit-identical (PAD form; max|d| 0.0) or ~1e-6-equal (TRANSPOSE_CONV) output versus
+the resize version.
+
+Actionable request: please emit an op-level error instead of `INTERNAL` with an
+empty body for this case, and confirm/deny a size limit on
+`RESIZE_NEAREST_NEIGHBOR` in the Tensor backend.
