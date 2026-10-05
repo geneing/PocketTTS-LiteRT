@@ -112,6 +112,9 @@ class PowerBenchmarkTest {
             }
             assertTrue("candidate probe produced no audio", candidateProbe.audio.isNotEmpty())
             val audioBaseline = measurePlayback(health, relevant, reference.audio)
+            val referencePlayback = if (candidateGraph != null) {
+                measureSynthesisPlayback(health, relevant, referenceEngine)
+            } else null
             val fullPlayback = measureSynthesisPlayback(health, relevant, candidateEngine)
             val audioCorr = correlation(reference.audio, fullPlayback.result.audio)
 
@@ -164,7 +167,14 @@ class PowerBenchmarkTest {
             )
             Log.i(TAG, "listening samples: reference=$referenceWav candidate=$candidateWav")
             logEnergy("audio-only", audioBaseline.deltaJoules)
+            referencePlayback?.let { logEnergy("reference synth+play", it.deltaJoules) }
             logEnergy("synthesize+play", fullPlayback.deltaJoules)
+            referencePlayback?.let {
+                logEnergy(
+                    "reference incremental model energy (full minus duration-scaled audio-only)",
+                    incrementalEnergy(audioBaseline, it),
+                )
+            }
             logEnergy(
                 "incremental model energy (full minus duration-scaled audio-only)",
                 incrementalEnergy(audioBaseline, fullPlayback),
