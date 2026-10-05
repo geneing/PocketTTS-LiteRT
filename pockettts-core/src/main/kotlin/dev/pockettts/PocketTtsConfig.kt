@@ -58,6 +58,8 @@ class PocketTtsConfig(
      * one voice file must be present or synthesis cannot work at all.
      */
     val voices: List<Voice> = defaultVoices(models),
+    /** Override the streaming SEANet graph filename; null selects [PocketTts.deconlyGraph]. */
+    val streamDecoderGraph: String? = null,
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }

@@ -37,6 +37,8 @@ class PocketTtsEngine(
     val streamW: Int = config.streamW
     val codecContinuity: Boolean = config.codecContinuity
     val noiseSeed: Long? = config.noiseSeed
+    internal val streamDecoderGraphName: String =
+        config.streamDecoderGraph ?: PocketTts.deconlyGraph(streamW)
 
     /** The voices this engine can speak, first = default. */
     val voices: List<Voice> = config.voices
@@ -104,8 +106,8 @@ class PocketTtsEngine(
         if (lmSteps > 1) load(PocketTts.msGraph(lmSteps), "lm_ms", placement.lm) else null
     internal val dectx: CompiledModel = load(PocketTts.DEC_TX, "dectx", placement.dectx)
     internal val deconly: CompiledModel = load(PocketTts.DECONLY, "dec", placement.deconly)
-    internal val deconlyW: CompiledModel? = if (models.store.exists(PocketTts.deconlyGraph(streamW))) {
-        load(PocketTts.deconlyGraph(streamW), "dec_w", placement.deconly)
+    internal val deconlyW: CompiledModel? = if (models.store.exists(streamDecoderGraphName)) {
+        load(streamDecoderGraphName, "dec_w", placement.deconly)
     } else {
         null
     }

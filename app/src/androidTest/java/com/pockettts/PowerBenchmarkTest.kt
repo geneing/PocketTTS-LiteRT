@@ -14,6 +14,8 @@ import android.os.PowerMonitorReadings
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import dev.pockettts.Accel
+import dev.pockettts.DirectorySource
 import dev.pockettts.Placement
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsConfig
@@ -25,6 +27,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
+import java.io.File
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -39,7 +42,12 @@ import java.util.concurrent.TimeUnit
 class PowerBenchmarkTest {
 
     @Test
-    fun longParagraphPlaybackPower() {
+    fun longParagraphPlaybackPower() = runPowerBenchmark(cpuInt8Seanet = false)
+
+    @Test
+    fun longParagraphCpuInt8SeanetPower() = runPowerBenchmark(cpuInt8Seanet = true)
+
+    private fun runPowerBenchmark(cpuInt8Seanet: Boolean) {
         assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
 
         val instrumentation = InstrumentationRegistry.getInstrumentation()
@@ -52,71 +60,123 @@ class PowerBenchmarkTest {
 
         val battery = requireNotNull(context.getSystemService(BatteryManager::class.java))
         val dir = context.getExternalFilesDir(null) ?: context.filesDir
-        val placement = Placement.default(context, dir)
-        val engine = PocketTtsEngine(
+        val defaultPlacement = Placement.default(context, dir)
+        val referenceEngine = PocketTtsEngine(
             context,
             PocketTtsConfig(
                 models = PocketTtsModels.default(context),
-                placement = placement,
+                placement = defaultPlacement,
                 noiseSeed = 42L,
             ),
         )
 
+        var referenceEngineClosed = false
         try {
             // Compile/initialize the selected delegates before taking any readings.
-            val warmup = engine.synthesize("A short warmup sentence.", "alba")
+            val warmup = referenceEngine.synthesize("A short warmup sentence.", "alba")
             assertTrue("warmup produced no audio", warmup.audio.isNotEmpty())
 
             // Establish streaming-path RTF and the exact waveform used by the
             // audio-only control. Neither interval is included in power deltas.
-            val reference = engine.stream(PARAGRAPH, "alba") {}
+            val reference = referenceEngine.stream(PARAGRAPH, "alba") {}
             assertTrue("reference produced no audio", reference.audio.isNotEmpty())
 
-            val audioBaseline = measurePlayback(health, relevant, reference.audio)
-            val fullPlayback = measureSynthesisPlayback(health, relevant, engine)
-            val quality = AudioQuality.compare(reference.audio, fullPlayback.result.audio)
+            val candidateEngine = if (cpuInt8Seanet) {
+                referenceEngine.close()
+                referenceEngineClosed = true
+                val candidateModels = PocketTtsModels.of(
+                    DirectorySource(File(dir, CPU_INT8_MODEL_DIR)),
+                    DirectorySource(dir),
+                )
+                PocketTtsEngine(
+                    context,
+                    PocketTtsConfig(
+                        models = candidateModels,
+                        placement = Placement(Accel.CPU, Accel.NPU, Accel.CPU),
+                        streamW = 512,
+                        streamDecoderGraph = CPU_INT8_STREAM_GRAPH,
+                        noiseSeed = 42L,
+                    ),
+                )
+            } else {
+                referenceEngine
+            }
 
-            assertEquals("streamed audio length", reference.audio.size, fullPlayback.result.audio.size)
-            assertTrue("playback run lost audio correlation: ${quality.corr}", quality.corr >= 0.99)
+            try {
+                if (candidateEngine !== referenceEngine) {
+                    val candidateWarmup = candidateEngine.stream("A short warmup sentence.", "alba") {}
+                    assertTrue("CPU-int8 warmup produced no audio", candidateWarmup.audio.isNotEmpty())
+                }
+                val candidateSpeedRun = if (candidateEngine === referenceEngine) {
+                    reference
+                } else {
+                    candidateEngine.stream(PARAGRAPH, "alba") {}
+                }
 
-            val profile = fullPlayback.result.profile
-            val timedModelMs = profile.lmRunMs + profile.decTxMs + profile.seanetMs
-            val rtf = reference.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
-                (reference.ms / 1000.0)
-            val batteryLevel = battery.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
-            val batteryCurrentUa = battery.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+                val audioBaseline = measurePlayback(health, relevant, reference.audio)
+                val fullPlayback = measureSynthesisPlayback(health, relevant, candidateEngine)
+                val quality = AudioQuality.compare(reference.audio, fullPlayback.result.audio)
 
-            Log.i(
-                TAG,
-                "device=${Build.MODEL}/${Build.DEVICE} android=${Build.VERSION.SDK_INT} " +
-                    "charging=${battery.isCharging} battery=${batteryLevel}% current=${batteryCurrentUa}uA " +
-                    "screenInteractive=${context.getSystemService(android.os.PowerManager::class.java)?.isInteractive}",
-            )
-            Log.i(TAG, "placement=${placement.label} monitors=${relevant.joinToString { it.name }}")
-            Log.i(
-                TAG,
-                "paragraph chars=${PARAGRAPH.length} words=${PARAGRAPH.split(Regex("\\s+")).size} " +
-                    "audio=${reference.audio.size.toDouble() / PocketTts.SAMPLE_RATE}s " +
-                    "frames=${fullPlayback.result.frames} inference=${reference.ms}ms " +
-                    "streamRtf=${fmt(rtf)}x playbackWall=${fullPlayback.elapsedMs}ms " +
-                    "qualityCorr=${fmt(quality.corr)} SNR=${fmt(quality.snrDb)}dB",
-            )
-            Log.i(
-                TAG,
-                "model stage time: lm=${profile.lmRunMs}ms dectx=${profile.decTxMs}ms " +
-                    "seanet=${profile.seanetMs}ms total=${timedModelMs}ms " +
-                    "shares=${fmt(percent(profile.lmRunMs, timedModelMs))}/" +
-                    "${fmt(percent(profile.decTxMs, timedModelMs))}/" +
-                    "${fmt(percent(profile.seanetMs, timedModelMs))}%",
-            )
-            logEnergy("audio-only", audioBaseline.deltaJoules)
-            logEnergy("synthesize+play", fullPlayback.deltaJoules)
-            logEnergy(
-                "incremental model energy (full minus duration-scaled audio-only)",
-                incrementalEnergy(audioBaseline, fullPlayback),
-            )
+                val profile = fullPlayback.result.profile
+                val timedModelMs = profile.lmRunMs + profile.decTxMs + profile.seanetMs
+                val referenceRtf = reference.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                    (reference.ms / 1000.0)
+                val candidateRtf = candidateSpeedRun.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                    (candidateSpeedRun.ms / 1000.0)
+                val batteryLevel = battery.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+                val batteryCurrentUa = battery.getIntProperty(BatteryManager.BATTERY_PROPERTY_CURRENT_NOW)
+
+                Log.i(
+                    TAG,
+                    "device=${Build.MODEL}/${Build.DEVICE} android=${Build.VERSION.SDK_INT} " +
+                        "charging=${battery.isCharging} battery=${batteryLevel}% current=${batteryCurrentUa}uA " +
+                        "screenInteractive=${context.getSystemService(android.os.PowerManager::class.java)?.isInteractive}",
+                )
+                Log.i(
+                    TAG,
+                    "placement=${candidateEngine.placements} decoderVariant=" +
+                        "${if (cpuInt8Seanet) "cpu-int8" else "default"} " +
+                        "monitors=${relevant.joinToString { it.name }}",
+                )
+                Log.i(
+                    TAG,
+                    "paragraph chars=${PARAGRAPH.length} words=${PARAGRAPH.split(Regex("\\s+")).size} " +
+                        "audio=${reference.audio.size.toDouble() / PocketTts.SAMPLE_RATE}s " +
+                        "frames=${fullPlayback.result.frames} referenceInference=${reference.ms}ms " +
+                        "candidateInference=${candidateSpeedRun.ms}ms " +
+                        "referenceRtf=${fmt(referenceRtf)}x candidateRtf=${fmt(candidateRtf)}x " +
+                        "playbackWall=${fullPlayback.elapsedMs}ms " +
+                        "qualityCorr=${fmt(quality.corr)} SNR=${fmt(quality.snrDb)}dB",
+                )
+                Log.i(
+                    TAG,
+                    "model stage time: lm=${profile.lmRunMs}ms dectx=${profile.decTxMs}ms " +
+                        "seanet=${profile.seanetMs}ms total=${timedModelMs}ms " +
+                        "shares=${fmt(percent(profile.lmRunMs, timedModelMs))}/" +
+                        "${fmt(percent(profile.decTxMs, timedModelMs))}/" +
+                        "${fmt(percent(profile.seanetMs, timedModelMs))}%",
+                )
+                logEnergy("audio-only", audioBaseline.deltaJoules)
+                logEnergy("synthesize+play", fullPlayback.deltaJoules)
+                logEnergy(
+                    "incremental model energy (full minus duration-scaled audio-only)",
+                    incrementalEnergy(audioBaseline, fullPlayback),
+                )
+                assertEquals("streamed audio length", reference.audio.size, fullPlayback.result.audio.size)
+                assertTrue("playback run lost audio correlation: ${quality.corr}", quality.corr >= 0.99)
+                if (cpuInt8Seanet) {
+                    assertTrue("CPU-int8 SEANet SNR below 30 dB: ${quality.snrDb}", quality.snrDb >= 30.0)
+                    assertTrue(
+                        "CPU-int8 streaming RTF fell below 95% of default: " +
+                            "$candidateRtf vs $referenceRtf",
+                        candidateRtf >= referenceRtf * 0.95,
+                    )
+                }
+            } finally {
+                if (candidateEngine !== referenceEngine) candidateEngine.close()
+            }
         } finally {
-            engine.close()
+            if (!referenceEngineClosed) referenceEngine.close()
         }
     }
 
@@ -302,6 +362,8 @@ class PowerBenchmarkTest {
 
     private companion object {
         const val TAG = "PocketTTSPower"
+        const val CPU_INT8_MODEL_DIR = "seanet_cpu_int8"
+        const val CPU_INT8_STREAM_GRAPH = "pt_mimi_deconly_w512_dyn8.tflite"
         val PARAGRAPH = """
             Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.
 

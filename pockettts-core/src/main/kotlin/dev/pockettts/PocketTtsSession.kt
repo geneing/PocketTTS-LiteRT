@@ -382,7 +382,7 @@ class PocketTtsSession internal constructor(
      */
     fun stream(text: String, onChunk: (FloatArray) -> Unit): TtsResult = synchronized(engine.lock) {
         if (engine.deconlyW == null) {
-            android.util.Log.w("PocketTTS", "no ${PocketTts.deconlyGraph(engine.streamW)}: one-shot fallback")
+            android.util.Log.w("PocketTTS", "no ${engine.streamDecoderGraphName}: one-shot fallback")
             val r = synthesize(text)
             if (r.audio.isNotEmpty()) onChunk(r.audio)
             return@synchronized r
