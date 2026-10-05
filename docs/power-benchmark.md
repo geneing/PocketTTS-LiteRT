@@ -38,28 +38,33 @@ counters include both plugged-in and battery operation, so USB debugging can
 remain connected; these readings are system-wide domain energy, not a direct
 battery-capacity discharge measurement.
 
-## Initial Pixel 10 baseline
+## Pixel 10 baseline
 
 Measured on 2026-10-05 with Android API 37, 80% charge, USB power connected, and
 the screen interactive. Default placement selected `lm:CPU dectx:NPU dec:GPU`.
-The paragraph rendered 60.72 seconds of audio; the initial one-shot RTF was 1.952×,
-waveform correlation was 1.000, and SNR was 59.7 dB.
+The paragraph rendered 60.72 seconds of audio. Streaming synthesis took 24.715 s
+(2.457× RTF); waveform correlation to the same-seed reference was 1.000 and SNR
+was 163.3 dB.
 
 | Stage | Placement | Model-run time | Share of measured stage time | Incremental domain energy estimate |
 |---|---:|---:|---:|---:|
-| Flow-LM | CPU | 15.643 s | 71.0% | 11.45 J across CPU clusters |
-| Mimi decoder transformer (`dec_tx`) | TPU | 1.989 s | 9.0% | 1.41 J on TPU |
-| SEANet waveform decoder | GPU | 4.407 s | 20.0% | 4.75 J on GPU |
+| Flow-LM | CPU | 15.171 s | 69.6% | 22.57 J across CPU clusters |
+| Mimi decoder transformer (`dec_tx`) | TPU | 2.160 s | 9.9% | 1.55 J on TPU |
+| SEANet waveform decoder | GPU | 4.481 s | 20.5% | 4.89 J on GPU |
 
 The incremental estimates are the modeled consumer deltas for the full
 synthesis-and-playback interval minus the duration-scaled audio-only control.
-They sum to about 17.6 J across the three modeled compute domains; the CPU
-Flow-LM is the largest contributor in this run. The hardware readings are
-domain-level, not model-call-level: CPU energy also includes tokenization and
-host-side work, while the GPU and TPU consumers include any other system work in
-those domains. Use stage timing and the placement mapping alongside energy
-before assigning a change to a graph.
+They sum to about 29.0 J across the three modeled compute domains. The CPU
+Flow-LM domain accounts for about 78% of that estimate and is the dominant
+consumer; SEANet is second, and `dec_tx` is smallest. Dividing each domain delta
+by its stage time gives rough stage-average estimates of 1.49 W, 1.09 W, and
+0.72 W respectively. These are attribution estimates, not isolated model-call
+power measurements.
 
-The modeled consumer deltas were CPU clusters 8.17 / 3.05 / 0.23 J, GPU 4.75 J,
-and TPU 1.41 J. Raw ODPM rail deltas are also logged, but those rails can overlap
-the modeled consumers and must not be added to them.
+The hardware readings are domain-level, not model-call-level: CPU energy also
+includes tokenization and host-side work, while GPU and TPU consumers include
+other system work in those domains. Stage timing and accelerator placement
+support the Flow-LM attribution, but the counters cannot isolate exact per-call
+energy. Raw ODPM rail deltas are also logged; those rails can overlap modeled
+consumers and must not be added to them. Incremental consumer deltas in this run
+were CPU clusters 10.59 / 10.70 / 1.28 J, GPU 4.89 J, and TPU 1.55 J.
