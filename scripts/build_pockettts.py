@@ -432,6 +432,50 @@ class ZeroStuffConvT1d(nn.Module):
         return y[:, :, :self.L * self.s]
 
 
+class PhaseConvT1d(nn.Module):
+    """ConvTranspose1d as a packed set of output phases.
+
+    For stride ``s``, output sample ``s*n+p`` is a causal convolution of the
+    input at ``n`` with the taps whose ConvTranspose kernel indices are
+    ``p, s+p, 2*s+p, ...``. Packing ``p`` into the output-channel dimension
+    lets LiteRT see one ordinary Conv1D instead of a zero-stuffed activation
+    followed by a wider convolution. The channel order is [group, output, phase].
+    """
+
+    def __init__(self, ct, L):
+        super().__init__()
+        self.s = ct.stride[0]
+        self.k = ct.kernel_size[0]
+        self.g = ct.groups
+        self.L = L
+        cin, cout = ct.in_channels, ct.out_channels
+        cing, coutg = cin // self.g, cout // self.g
+        kphase = (self.k + self.s - 1) // self.s
+        src = ct.weight.detach().view(self.g, cing, coutg, self.k)
+        # Conv1D cross-correlation reads x[n - q] when its kernel is reversed
+        # and padded on the left by kphase-1.
+        w = torch.zeros(self.g, coutg, self.s, cing, kphase,
+                        dtype=src.dtype, device=src.device)
+        for p in range(self.s):
+            for q in range(kphase):
+                k = self.s * q + p
+                if k < self.k:
+                    w[:, :, p, :, kphase - 1 - q] = src[..., k].permute(0, 2, 1)
+        self.register_buffer("w", w.reshape(cout * self.s, cing, kphase).contiguous())
+        bias = (ct.bias.detach().clone() if ct.bias is not None
+                else torch.zeros(cout, dtype=src.dtype, device=src.device))
+        self.register_buffer("b", bias.view(self.g, coutg, 1).expand(-1, -1, self.s).reshape(-1).contiguous())
+        self.kphase = kphase
+        self.coutg = coutg
+
+    def forward(self, x):
+        y = F.conv1d(F.pad(x, (self.kphase - 1, 0)), self.w, self.b, groups=self.g)
+        b, _, length = y.shape
+        return (y.view(b, self.g * self.coutg, self.s, length)
+                .permute(0, 1, 3, 2)
+                .reshape(b, self.g * self.coutg, length * self.s))
+
+
 def load_eager():
     from pocket_tts import TTSModel
     model = TTSModel.load_model()
@@ -1092,7 +1136,7 @@ class MimiDecOnly(nn.Module):
     stage_stream().
     """
 
-    def __init__(self, model, L=S_DEC):
+    def __init__(self, model, L=S_DEC, convtr_impl="zero"):
         super().__init__()
         from pocket_tts.modules.conv import StreamingConv1d, StreamingConvTranspose1d
         from pocket_tts.modules.seanet import SEANetResnetBlock
@@ -1141,7 +1185,10 @@ class MimiDecOnly(nn.Module):
             if kind == "conv":
                 L = add_conv(obj, pad, L)
             elif kind == "convtr":
-                self.mods.append(ZeroStuffConvT1d(obj, L))
+                convtr_cls = PhaseConvT1d if convtr_impl == "phase" else ZeroStuffConvT1d
+                if convtr_impl not in ("zero", "phase"):
+                    raise ValueError(f"unknown ConvTranspose implementation: {convtr_impl}")
+                self.mods.append(convtr_cls(obj, L))
                 self.plan.append(("zs", len(self.mods) - 1, None))
                 L = L * obj.stride[0]
             elif kind == "elu":
