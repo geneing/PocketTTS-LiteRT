@@ -56,7 +56,18 @@ class PowerBenchmarkTest {
         val context = InstrumentationRegistry.getInstrumentation().targetContext
         val modelDir = context.getExternalFilesDir(null) ?: context.filesDir
         val placement = Placement.default(context, modelDir).copy(deconly = Accel.GPU)
-        runPowerProbe("seanet-npu-phase", placement, placement, PHASE_GRAPH, Accel.NPU)
+        runPowerProbe("seanet-npu-phase-w512", placement, placement, PHASE_GRAPH, Accel.NPU)
+    }
+
+    @Test
+    fun phasePackedSeanetNpu1024LongParagraphPlaybackPower() {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val modelDir = context.getExternalFilesDir(null) ?: context.filesDir
+        val placement = Placement.default(context, modelDir).copy(deconly = Accel.GPU)
+        runPowerProbe(
+            "seanet-npu-phase-w1024", placement, placement, PHASE_GRAPH_1024, Accel.NPU,
+            candidateWindow = 1024,
+        )
     }
 
     private fun runPowerProbe(
@@ -65,6 +76,7 @@ class PowerBenchmarkTest {
         candidatePlacement: Placement,
         candidateGraph: String?,
         candidateStreamAccel: Accel,
+        candidateWindow: Int = PocketTts.STREAM_W,
     ) {
         assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
 
@@ -82,7 +94,7 @@ class PowerBenchmarkTest {
         val sameEngine = candidateGraph == null && candidatePlacement == referencePlacement &&
             candidateStreamAccel == referencePlacement.deconly
         val candidateEngine = if (sameEngine) referenceEngine else {
-            newEngine(context, models, candidatePlacement, candidateGraph, candidateStreamAccel)
+            newEngine(context, models, candidatePlacement, candidateGraph, candidateStreamAccel, candidateWindow)
         }
 
         try {
@@ -169,12 +181,14 @@ class PowerBenchmarkTest {
         placement: Placement,
         graph: String?,
         streamAccel: Accel,
+        streamWindow: Int = PocketTts.STREAM_W,
     ) = PocketTtsEngine(
         context,
         PocketTtsConfig(
             models = models,
             placement = placement,
             noiseSeed = 42L,
+            streamW = streamWindow,
             streamDecoderGraph = graph,
             streamDecoderAccel = streamAccel,
         ),
@@ -409,6 +423,7 @@ class PowerBenchmarkTest {
     private companion object {
         const val TAG = "PocketTTSPower"
         const val PHASE_GRAPH = "pt_mimi_deconly_w512_phase_fp16.tflite"
+        const val PHASE_GRAPH_1024 = "pt_mimi_deconly_w1024_phase_fp16.tflite"
         val PARAGRAPH = """
             Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.
 
