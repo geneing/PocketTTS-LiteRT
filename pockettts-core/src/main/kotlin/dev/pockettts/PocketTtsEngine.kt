@@ -35,6 +35,8 @@ class PocketTtsEngine(
     val placement: Placement = config.placement
     val lmSteps: Int = config.lmSteps
     val streamW: Int = config.streamW
+    val streamDecoderAccel: Accel = config.streamDecoderAccel
+    val streamDecoderGraphName: String = config.streamDecoderGraph ?: PocketTts.deconlyGraph(streamW)
     val codecContinuity: Boolean = config.codecContinuity
     val noiseSeed: Long? = config.noiseSeed
 
@@ -104,8 +106,8 @@ class PocketTtsEngine(
         if (lmSteps > 1) load(PocketTts.msGraph(lmSteps), "lm_ms", placement.lm) else null
     internal val dectx: CompiledModel = load(PocketTts.DEC_TX, "dectx", placement.dectx)
     internal val deconly: CompiledModel = load(PocketTts.DECONLY, "dec", placement.deconly)
-    internal val deconlyW: CompiledModel? = if (models.store.exists(PocketTts.deconlyGraph(streamW))) {
-        load(PocketTts.deconlyGraph(streamW), "dec_w", placement.deconly)
+    internal val deconlyW: CompiledModel? = if (models.store.exists(streamDecoderGraphName)) {
+        load(streamDecoderGraphName, "dec_w", streamDecoderAccel)
     } else {
         null
     }
@@ -153,8 +155,15 @@ class PocketTtsEngine(
     internal val deconlyWIn = deconlyW?.createInputBuffers()
     internal val deconlyWOut = deconlyW?.createOutputBuffers()
 
-    /** e.g. "lm:CPU dectx:NPU dec:GPU" — for diagnostics/UI. */
-    val placements: String = if (lmSteps > 1) "${placement.label} ms$lmSteps" else placement.label
+    /** Effective graph placements, including an experimental streaming decoder override. */
+    val placements: String = buildString {
+        append(if (lmSteps > 1) "${placement.label} ms$lmSteps" else placement.label)
+        if (streamDecoderAccel != placement.deconly ||
+            streamDecoderGraphName != PocketTts.deconlyGraph(streamW)
+        ) {
+            append(" streamDec:${streamDecoderAccel.tag}($streamDecoderGraphName)")
+        }
+    }
 
     // ---- host assets ------------------------------------------------------
     private val embChannel = RandomAccessFile(models.store.file(PocketTts.EMBED), "r").channel
@@ -313,9 +322,13 @@ class PocketTtsEngine(
             if (config.placement.dectx == Accel.NPU) {
                 f += PocketTts.g5Variant(PocketTts.DEC_TX)
             }
+            val streamGraph = config.streamDecoderGraph ?: PocketTts.deconlyGraph(config.streamW)
+            if (config.streamDecoderAccel == Accel.NPU) {
+                f += PocketTts.g5Variant(streamGraph)
+            }
             f += PocketTts.DEC_TX
             f += PocketTts.DECONLY
-            f += PocketTts.deconlyGraph(config.streamW)
+            f += streamGraph
             f += listOf(
                 PocketTts.EMBED, PocketTts.INPUT_LINEAR, PocketTts.BOS,
                 PocketTts.NEUTRAL, PocketTts.TOKENIZER,

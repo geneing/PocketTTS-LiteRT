@@ -47,6 +47,10 @@ class PocketTtsConfig(
     val codecContinuity: Boolean = false,
     /** SEANet window (feature positions) for streaming. */
     val streamW: Int = PocketTts.STREAM_W,
+    /** Optional alternate streaming SEANet graph filename for experiments. */
+    val streamDecoderGraph: String? = null,
+    /** Accelerator for the streaming SEANet graph; defaults to the one-shot decoder placement. */
+    val streamDecoderAccel: Accel = placement.deconly,
     /** When set, every synthesis reseeds the noise RNG so repeats are identical. */
     val noiseSeed: Long? = null,
     /** When set, GPU graphs serialize their compiled program cache here. */
