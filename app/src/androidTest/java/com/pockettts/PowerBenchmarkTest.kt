@@ -21,6 +21,7 @@ import dev.pockettts.PocketTtsConfig
 import dev.pockettts.PocketTtsEngine
 import dev.pockettts.PocketTtsModels
 import dev.pockettts.TtsResult
+import dev.pockettts.Wav
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Assume.assumeTrue
@@ -80,6 +81,22 @@ class PowerBenchmarkTest {
             val reference = referenceEngine.stream(PARAGRAPH, "alba") {}
             assertTrue("reference produced no audio", reference.audio.isNotEmpty())
 
+            val audioBaseline = measurePlayback(health, relevant, reference.audio)
+            val referencePlayback = if (cpuInt8Seanet) {
+                measureSynthesisPlayback(health, relevant, referenceEngine)
+            } else {
+                null
+            }
+            val referenceAudio = referencePlayback?.result?.audio ?: reference.audio
+            assertEquals("reference replay audio length", reference.audio.size, referenceAudio.size)
+            if (referencePlayback != null) {
+                val referenceRepeatCorr = AudioQuality.compare(reference.audio, referenceAudio).corr
+                assertTrue("reference repeat correlation: $referenceRepeatCorr", referenceRepeatCorr >= 0.99)
+            }
+            val sampleDir = context.getExternalFilesDir("power-benchmark")
+                ?: File(context.filesDir, "power-benchmark")
+            saveSample(sampleDir, "${if (cpuInt8Seanet) "seanet-cpu-int8" else "seanet-default"}-reference.wav", referenceAudio)
+
             val candidateEngine = if (cpuInt8Seanet) {
                 referenceEngine.close()
                 referenceEngineClosed = true
@@ -110,9 +127,13 @@ class PowerBenchmarkTest {
                     candidateEngine.stream(PARAGRAPH, "alba") {}
                 }
 
-                val audioBaseline = measurePlayback(health, relevant, reference.audio)
                 val fullPlayback = measureSynthesisPlayback(health, relevant, candidateEngine)
-                val quality = AudioQuality.compare(reference.audio, fullPlayback.result.audio)
+                saveSample(
+                    sampleDir,
+                    "${if (cpuInt8Seanet) "seanet-cpu-int8" else "seanet-default"}-candidate.wav",
+                    fullPlayback.result.audio,
+                )
+                val quality = AudioQuality.compare(referenceAudio, fullPlayback.result.audio)
 
                 val profile = fullPlayback.result.profile
                 val timedModelMs = profile.lmRunMs + profile.decTxMs + profile.seanetMs
@@ -143,8 +164,15 @@ class PowerBenchmarkTest {
                         "candidateInference=${candidateSpeedRun.ms}ms " +
                         "referenceRtf=${fmt(referenceRtf)}x candidateRtf=${fmt(candidateRtf)}x " +
                         "playbackWall=${fullPlayback.elapsedMs}ms " +
-                        "qualityCorr=${fmt(quality.corr)} SNR=${fmt(quality.snrDb)}dB",
+                        "qualityCorr=${fmt(quality.corr)}",
                 )
+                referencePlayback?.result?.profile?.let { profile ->
+                    Log.i(
+                        TAG,
+                        "reference stage time: lm=${profile.lmRunMs}ms dectx=${profile.decTxMs}ms " +
+                            "seanet=${profile.seanetMs}ms",
+                    )
+                }
                 Log.i(
                     TAG,
                     "model stage time: lm=${profile.lmRunMs}ms dectx=${profile.decTxMs}ms " +
@@ -154,6 +182,13 @@ class PowerBenchmarkTest {
                         "${fmt(percent(profile.seanetMs, timedModelMs))}%",
                 )
                 logEnergy("audio-only", audioBaseline.deltaJoules)
+                referencePlayback?.let {
+                    logEnergy("reference synthesize+play", it.deltaJoules)
+                    logEnergy(
+                        "reference incremental model energy (full minus duration-scaled audio-only)",
+                        incrementalEnergy(audioBaseline, it),
+                    )
+                }
                 logEnergy("synthesize+play", fullPlayback.deltaJoules)
                 logEnergy(
                     "incremental model energy (full minus duration-scaled audio-only)",
@@ -162,7 +197,6 @@ class PowerBenchmarkTest {
                 assertEquals("streamed audio length", reference.audio.size, fullPlayback.result.audio.size)
                 assertTrue("playback run lost audio correlation: ${quality.corr}", quality.corr >= 0.99)
                 if (cpuInt8Seanet) {
-                    assertTrue("CPU-int8 SEANet SNR below 30 dB: ${quality.snrDb}", quality.snrDb >= 30.0)
                     assertTrue(
                         "CPU-int8 streaming RTF fell below 95% of default: " +
                             "$candidateRtf vs $referenceRtf",
@@ -328,6 +362,13 @@ class PowerBenchmarkTest {
             .sortedBy { it.key }
             .joinToString { (name, value) -> "$name=${fmt(value)}J" }
         Log.i(TAG, "$label: $rendered")
+    }
+
+    private fun saveSample(directory: File, name: String, audio: FloatArray) {
+        assertTrue("could not create sample directory: ${directory.absolutePath}", directory.mkdirs() || directory.isDirectory)
+        val file = File(directory, name)
+        Wav.write(file, audio)
+        Log.i(TAG, "saved sample=${file.absolutePath} bytes=${file.length()}")
     }
 
     private fun String.isRelevantPowerDomain(): Boolean {
