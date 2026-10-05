@@ -11,7 +11,7 @@ paragraph and seed, warms the delegates, then measures two intervals:
 The test reads Android `PowerMonitor` counters before and after each interval.
 It reports modeled CPU-cluster, GPU, and TPU energy consumers and the matching
 ODPM rails when the device exposes them. The report also includes per-stage
-model-run times, RTF from a separate synthesis-only take, and waveform
+model-run times, RTF from a separate no-audio streaming take, and waveform
 correlation against that take. The audio-only control is scaled to the live
 interval duration and subtracted from the full interval to estimate incremental
 model energy.
@@ -42,7 +42,7 @@ battery-capacity discharge measurement.
 
 Measured on 2026-10-05 with Android API 37, 80% charge, USB power connected, and
 the screen interactive. Default placement selected `lm:CPU dectx:NPU dec:GPU`.
-The paragraph rendered 60.72 seconds of audio; synthesis-only RTF was 1.952×,
+The paragraph rendered 60.72 seconds of audio; the initial one-shot RTF was 1.952×,
 waveform correlation was 1.000, and SNR was 59.7 dB.
 
 | Stage | Placement | Model-run time | Share of measured stage time | Incremental domain energy estimate |

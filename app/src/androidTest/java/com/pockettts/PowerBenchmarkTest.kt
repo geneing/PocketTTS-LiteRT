@@ -67,9 +67,9 @@ class PowerBenchmarkTest {
             val warmup = engine.synthesize("A short warmup sentence.", "alba")
             assertTrue("warmup produced no audio", warmup.audio.isNotEmpty())
 
-            // Establish the model-only RTF and the exact waveform used by the
+            // Establish streaming-path RTF and the exact waveform used by the
             // audio-only control. Neither interval is included in power deltas.
-            val reference = engine.synthesize(PARAGRAPH, "alba")
+            val reference = engine.stream(PARAGRAPH, "alba") {}
             assertTrue("reference produced no audio", reference.audio.isNotEmpty())
 
             val audioBaseline = measurePlayback(health, relevant, reference.audio)
@@ -98,7 +98,7 @@ class PowerBenchmarkTest {
                 "paragraph chars=${PARAGRAPH.length} words=${PARAGRAPH.split(Regex("\\s+")).size} " +
                     "audio=${reference.audio.size.toDouble() / PocketTts.SAMPLE_RATE}s " +
                     "frames=${fullPlayback.result.frames} inference=${reference.ms}ms " +
-                    "inferenceRtf=${fmt(rtf)}x playbackWall=${fullPlayback.elapsedMs}ms " +
+                    "streamRtf=${fmt(rtf)}x playbackWall=${fullPlayback.elapsedMs}ms " +
                     "qualityCorr=${fmt(quality.corr)} SNR=${fmt(quality.snrDb)}dB",
             )
             Log.i(
