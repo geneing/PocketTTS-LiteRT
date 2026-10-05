@@ -43,8 +43,7 @@ battery-capacity discharge measurement.
 Measured on 2026-10-05 with Android API 37, 80% charge, USB power connected, and
 the screen interactive. Default placement selected `lm:CPU dectx:NPU dec:GPU`.
 The paragraph rendered 60.72 seconds of audio. Streaming synthesis took 24.715 s
-(2.457× RTF); waveform correlation to the same-seed reference was 1.000 and SNR
-was 163.3 dB.
+(2.457× RTF); waveform correlation to the same-seed reference was 1.000.
 
 | Stage | Placement | Model-run time | Share of measured stage time | Incremental domain energy estimate |
 |---|---:|---:|---:|---:|
@@ -88,13 +87,26 @@ then run `PowerBenchmarkTest#longParagraphCpuInt8SeanetPower`. The test places
 the candidate SEANet on CPU, keeps Flow-LM on CPU and `dec_tx` on NPU, and uses
 the same-seed GPU output as its quality and audio-only reference.
 
-On the Pixel 10 trial (201 words, 60.72 s audio), the candidate reached 2.482×
-RTF versus 2.440× for the same-run default reference. Correlation was 0.995, but
-SNR was 19.67 dB, below the test's 30 dB quality floor. The candidate SEANet
-stage took 8.35 s during playback, versus 4.48 s for the GPU baseline.
+The paired Pixel 10 run measures an audio-only interval, default GPU-SEANet
+reference synthesis and playback, then CPU-int8 candidate synthesis and
+playback. It uses the same 201-word paragraph, 60.72 s output, and seed. The
+quality gate is waveform correlation (>=0.99); the saved WAVs are for listening
+review. SNR is not used as an acceptance signal.
 
-The candidate's incremental modeled deltas were CPU clusters 13.60 / 13.17 /
-0.54 J, GPU -0.24 J, and TPU 1.42 J. This largely trades GPU work for CPU work;
-compared with the separate default run, the total compute-domain estimate fell
-by only about 0.5 J, too little to call a reliable power win. RTF passed the
-5% regression limit, but audio quality did not. Keep this variant experimental.
+| Measure | Default GPU SEANet | CPU-int8 SEANet |
+|---|---:|---:|
+| No-playback inference | 24.605 s / 2.468× RTF | 24.359 s / 2.493× RTF |
+| Playback stage time: Flow-LM / dec_tx / SEANet | 15.179 / 2.009 / 4.452 s | 15.409 / 1.985 / 8.273 s |
+| Candidate-to-reference waveform correlation | — | 0.995 |
+| Incremental CPU/0, CPU/1, CPU/2 | 8.945 / 2.855 / 2.264 J | 13.039 / 11.953 / 2.138 J |
+| Incremental GPU / TPU | 4.263 / 1.374 J | -0.813 / 1.354 J |
+
+The negative GPU delta is measurement noise and should be treated as roughly
+zero. CPU-int8 keeps speed and passes the correlation gate, but moves energy
+onto CPU: the modeled compute-domain estimate is about 19.7 J for the reference
+and 28.5 J for the candidate (GPU noise floored at zero). The candidate SEANet
+stage also takes about 1.86× as long as the GPU stage. Keep CPU-int8 available
+as an experiment, but this Pixel 10 run does not support it as a battery-saving
+placement. The WAVs are written under `scripts/out/` as
+`seanet-cpu-int8-reference.wav` and `seanet-cpu-int8-candidate.wav` for the
+user's listening comparison.
