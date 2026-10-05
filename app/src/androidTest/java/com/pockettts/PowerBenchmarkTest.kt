@@ -15,7 +15,6 @@ import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import dev.pockettts.Accel
-import dev.pockettts.DirectorySource
 import dev.pockettts.Placement
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsConfig
@@ -84,14 +83,12 @@ class PowerBenchmarkTest {
             val candidateEngine = if (cpuInt8Seanet) {
                 referenceEngine.close()
                 referenceEngineClosed = true
-                val candidateModels = PocketTtsModels.of(
-                    DirectorySource(File(dir, CPU_INT8_MODEL_DIR)),
-                    DirectorySource(dir),
-                )
+                val candidateGraph = File(dir, CPU_INT8_STREAM_GRAPH)
+                assertTrue("missing CPU-int8 SEANet graph: ${candidateGraph.absolutePath}", candidateGraph.isFile)
                 PocketTtsEngine(
                     context,
                     PocketTtsConfig(
-                        models = candidateModels,
+                        models = PocketTtsModels.default(context),
                         placement = Placement(Accel.CPU, Accel.NPU, Accel.CPU),
                         streamW = 512,
                         streamDecoderGraph = CPU_INT8_STREAM_GRAPH,
@@ -362,7 +359,6 @@ class PowerBenchmarkTest {
 
     private companion object {
         const val TAG = "PocketTTSPower"
-        const val CPU_INT8_MODEL_DIR = "seanet_cpu_int8"
         const val CPU_INT8_STREAM_GRAPH = "pt_mimi_deconly_w512_dyn8.tflite"
         val PARAGRAPH = """
             Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.
