@@ -47,6 +47,10 @@ class PocketTtsEngine(
     /** Per-graph compile time (ms), keyed lm/lm_ms/dectx/dec/dec_w. */
     val loadMs = LinkedHashMap<String, Long>()
 
+    /** Backend that successfully created each graph; non-NPU failures retry on CPU. */
+    private val loadedAccelerators = LinkedHashMap<String, Accel>()
+    val runtimeAccelerators: Map<String, Accel> get() = loadedAccelerators.toMap()
+
     private var npuEnvironment: Environment? = null
 
     private fun npuEnv(): Environment {
@@ -65,6 +69,7 @@ class PocketTtsEngine(
         val file = if (accel == Accel.NPU) PocketTts.g5Variant(name) else name
         val p = models.store.file(file).absolutePath
         val t = System.nanoTime()
+        var actualAccel = accel
         val model = try {
             when (accel) {
                 Accel.CPU -> CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null)
@@ -92,9 +97,16 @@ class PocketTtsEngine(
             // The NPU partition only has a dispatch kernel, so a CPU retry of the
             // same file cannot work; a silent fallback would hide a mis-wired NPU.
             if (accel == Accel.NPU) throw e
+            actualAccel = Accel.CPU
+            android.util.Log.w(
+                "PocketTTS",
+                "$key graph $name failed to load on $accel; retrying on CPU",
+                e,
+            )
             CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null)
         }
         loadMs[key] = (System.nanoTime() - t) / 1_000_000
+        loadedAccelerators[key] = actualAccel
         return model
     }
 

@@ -47,6 +47,30 @@ class PowerBenchmarkTest {
     @Test
     fun longParagraphCpuInt8SeanetPower() = runPowerBenchmark(cpuInt8Seanet = true)
 
+    @Test
+    fun longParagraphFlowLmGpuFp16Power() = runFlowLmPowerBenchmark(
+        caseName = "gpu-requested-fp16-step",
+        lmPlacement = Accel.GPU,
+        lmGraph = FP16_FLOWLM_GRAPH,
+        lmSteps = 1,
+    )
+
+    @Test
+    fun longParagraphFlowLmGpuFp16Ms4Power() = runFlowLmPowerBenchmark(
+        caseName = "gpu-requested-fp16-ms4",
+        lmPlacement = Accel.GPU,
+        lmGraph = FP16_FLOWLM_GRAPH,
+        lmSteps = 4,
+    )
+
+    @Test
+    fun longParagraphFlowLmGpuDyn8Int8Power() = runFlowLmPowerBenchmark(
+        caseName = "gpu-requested-dyn8-int8-step",
+        lmPlacement = Accel.GPU,
+        lmGraph = PocketTts.LM,
+        lmSteps = 1,
+    )
+
     private fun runPowerBenchmark(cpuInt8Seanet: Boolean) {
         assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
 
@@ -209,6 +233,168 @@ class PowerBenchmarkTest {
         } finally {
             if (!referenceEngineClosed) referenceEngine.close()
         }
+    }
+
+    /** Paired CPU-reference / Flow-LM candidate energy and quality probe. */
+    private fun runFlowLmPowerBenchmark(
+        caseName: String,
+        lmPlacement: Accel,
+        lmGraph: String?,
+        lmSteps: Int,
+    ) {
+        assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
+
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val health = requireNotNull(context.getSystemService(SystemHealthManager::class.java))
+        val monitors = supportedMonitors(health)
+        assumeTrue("device does not expose power monitors", monitors.isNotEmpty())
+        val relevant = monitors.filter { it.name.isRelevantPowerDomain() }
+        assertTrue("no CPU/GPU/TPU energy monitors: ${monitors.map { it.name }}", relevant.isNotEmpty())
+
+        val dir = context.getExternalFilesDir(null) ?: context.filesDir
+        val models = PocketTtsModels.default(context)
+        val defaultPlacement = Placement.default(context, dir)
+        assumeTrue(
+            "Flow-LM comparison requires default CPU placement; detected ${defaultPlacement.label}",
+            defaultPlacement.lm == Accel.CPU,
+        )
+
+        val referenceGraph = lmGraph ?: PocketTts.LM
+        assumeTrue("missing reference/candidate Flow-LM graph: $referenceGraph", models.store.exists(referenceGraph))
+        if (lmSteps > 1) {
+            val multiGraph = PocketTts.msGraph(lmSteps)
+            assumeTrue("missing multistep Flow-LM graph: $multiGraph", models.store.exists(multiGraph))
+        }
+
+        val referenceEngine = PocketTtsEngine(
+            context,
+            PocketTtsConfig(
+                models = models,
+                placement = defaultPlacement,
+                lmGraph = referenceGraph,
+                lmSteps = 1,
+                noiseSeed = FLOW_LM_SEED,
+            ),
+        )
+        var referenceEngineClosed = false
+        try {
+            val warmup = referenceEngine.stream("A short warmup sentence.", "alba") {}
+            assertTrue("reference warmup produced no audio", warmup.audio.isNotEmpty())
+
+            val referenceTake = referenceEngine.stream(PARAGRAPH, "alba") {}
+            assertTrue("reference produced no audio", referenceTake.audio.isNotEmpty())
+            val audioBaseline = measurePlayback(health, relevant, referenceTake.audio)
+            val referencePlayback = measureSynthesisPlayback(health, relevant, referenceEngine)
+            val referenceRepeatQuality = AudioQuality.compare(referenceTake.audio, referencePlayback.result.audio)
+            assertTrue(
+                "reference repeat correlation: ${referenceRepeatQuality.corr}",
+                referenceRepeatQuality.corr >= MIN_FLOW_LM_CORRELATION,
+            )
+
+            val sampleDir = context.getExternalFilesDir("power-benchmark")
+                ?: File(context.filesDir, "power-benchmark")
+            saveSample(sampleDir, "flowlm-$caseName-reference.wav", referencePlayback.result.audio)
+            val referencePlacement = referenceEngine.placements
+            referenceEngine.close()
+            referenceEngineClosed = true
+
+            val candidatePlacement = defaultPlacement.copy(lm = lmPlacement)
+            val candidateEngine = PocketTtsEngine(
+                context,
+                PocketTtsConfig(
+                    models = models,
+                    placement = candidatePlacement,
+                    lmGraph = referenceGraph,
+                    lmSteps = lmSteps,
+                    noiseSeed = FLOW_LM_SEED,
+                ),
+            )
+            try {
+                val candidateWarmup = candidateEngine.stream("A short warmup sentence.", "alba") {}
+                assertTrue("candidate warmup produced no audio", candidateWarmup.audio.isNotEmpty())
+
+                val candidateSpeedRun = candidateEngine.stream(PARAGRAPH, "alba") {}
+                assertTrue("candidate speed run produced no audio", candidateSpeedRun.audio.isNotEmpty())
+
+                val candidatePlayback = measureSynthesisPlayback(health, relevant, candidateEngine)
+                saveSample(sampleDir, "flowlm-$caseName-candidate.wav", candidatePlayback.result.audio)
+
+                val quality = AudioQuality.compare(referencePlayback.result.audio, candidatePlayback.result.audio)
+                val referenceRtf = referenceTake.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                    (referenceTake.ms / 1000.0)
+                val candidateRtf = candidateSpeedRun.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                    (candidateSpeedRun.ms / 1000.0)
+                val audioSeconds = candidatePlayback.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE
+                val words = PARAGRAPH.split(Regex("\\s+")).size
+                val candidateMultiGraph = if (lmSteps > 1) PocketTts.msGraph(lmSteps) else "none"
+                val actualLmBackend = candidateEngine.runtimeAccelerators["lm"]
+                val actualMultiBackend = candidateEngine.runtimeAccelerators["lm_ms"]
+
+                Log.i(
+                    TAG,
+                    "Flow-LM paired case=$caseName seed=$FLOW_LM_SEED " +
+                        "referencePlacement=$referencePlacement candidateRequestedPlacement=${candidateEngine.placements} " +
+                        "candidateRuntimeAccelerators=${candidateEngine.runtimeAccelerators} " +
+                        "referenceGraph=$referenceGraph candidateMultiGraph=$candidateMultiGraph",
+                )
+                Log.i(
+                    TAG,
+                    "paragraph chars=${PARAGRAPH.length} words=$words audio=${fmt(audioSeconds)}s " +
+                        "referenceSamples=${referencePlayback.result.audio.size} " +
+                        "candidateSamples=${candidatePlayback.result.audio.size} " +
+                        "referenceNoPlay=${referenceTake.ms}ms candidateNoPlay=${candidateSpeedRun.ms}ms " +
+                        "referenceRtf=${fmt(referenceRtf)}x candidateRtf=${fmt(candidateRtf)}x " +
+                        "referencePlaybackWall=${referencePlayback.elapsedMs}ms " +
+                        "candidatePlaybackWall=${candidatePlayback.elapsedMs}ms " +
+                        "qualityCorr=${fmt(quality.corr)}",
+                )
+                logFlowLmStages("reference", referencePlayback.result, referencePlayback.elapsedMs)
+                logFlowLmStages("candidate", candidatePlayback.result, candidatePlayback.elapsedMs)
+
+                logEnergy("audio-only", audioBaseline.deltaJoules)
+                logEnergy("reference synthesize+play", referencePlayback.deltaJoules)
+                logEnergy(
+                    "reference incremental model energy (full minus duration-scaled audio-only)",
+                    incrementalEnergy(audioBaseline, referencePlayback),
+                )
+                logEnergy("candidate synthesize+play", candidatePlayback.deltaJoules)
+                logEnergy(
+                    "candidate incremental model energy (full minus duration-scaled audio-only)",
+                    incrementalEnergy(audioBaseline, candidatePlayback),
+                )
+
+                assertTrue(
+                    "Flow-LM $caseName correlation ${quality.corr} is below $MIN_FLOW_LM_CORRELATION",
+                    quality.corr >= MIN_FLOW_LM_CORRELATION,
+                )
+                assertEquals("candidate/reference streamed audio length", referenceTake.audio.size, candidatePlayback.result.audio.size)
+                assertEquals("requested Flow-LM backend loaded", lmPlacement, actualLmBackend)
+                if (lmSteps > 1) {
+                    assertEquals("requested multi-step Flow-LM backend loaded", lmPlacement, actualMultiBackend)
+                }
+            } finally {
+                candidateEngine.close()
+            }
+        } finally {
+            if (!referenceEngineClosed) referenceEngine.close()
+        }
+    }
+
+    private fun logFlowLmStages(label: String, result: TtsResult, playbackElapsedMs: Long) {
+        val profile = result.profile
+        val audioSeconds = result.audio.size.toDouble() / PocketTts.SAMPLE_RATE
+        Log.i(
+            TAG,
+            "$label streamMs=${result.ms}ms playbackWall=${playbackElapsedMs}ms " +
+                "audio=${fmt(audioSeconds)}s frames=${result.frames} " +
+                "lmSteps=${profile.lmSteps} lmInvocations=${profile.lmInvocations}",
+        )
+        Log.i(
+            TAG,
+            "$label stage time: lmInput=${profile.lmInMs}ms lmRun=${profile.lmRunMs}ms " +
+                "lmRead=${profile.lmReadMs}ms dectx=${profile.decTxMs}ms seanet=${profile.seanetMs}ms",
+        )
     }
 
     private fun measurePlayback(
@@ -401,6 +587,9 @@ class PowerBenchmarkTest {
     private companion object {
         const val TAG = "PocketTTSPower"
         const val CPU_INT8_STREAM_GRAPH = "pt_mimi_deconly_w512_dyn8.tflite"
+        const val FP16_FLOWLM_GRAPH = "pt_flowlm_fused_fp16.tflite"
+        const val FLOW_LM_SEED = 42L
+        const val MIN_FLOW_LM_CORRELATION = 0.99
         val PARAGRAPH = """
             Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.
 
