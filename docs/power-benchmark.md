@@ -110,3 +110,12 @@ as an experiment, but this Pixel 10 run does not support it as a battery-saving
 placement. The WAVs are written under `scripts/out/` as
 `seanet-cpu-int8-reference.wav` and `seanet-cpu-int8-candidate.wav` for the
 user's listening comparison.
+
+### Listening review
+
+User review on 2026-10-05 found strong audible white-noise artifacts in
+`seanet-cpu-int8-candidate.wav`. The phase-packed W512 NPU sample
+`seanet-npu-phase-candidate.wav` sounded indistinguishable from its reference.
+This listening result rejects CPU-int8 as a quality-preserving option despite
+its 0.995 waveform correlation; the NPU path remains the preferred SEANet
+experiment for further power work.
