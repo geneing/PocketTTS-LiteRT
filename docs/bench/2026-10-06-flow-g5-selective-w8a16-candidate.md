@@ -1,4 +1,4 @@
-# FlowLM selective W8/A16: host candidates
+# FlowLM selective W8/A16: FFN12 Pixel long pairs
 
 The full static W8/A16 and all-FC W8/A16 recipes failed first-step tensor
 parity (see the companion `2026-10-06-flow-g5-static-w8a16-candidate.md`).
@@ -6,8 +6,10 @@ This follow-up quantizes only large FlowLM feed-forward network (FFN) dense
 matrices. It retains float32 attention projections, K/V handling, EOS and
 flow head, and all Android-facing tensors. Both selective candidates passed
 the first-step host screen and completed a 32-step Alba free-run comparison.
-The FFN12 variant was also AOT compiled for Tensor G5 on the host. There is
-still no Pixel timing, energy, speech completion, or listening result.
+The FFN12 variant was AOT compiled for Tensor G5 and measured in two reversed
+long-utterance pairs on Pixel 10. It ran completely on the NPU partition but
+remained slower than the CPU dynamic INT8 control. Spoken-text completion and
+listening quality have not been reviewed.
 
 ## Selection and reproduction
 
@@ -136,6 +138,133 @@ The compiled artifact is at
 `build/flowlm-worktrees/option12-static-w8a16/scripts/out/pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite`.
 Its logical Android `npuGraph` name is
 `pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite` with
-`npuPositionMajorCache=true`. Full speech completion, listening and paired
-Pixel timing are still required by the benchmark protocol. No device work was
-performed in this branch.
+`npuPositionMajorCache=true`. The paired Pixel results appear below.
+
+## Pixel long-pair procedure
+
+The AOT artifact was pushed into the app's external model directory after
+the previous device experiment finished. `PocketTts.g5Variant`
+appends `_g5` to the logical `npuGraph` name. The app and test APKs must be
+installed, but a model-only change needs no APK rebuild. Use direct
+instrumentation; `:app:connectedDebugAndroidTest` uninstalls the app and
+removes pushed model files.
+
+```powershell
+$adbExe = 'C:\Users\genei\AppData\Local\Android\Sdk\platform-tools\adb.exe'
+$pixelSerial = '57220DLCR002R6'
+$candidateFile = 'I:\Android_Projects\PocketTTS-LiteRT\build\flowlm-worktrees\option12-static-w8a16\scripts\out\pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite'
+& $adbExe -s $pixelSerial push $candidateFile /sdcard/Android/data/com.pockettts/files/pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite
+& $adbExe -s $pixelSerial shell sha256sum /sdcard/Android/data/com.pockettts/files/pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite
+```
+
+The checksum returned by the device was
+`183a71a2475e6fb68ab626788f8f2189a85d9fb661bcca8c8637e19ce2906d12`.
+The harness defaults to Alba/seed 42 for the long text, but both are passed
+explicitly here. It uses the shipped CPU dynamic INT8 graph as the CPU arm,
+with the same NPU Mimi transformer and GPU SEANet placements on both arms.
+Run one instrumentation method at a time, first NPU then CPU and then reversed:
+
+```powershell
+& $adbExe -s $pixelSerial shell am instrument -w `
+  -e class com.pockettts.FlowLmHarnessTest#npuResidentCacheSpeechPair `
+  -e npuSliceCache true -e npuResidentCache false `
+  -e npuPositionMajorCache true -e verifyNpuSliceRows false `
+  -e npuGraph pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite `
+  -e referenceGraph pt_flowlm_fused_dyn8_all.tflite `
+  -e workload long -e voice alba -e seed 42 -e energyRepeats 1 `
+  -e order npu-cpu -e aotReport G5-694of694ops-1partition-LiteRT2.2.0 `
+  com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+
+& $adbExe -s $pixelSerial shell am instrument -w `
+  -e class com.pockettts.FlowLmHarnessTest#npuResidentCacheSpeechPair `
+  -e npuSliceCache true -e npuResidentCache false `
+  -e npuPositionMajorCache true -e verifyNpuSliceRows false `
+  -e npuGraph pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite `
+  -e referenceGraph pt_flowlm_fused_dyn8_all.tflite `
+  -e workload long -e voice alba -e seed 42 -e energyRepeats 1 `
+  -e order cpu-npu -e aotReport G5-694of694ops-1partition-LiteRT2.2.0 `
+  com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+Each run writes its report and NPU/CPU WAVs under the device app external
+files `flowlm-npu-slice-position-major/speech-<timestamp>/` directory. The
+`aotReport` argument records compiler coverage alongside the on-device graph
+checksum, backend, power monitors, elapsed time, first audio and stage timing.
+
+## Pixel long-pair results
+
+Both direct instrumentation commands above passed as single methods. Device
+serial `57220DLCR002R6` identified Pixel 10 (`frankel`), Android 17,
+fingerprint `google/frankel/frankel:17/CP3A.260905.009/16091614:user/release-keys`.
+The phone's SHA-256 of the installed AOT model matched the artifact table.
+Both reports show `g5HighPerformance=false`, NPU arm placement
+`lm:NPU dectx:NPU dec:GPU`, and CPU control `lm:CPU dectx:NPU dec:GPU`.
+The model remained the sole 694/694-op Tensor G5 AOT partition. The fixed
+long text, Alba voice, seed 42, and `energyRepeats=1` were the same in both
+orders. The harness measured one synthesis interval per arm after its warmup
+and same-workload audio-only sample.
+
+| Order | NPU frames / speech | CPU frames / speech | Engine inference NPU / CPU | NPU/CPU | First audio NPU / CPU | Thermal status |
+|---|---:|---:|---:|---:|---:|---:|
+| NPU then CPU | 769 / 61.52 s | 759 / 60.72 s | 32.857 / 24.834 s | 1.323x | 1.510 / 1.122 s | 0 |
+| CPU then NPU | 769 / 61.52 s | 759 / 60.72 s | 32.292 / 24.141 s | 1.338x | 1.687 / 1.133 s | 0 |
+| Two-order mean | 769 / 61.52 s | 759 / 60.72 s | 32.575 / 24.488 s | **1.330x** | 1.599 / 1.128 s | 0 |
+
+Mean engine inference real-time factors were 0.529 for FFN12 NPU and 0.403 for
+CPU dynamic INT8. The NPU produced ten more frames (0.80 s) in both orders;
+frame count alone does not establish that every word was spoken. The paired
+speed target was missed in both orders.
+
+| Order and arm | LM input ms | LM run ms | LM read ms | Native cache row copy ms | Mimi dec-tx ms | Mimi SEANet ms | LM load ms |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| NPU then CPU: FFN12 NPU | 1,281 | 17,100 | 2,292 | 1,767 | 3,274 | 4,661 | 162 |
+| NPU then CPU: CPU dyn8 | 2,382 | 14,970 | 131 | n/a | 1,679 | 4,523 | 1,775 |
+| CPU then NPU: FFN12 NPU | 1,156 | 16,914 | 2,198 | 1,688 | 3,442 | 4,693 | 233 |
+| CPU then NPU: CPU dyn8 | 2,259 | 14,850 | 117 | n/a | 1,495 | 4,441 | 1,807 |
+
+The NPU LM run stage averaged 17.007 s versus 14.910 s on CPU. NPU output
+readback averaged 2.245 s versus 0.124 s; NPU cache row copies averaged
+1.728 s and are a component of its native cache path. The NPU saved about
+1.102 s in LM input staging yet had longer LM execution, readback, and Mimi
+dec-tx times. The candidate had 1,117 LM steps versus 1,107 for CPU because
+of the ten extra frames. NPU model load took 162/233 ms versus CPU dynamic
+INT8 1,775/1,807 ms; load is separate from the synthesis interval.
+
+The harness estimates incremental energy by measuring Android power monitors
+during synthesis, measuring audio-only playback of the same workload, then
+subtracting audio-only energy scaled by elapsed duration. The selected
+aggregate-domain values below are joules for each measured synthesis interval,
+not a model-only power measurement. The full rail output is in each pulled
+`report.txt`.
+
+| Order and arm | CPU/0 J | CPU/1 J | CPU/2 J | GPU/0 J | TPU/1 J | Display J |
+|---|---:|---:|---:|---:|---:|---:|
+| NPU then CPU: FFN12 NPU | 0.742 | 2.392 | 0.027 | 5.001 | 12.108 | -0.116 |
+| NPU then CPU: CPU dyn8 | 10.577 | 11.453 | 0.067 | 4.900 | 1.418 | 0.330 |
+| CPU then NPU: FFN12 NPU | 0.405 | -1.252 | 0.189 | 5.208 | 12.257 | -0.166 |
+| CPU then NPU: CPU dyn8 | 13.284 | 15.088 | 6.447 | 5.119 | 1.862 | 0.500 |
+
+The negative incremental values and the CPU/2 control change from 0.067 to
+6.447 J show the limit of a single-repeat, duration-scaled subtraction.
+TPU/1 was about 12.1 J for NPU versus 1.4-1.9 J for CPU, while CPU domain
+energy moved the other way. These pairs do not support a stable total-energy
+claim without more power repeats, and latency already misses the speed gate.
+
+| Order | Waveform correlation | SNR dB | High-band error dB | Reference HNR dB | FFN12 HNR dB |
+|---|---:|---:|---:|---:|---:|
+| NPU then CPU | 0.072400 | 0.022825 | 0.032678 | 0.795331 | 0.368675 |
+| CPU then NPU | 0.072428 | 0.022842 | 0.032723 | 0.795849 | 0.368660 |
+
+Free-running waveform correlation is diagnostic and cannot by itself reject
+speech. Both runs wrote 61.52 s FFN12 and 60.72 s CPU WAVs. Listening and
+spoken-text completeness remain unverified.
+
+Reports and all four WAVs were pulled into ignored local directories in this
+worktree before releasing the phone:
+
+| Order | Pulled directory |
+|---|---|
+| NPU then CPU | `build/flowlm-w8a16-device/npu-first/speech-20261006-164542-399/` |
+| CPU then NPU | `build/flowlm-w8a16-device/cpu-first/speech-20261006-165020-478/` |
+
+Each directory contains `report.txt`, `npu.wav` and `cpu.wav`.

@@ -71,7 +71,7 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 9. G5 static INT8 | `codex/flowlm-g5-static-int8` | Calibrated W8/A8 NPU recipe with float external tensors | Host quality failed at step 0 (latent corr 0.0105, EOS delta 6.465); 32-step minimum corr -0.1744. Stopped before AOT or Pixel test; see [candidate report](2026-10-06-flow-g5-static-int8-candidate.md) |
 | 10. G5 `HIGH_PERFORMANCE` runtime mode | `codex/flowlm-g5-high-performance` | Native LiteRT C opaque `google_tensor` option, `performance_mode=3`; harness-only opt-in | Two long Alba pairs averaged 29.827 / 25.052 s NPU/CPU (`1.191x`), all 759 frames; mean first audio 1.524 / 1.137 s. Improves NPU time 8.7% over option 7 position-major FP16, but still misses parity; see [candidate report](2026-10-06-g5-high-performance.md) |
 | 11. G5 FP16 `half` truncation | `codex/flowlm-g5-half-truncation` | Existing position-major FP16 graph compiled with AOT `--truncation half` | Two long Alba pairs averaged 32.066 / 24.782 s NPU/CPU (`1.294x`); both emitted only 750/759 frames. Similar to default FP16 NPU speed and fails completion; see [candidate report](2026-10-06-flow-g5-fp16-half-truncation-candidate.md) |
-| 12. G5 static W8/A16 | `codex/flowlm-g5-static-w8a16` | Calibrated AEQ W8/A16; all-op, FC-only, and selective FFN variants preserve float32 I/O | All-op/FC-only variants failed host parity. Selective FFN12 reached first-step corr 0.9998 and 32-step min 0.670; G5 AOT compiled 694/694 ops in one partition. Pixel speed/speech acceptance pending; see [initial report](2026-10-06-flow-g5-static-w8a16-candidate.md) and [selective/AOT report](2026-10-06-flow-g5-selective-w8a16-candidate.md) |
+| 12. G5 static W8/A16 | `codex/flowlm-g5-static-w8a16` | Calibrated AEQ W8/A16; all-op, FC-only, and selective FFN variants preserve float32 I/O | Selective FFN12 compiled 694/694 ops in one partition. Two long pairs averaged 32.575 / 24.488 s NPU/CPU (`1.330x`), output 769/759 frames (10 extra); first audio 1.599/1.128 s. Still misses parity; speech completeness/listening unverified. See [initial report](2026-10-06-flow-g5-static-w8a16-candidate.md) and [selective/AOT/Pixel report](2026-10-06-flow-g5-selective-w8a16-candidate.md) |
 | 13. G5 dynamic INT8 + `HIGH_PERFORMANCE` | `codex/flowlm-g5-high-performance` | Existing position-major W8/float AOT artifact with native `performance_mode=3` | Two long Alba pairs averaged 51.919 / 24.793 s NPU/CPU (`2.094x`), 753/759 frames. About 2% faster than default-mode INT8, still fails speed and completion; details in [runtime report](2026-10-06-g5-high-performance.md) |
 
 ### Option 6: CPU thread tuning
@@ -226,10 +226,14 @@ EOS delta 6.485); FC-only began at 0.9497 but drifted to a 32-step minimum of
 (59.6% of dense weights), leaving Q/K/V, attention, EOS, and flow head in
 FP32. It reached first-step correlation 0.9998 and a 32-step minimum of
 0.6699, versus -0.1247 for the CPU dynamic INT8 host rollout on the same seed.
-The G5 compiler placed all 694/694 ops in one partition, but compiled-device
-numerics, speed and long speech completion remain untested. Initial all-op and
-FC-only details are in the [W8/A16 report](2026-10-06-flow-g5-static-w8a16-candidate.md);
-selective coverage, drift and AOT details are in the [FFN report](2026-10-06-flow-g5-selective-w8a16-candidate.md).
+The G5 compiler placed all 694/694 ops in one partition. Two long Alba Pixel
+pairs then averaged 32.575 s NPU versus 24.488 s CPU (1.330x), with first audio
+at 1.599 versus 1.128 s. FFN12 emitted ten extra frames (769 versus 759), and
+its long free-running waveform correlation was 0.0724; listening and spoken
+text completeness remain unverified. The single-repeat energy subtraction was
+noisy and does not support an energy claim. It still misses speed parity.
+Initial all-op and FC-only details are in the [W8/A16 report](2026-10-06-flow-g5-static-w8a16-candidate.md);
+selective coverage, drift, AOT, and Pixel measurements are in the [FFN report](2026-10-06-flow-g5-selective-w8a16-candidate.md).
 
 ### How other runtimes manage KV state
 
