@@ -21,6 +21,7 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.abs
 import kotlin.math.sqrt
 
 /** Text-driven FlowLM probe. Invoke with instrumentation args; outputs land in files/flowlm-harness. */
@@ -186,6 +187,138 @@ class FlowLmHarnessTest {
             "Kotlin API unexpectedly gained a GPU buffer handle/interop method; review the API gate",
             interopMethods.isEmpty(),
         )
+    }
+
+    /**
+     * Option 4's fixed-shape cache gate. The tiny graph is exported by
+     * scripts/export_gpu_cache_probe.py and pushed next to the model assets.
+     * This deliberately leaves the production CPU int8 graph untouched.
+     *
+     * The output cache buffer is passed as the next invocation's input; no
+     * readFloat/writeFloat is called on it between steps. This establishes
+     * whether LiteRT accepts the buffer chain and how much public host I/O it
+     * needs. It does not establish that an internal device copy is absent:
+     * that still requires a GPU trace or native buffer inspection.
+     */
+    @Test
+    fun gpuCacheChainGate() {
+        val backend = args.getString("cacheProbeBackend")?.trim()?.uppercase(Locale.ROOT)
+            ?.let { Accel.valueOf(it) } ?: Accel.GPU
+        require(backend in setOf(Accel.CPU, Accel.GPU, Accel.GPU32)) {
+            "cache probe supports CPU, GPU, or GPU32"
+        }
+        val steps = args.getString("cacheProbeSteps")?.toIntOrNull() ?: 32
+        require(steps in 2..PocketTts.PMAX) { "cacheProbeSteps must be 2..${PocketTts.PMAX}" }
+        val graph = args.getString("cacheProbeGraph")?.trim()
+            ?.ifEmpty { CACHE_PROBE_GRAPH } ?: CACHE_PROBE_GRAPH
+        val reportDir = context.getExternalFilesDir("flowlm-harness")
+            ?: File(context.filesDir, "flowlm-harness")
+        reportDir.mkdirs()
+        val reportFile = File(reportDir, "gpu-cache-gate-${backend.name.lowercase(Locale.ROOT)}.txt")
+        val cacheChannels = 2 * PocketTts.G
+        val cacheFloats = cacheChannels * PocketTts.PMAX * PocketTts.HD
+        val rowFloats = cacheChannels * PocketTts.HD
+        val hostBytesPerStep = (rowFloats + PocketTts.PMAX + 1) * Float.SIZE_BYTES
+        val lines = arrayListOf(
+            "FlowLM option 4 fixed-shape cache gate",
+            "device=${android.os.Build.MODEL} (${android.os.Build.DEVICE}) Android ${android.os.Build.VERSION.RELEASE}",
+            "backend=$backend graph=$graph steps=$steps",
+            "cacheShape=[1,$cacheChannels,${PocketTts.PMAX},${PocketTts.HD}] cacheBytes=${cacheFloats * Float.SIZE_BYTES}",
+            "hostBytesPerStep=$hostBytesPerStep (row+mask write, scalar read; excludes one-time cache initialization)",
+        )
+        try {
+            val graphFile = File(modelDir, graph)
+            check(graphFile.isFile) { "missing cache probe graph: $graphFile" }
+            val options = CompiledModel.Options(
+                if (backend == Accel.CPU) Accelerator.CPU else Accelerator.GPU,
+            )
+            if (backend == Accel.GPU32) {
+                options.gpuOptions = CompiledModel.GpuOptions(
+                    precision = CompiledModel.GpuOptions.Precision.FP32,
+                )
+            }
+            val loadStart = System.nanoTime()
+            val model = CompiledModel.create(graphFile.absolutePath, options, null)
+            lines += String.format(Locale.US, "loadMs=%.3f", (System.nanoTime() - loadStart) / 1e6)
+            try {
+                val input = model.createInputBuffers()
+                val outputA = model.createOutputBuffers()
+                val outputB = model.createOutputBuffers()
+                try {
+                    check(input.size == 3 && outputA.size == 2 && outputB.size == 2) {
+                        "unexpected cache probe I/O counts: ${input.size}/${outputA.size}/${outputB.size}"
+                    }
+                    input[0].writeFloat(FloatArray(cacheFloats))
+                    var currentCache = input[0]
+                    val row = FloatArray(rowFloats)
+                    val mask = FloatArray(PocketTts.PMAX)
+                    val writes = DoubleArray(steps)
+                    val runs = DoubleArray(steps)
+                    val reads = DoubleArray(steps)
+                    for (step in 0 until steps) {
+                        val value = (step + 1) / 16f
+                        row.fill(value)
+                        mask.fill(0f)
+                        mask[step] = 1f
+                        val nextOutput = if (step % 2 == 0) outputA else outputB
+                        val writeStart = System.nanoTime()
+                        input[1].writeFloat(row)
+                        input[2].writeFloat(mask)
+                        val runStart = System.nanoTime()
+                        model.run(listOf(currentCache, input[1], input[2]), nextOutput)
+                        val readStart = System.nanoTime()
+                        val scalar = nextOutput[1].readFloat().single()
+                        val done = System.nanoTime()
+                        writes[step] = (runStart - writeStart) / 1e6
+                        runs[step] = (readStart - runStart) / 1e6
+                        reads[step] = (done - readStart) / 1e6
+                        check(abs(scalar - value) <= 1e-3f) {
+                            "scalar mismatch step=$step got=$scalar expected=$value"
+                        }
+                        currentCache = nextOutput[0]
+                    }
+                    val finalReadStart = System.nanoTime()
+                    val finalCache = currentCache.readFloat()
+                    val finalReadMs = (System.nanoTime() - finalReadStart) / 1e6
+                    check(finalCache.size == cacheFloats) {
+                        "cache size ${finalCache.size} != $cacheFloats"
+                    }
+                    var maxDifference = 0f
+                    for (channel in 0 until cacheChannels) {
+                        for (position in 0 until PocketTts.PMAX) {
+                            val expected = if (position < steps) (position + 1) / 16f else 0f
+                            val base = (channel * PocketTts.PMAX + position) * PocketTts.HD
+                            for (headValue in 0 until PocketTts.HD) {
+                                val difference = abs(finalCache[base + headValue] - expected)
+                                if (difference > maxDifference) maxDifference = difference
+                            }
+                        }
+                    }
+                    lines += String.format(Locale.US,
+                        "firstStepMs write=%.3f run=%.3f read=%.3f total=%.3f",
+                        writes[0], runs[0], reads[0], writes[0] + runs[0] + reads[0])
+                    lines += String.format(Locale.US,
+                        "steadyMs write=%.3f run=%.3f read=%.3f total=%.3f (steps 2..%d)",
+                        writes.drop(1).average(), runs.drop(1).average(), reads.drop(1).average(),
+                        (1 until steps).map { writes[it] + runs[it] + reads[it] }.average(), steps)
+                    lines += String.format(Locale.US,
+                        "finalCacheReadMs=%.3f finalCacheMaxAbsDiff=%.8g", finalReadMs, maxDifference)
+                    check(maxDifference <= 1e-3f) { "cache chain lost updates: max difference=$maxDifference" }
+                    lines += "gate=API_CHAIN_ACCEPTED hostBytesPerStep=$hostBytesPerStep gpuResidency=UNVERIFIED"
+                } finally {
+                    (input + outputA + outputB).forEach { it.close() }
+                }
+            } finally {
+                model.close()
+            }
+        } catch (t: Throwable) {
+            lines += "gate=FAILED error=${t::class.java.simpleName}: ${t.message}"
+            throw t
+        } finally {
+            reportFile.writeText(lines.joinToString("\n", postfix = "\n"))
+            lines.forEach { Log.i(TAG, it) }
+            Log.i(TAG, "saved GPU cache gate to ${reportFile.absolutePath}")
+        }
     }
 
     private fun runPrompt(
@@ -357,6 +490,7 @@ class FlowLmHarnessTest {
         const val TAG = "FlowLmHarness"
         const val DEFAULT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val REFERENCE_GRAPH = "pt_flowlm_fused_fp16.tflite"
+        const val CACHE_PROBE_GRAPH = "pt_gpu_cache_probe.tflite"
         const val DEFAULT_TEXT = "Hello world. This is a FlowLM text probe."
     }
 }
