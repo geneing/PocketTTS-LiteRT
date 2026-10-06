@@ -40,13 +40,27 @@ The PowerMonitor domains overlap; do not add these rail values into a single dev
 
 The played reference and repeat WAVs are available locally at `scripts/out/flowlm-pixel10-control-reference.wav` and `scripts/out/flowlm-pixel10-control-repeat.wav` (ignored build artifacts).
 
+## Option 1: NPU cache-chain first gate
+
+The tiny fixed-shape graph `pt_npu_cache_chain_g5.tflite` (SHA-256 `a5fb30d0c684c29b133f1e5cf23a80b82c318aa37ac058865b79f3b1b8f43282`) compiled as 9/9 ops in one Tensor G5 partition. Its CPU oracle matched the full cache and scalar for three steps. On-device instrumentation then passed 32 steps in two-bank-chain, full-host-write, and same-buffer-alias modes.
+
+| Mode | Host cache bytes/step | Full cache input write | Row write | NPU run | Scalar read/sync |
+|---|---:|---:|---:|---:|---:|
+| Two-bank chain | 49,152 B | 0 ms | 0.114 ms | 9.137 ms | 0.148 ms |
+| Full-host-write control | 25,214,976 B | 11.816 ms | 0.137 ms | 9.416 ms | 0.164 ms |
+| Same-buffer-alias probe | 49,152 B | 0 ms | 0.129 ms | 9.610 ms | 0.169 ms |
+
+The graph uses a 25,165,824-byte FP32 cache and 49,152-byte update rows; the one-time initial cache write was 4.933 ms in the chain run. LiteRT reported compatible input/output buffer requirements `[Ahwb, DmaBuf]`, but its Kotlin `TensorBuffer` API did not expose the actual allocated type. The dispatch log confirms one NPU partition but does not reveal whether the runtime copies the full cache inside device memory. Device-side copy volume, NPU energy, and full FlowLM timing remain unverified, so this is a successful host-transfer prototype and an incomplete deployment gate, not a speed/energy win.
+
+The three device reports are under `/sdcard/Android/data/com.pockettts/files/flowlm-harness/cache-*/report.txt`; the installed graph and option 1 instrumentation are isolated to that branch's test harness.
+
 ## Optimization attempts
 
 Each option has its own branch and bench report. Device tests are run serially because they share this Pixel 10. “Pending” means no performance claim is made.
 
 | Option | Branch | Current implementation / gate | Pixel 10 result |
 |---|---|---|---|
-| 1. Persistent NPU KV cache | `codex/flowlm-option-1-npu-cache` | Tiny fixed-shape two-bank cache-chain proof | Pending device buffer-chain and transfer measurements |
+| 1. Persistent NPU KV cache | `codex/flowlm-option-1-npu-cache` | Tiny fixed-shape two-bank cache-chain proof | 32-step gate passed; host transfer 49 KB vs 25.2 MB, device-side copies and energy unverified |
 | 2. CPU int8 prompt prefill buckets | `codex/flowlm-option-2-int8-prefill` | Repair per-row quantized prefill parity; fixed prompt buckets | Pending quantized row parity and device timing |
 | 3. KV capacity buckets | `codex/flowlm-option-3-kv-capacity` | Smaller static capacities with 512 fallback and capacity checks | Pending safe-boundary, memory, and device timing |
 | 4. GPU resident KV cache | `codex/flowlm-option-4-gpu-cache` | Tiny GPU buffer-chain feasibility gate | Pending device transfer and latency measurements |
