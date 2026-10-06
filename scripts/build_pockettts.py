@@ -595,12 +595,13 @@ def stage_fused(model):
     head = fused.head
 
     ks, vs, off0 = load_voice_state("alba")
-    # Alba's bundled prefix is longer than the 128-position experiment. Keep
-    # the graph export useful for short-prefix voices while never slicing a
-    # real voice silently: this export-only parity seed is empty, and the
-    # Android harness separately checks full, exact voice-prefix repacking.
-    if off0 >= PMAX:
-        print(f"alba prefix ({off0}) exceeds PMAX={PMAX}; using empty export parity prefix")
+    # The optional prefill parity fixture needs P writable rows after the
+    # prefix. Never slice a real voice to make it fit a reduced bucket.
+    # Android separately tests exact repacking with a voice that fits.
+    parity_rows = max(1, PREFILL_TOKENS)
+    if off0 + parity_rows > PMAX:
+        print(f"alba prefix ({off0}) plus parity rows ({parity_rows}) exceeds "
+              f"PMAX={PMAX}; using empty export parity prefix")
         off0 = 0
     test_steps = min(12, PMAX - off0)
     if test_steps < 1:
