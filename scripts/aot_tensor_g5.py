@@ -35,6 +35,7 @@ fp16 is fine: the plugin accepts half-precision weights, and every graph above
 compiles to byte-identical size in fp32/fp16 apart from the weight width.
 """
 import os
+import argparse
 import shutil
 import sys
 import time
@@ -49,12 +50,14 @@ DEFAULT_GRAPHS = [
 ]
 
 
-def aot_one(src, dst, target, work_dir):
+def aot_one(src, dst, target, work_dir, truncation=None):
     from ai_edge_litert.aot import aot_compile as aot_lib
 
     t0 = time.time()
+    options = ({"google_tensor_truncation_type": truncation}
+               if truncation is not None else {})
     result = aot_lib.aot_compile(src, output_dir=work_dir, target=[target],
-                                 keep_going=False)
+                                 keep_going=False, **options)
     report = result.compilation_report().strip().replace("\n", " | ")
     result.export(work_dir, model_name="m")
     shutil.copy(os.path.join(work_dir, "m_Google_Tensor_G5.tflite"), dst)
@@ -64,21 +67,27 @@ def aot_one(src, dst, target, work_dir):
 def main():
     from ai_edge_litert.aot.vendors.google_tensor import target as gt
 
-    graphs = sys.argv[1:] or DEFAULT_GRAPHS
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("graphs", nargs="*", help="source graph stems (without .tflite)")
+    parser.add_argument("--truncation", choices=("half", "bfloat16", "no_truncation"),
+                        help="Google Tensor compiler truncation setting; omission keeps the SDK default")
+    args = parser.parse_args()
+    graphs = args.graphs or DEFAULT_GRAPHS
     target = gt.Target(gt.SocModel.TENSOR_G5)
-    work_dir = os.path.join(OUT, "_aot_work")
+    suffix = "_g5" if args.truncation is None else f"_{args.truncation}_g5"
+    work_dir = os.path.join(OUT, f"_aot_work{suffix}")
     os.makedirs(work_dir, exist_ok=True)
 
-    print(f"target {target!r} -> {OUT}")
+    print(f"target {target!r} truncation={args.truncation or 'sdk_default'} -> {OUT}")
     failed = []
     for g in graphs:
         src = os.path.join(OUT, f"{g}.tflite")
-        dst = os.path.join(OUT, f"{g}_g5.tflite")
+        dst = os.path.join(OUT, f"{g}{suffix}.tflite")
         if not os.path.exists(src):
             print(f"SKIP {g}: no {src}")
             continue
         try:
-            secs, report = aot_one(src, dst, target, work_dir)
+            secs, report = aot_one(src, dst, target, work_dir, args.truncation)
             print(f"OK   {g:28s} {secs:6.1f}s  {report}  "
                   f"-> {os.path.getsize(dst)/1e6:.1f} MB")
         except Exception as e:  # noqa: BLE001 - a failure here is a result

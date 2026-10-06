@@ -71,6 +71,9 @@ class PowerBenchmarkTest {
         lmSteps = 1,
     )
 
+    @Test
+    fun longParagraphFlowLmNpuFp16NoTruncationPower() = runFlowLmNpuPowerBenchmark()
+
     private fun runPowerBenchmark(cpuInt8Seanet: Boolean) {
         assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
 
@@ -397,6 +400,138 @@ class PowerBenchmarkTest {
         )
     }
 
+    /** Load the AOT NPU graph first; LiteRT's dispatch configuration is process-wide. */
+    private fun runFlowLmNpuPowerBenchmark() {
+        assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
+
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        val health = requireNotNull(context.getSystemService(SystemHealthManager::class.java))
+        val monitors = supportedMonitors(health)
+        assumeTrue("device does not expose power monitors", monitors.isNotEmpty())
+        val relevant = monitors.filter { it.name.isRelevantPowerDomain() }
+        assertTrue("no CPU/GPU/TPU energy monitors: ${monitors.map { it.name }}", relevant.isNotEmpty())
+
+        val dir = context.getExternalFilesDir(null) ?: context.filesDir
+        val models = PocketTtsModels.default(context)
+        val dispatchLibrary = File(
+            context.applicationInfo.nativeLibraryDir,
+            "libLiteRtDispatch_GoogleTensor.so",
+        )
+        assumeTrue("Google Tensor dispatch library is unavailable", dispatchLibrary.isFile)
+
+        val candidateGraph = FP16_FLOWLM_NO_TRUNCATION_GRAPH
+        val compiledCandidateGraph = PocketTts.g5Variant(candidateGraph)
+        assumeTrue("missing CPU fp16 Flow-LM graph: $FP16_FLOWLM_GRAPH", models.store.exists(FP16_FLOWLM_GRAPH))
+        assumeTrue("missing no-truncation Tensor G5 graph: $compiledCandidateGraph", models.store.exists(compiledCandidateGraph))
+
+        val defaultPlacement = Placement.default(context, dir)
+        val candidatePlacement = defaultPlacement.copy(lm = Accel.NPU)
+        val candidateEngine = PocketTtsEngine(
+            context,
+            PocketTtsConfig(
+                models = models,
+                placement = candidatePlacement,
+                lmGraph = candidateGraph,
+                noiseSeed = FLOW_LM_SEED,
+            ),
+        )
+        var candidateEngineClosed = false
+        try {
+            val candidateRuntime = candidateEngine.runtimeAccelerators
+            Log.i(
+                TAG,
+                "Flow-LM NPU graph=$compiledCandidateGraph requested=${candidateEngine.placements} " +
+                    "runtimeAccelerators=$candidateRuntime",
+            )
+            assertEquals("no-truncation Flow-LM did not load on NPU", Accel.NPU, candidateRuntime["lm"])
+
+            val candidateWarmup = candidateEngine.stream("A short warmup sentence.", "alba") {}
+            assertTrue("NPU warmup produced no audio", candidateWarmup.audio.isNotEmpty())
+            val candidateTake = candidateEngine.stream(PARAGRAPH, "alba") {}
+            assertTrue("NPU candidate produced no audio", candidateTake.audio.isNotEmpty())
+            val candidateBaseline = measurePlayback(health, relevant, candidateTake.audio)
+            val candidatePlayback = measureSynthesisPlayback(health, relevant, candidateEngine)
+            val candidateRepeatCorr = AudioQuality.compare(candidateTake.audio, candidatePlayback.result.audio).corr
+            assertTrue(
+                "NPU repeat correlation: $candidateRepeatCorr",
+                candidateRepeatCorr >= MIN_FLOW_LM_CORRELATION,
+            )
+
+            val sampleDir = context.getExternalFilesDir("power-benchmark")
+                ?: File(context.filesDir, "power-benchmark")
+            saveSample(sampleDir, "flowlm-npu-no-truncation-candidate.wav", candidatePlayback.result.audio)
+            val candidateRuntimeLm = candidateRuntime["lm"]
+            candidateEngine.close()
+            candidateEngineClosed = true
+
+            val referencePlacement = defaultPlacement.copy(lm = Accel.CPU)
+            val referenceEngine = PocketTtsEngine(
+                context,
+                PocketTtsConfig(
+                    models = models,
+                    placement = referencePlacement,
+                    lmGraph = FP16_FLOWLM_GRAPH,
+                    noiseSeed = FLOW_LM_SEED,
+                ),
+            )
+            try {
+                val referenceRuntime = referenceEngine.runtimeAccelerators
+                assertEquals("fp16 reference LM did not load on CPU", Accel.CPU, referenceRuntime["lm"])
+                val referenceWarmup = referenceEngine.stream("A short warmup sentence.", "alba") {}
+                assertTrue("CPU reference warmup produced no audio", referenceWarmup.audio.isNotEmpty())
+                val referenceTake = referenceEngine.stream(PARAGRAPH, "alba") {}
+                assertTrue("CPU reference produced no audio", referenceTake.audio.isNotEmpty())
+                val referenceBaseline = measurePlayback(health, relevant, referenceTake.audio)
+                val referencePlayback = measureSynthesisPlayback(health, relevant, referenceEngine)
+                val referenceRepeatCorr = AudioQuality.compare(referenceTake.audio, referencePlayback.result.audio).corr
+                assertTrue(
+                    "CPU reference repeat correlation: $referenceRepeatCorr",
+                    referenceRepeatCorr >= MIN_FLOW_LM_CORRELATION,
+                )
+                saveSample(sampleDir, "flowlm-npu-no-truncation-reference.wav", referencePlayback.result.audio)
+
+                val quality = AudioQuality.compare(referencePlayback.result.audio, candidatePlayback.result.audio)
+                val referenceRtf = referenceTake.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                    (referenceTake.ms.coerceAtLeast(1) / 1000.0)
+                val candidateRtf = candidateTake.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                    (candidateTake.ms.coerceAtLeast(1) / 1000.0)
+                Log.i(
+                    TAG,
+                    "Flow-LM NPU paired seed=$FLOW_LM_SEED referenceLm=${referenceRuntime["lm"]} " +
+                        "candidateLm=$candidateRuntimeLm graph=$compiledCandidateGraph corr=${fmt(quality.corr)} " +
+                        "referenceRtf=${fmt(referenceRtf)}x candidateRtf=${fmt(candidateRtf)}x " +
+                        "referenceSamples=${referencePlayback.result.audio.size} " +
+                        "candidateSamples=${candidatePlayback.result.audio.size}",
+                )
+                logFlowLmStages("CPU fp16 reference", referencePlayback.result, referencePlayback.elapsedMs)
+                logFlowLmStages("NPU no-truncation fp16", candidatePlayback.result, candidatePlayback.elapsedMs)
+
+                logEnergy("NPU audio-only", candidateBaseline.deltaJoules)
+                logEnergy("NPU synthesize+play", candidatePlayback.deltaJoules)
+                logEnergy(
+                    "NPU incremental model energy (full minus duration-scaled audio-only)",
+                    incrementalEnergy(candidateBaseline, candidatePlayback),
+                )
+                logEnergy("CPU fp16 reference audio-only", referenceBaseline.deltaJoules)
+                logEnergy("CPU fp16 reference synthesize+play", referencePlayback.deltaJoules)
+                logEnergy(
+                    "CPU fp16 reference incremental model energy (full minus duration-scaled audio-only)",
+                    incrementalEnergy(referenceBaseline, referencePlayback),
+                )
+
+                assertTrue(
+                    "NPU no-truncation Flow-LM correlation ${quality.corr} is below $MIN_FLOW_LM_CORRELATION",
+                    quality.corr >= MIN_FLOW_LM_CORRELATION,
+                )
+            } finally {
+                referenceEngine.close()
+            }
+        } finally {
+            if (!candidateEngineClosed) candidateEngine.close()
+        }
+    }
+
     private fun measurePlayback(
         health: SystemHealthManager,
         monitors: List<PowerMonitor>,
@@ -588,6 +723,7 @@ class PowerBenchmarkTest {
         const val TAG = "PocketTTSPower"
         const val CPU_INT8_STREAM_GRAPH = "pt_mimi_deconly_w512_dyn8.tflite"
         const val FP16_FLOWLM_GRAPH = "pt_flowlm_fused_fp16.tflite"
+        const val FP16_FLOWLM_NO_TRUNCATION_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val FLOW_LM_SEED = 42L
         const val MIN_FLOW_LM_CORRELATION = 0.99
         val PARAGRAPH = """
