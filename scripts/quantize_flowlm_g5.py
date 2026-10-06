@@ -10,6 +10,10 @@ result separately in the LiteRT 2.2.0 AOT environment with, for example::
 
 The existing group-major CPU ``dyn8_all`` graph is separate; this script never
 replaces a production graph.
+
+``--recipe static16`` tries calibrated channelwise W8/A16 on the same source.
+It transposes the representative K/V caches to position-major order and reports
+whether the external float32 cache protocol survives quantization.
 """
 
 from __future__ import annotations
@@ -26,7 +30,10 @@ import build_pockettts as bp
 
 
 SOURCE_STEM = "pt_flowlm_fused_fp32_contiguous"
-CANDIDATE_STEM = "pt_flowlm_fused_dyn8_all_contiguous"
+CANDIDATE_STEMS = {
+    "dynamic8": "pt_flowlm_fused_dyn8_all_contiguous",
+    "static16": "pt_flowlm_fused_st16_all_contiguous",
+}
 
 
 def signature(path: Path):
@@ -38,26 +45,53 @@ def signature(path: Path):
     return [inputs, outputs]
 
 
-def check_interface(source: Path, quantized: Path) -> None:
+def check_interface(source: Path, quantized: Path, require_float_io: bool) -> None:
     expected, actual = signature(source), signature(quantized)
+    float_io = True
     for side, original, candidate in zip(("input", "output"), expected, actual):
         if len(original) != len(candidate):
             raise AssertionError(f"{side} count changed: {len(original)} -> {len(candidate)}")
         for i, (a, b) in enumerate(zip(original, candidate)):
             a_shape = tuple(int(x) for x in a["shape"])
             b_shape = tuple(int(x) for x in b["shape"])
-            if a_shape != b_shape or a["dtype"] != b["dtype"]:
+            if a_shape != b_shape:
                 raise AssertionError(f"{side} {i} changed: {a_shape}/{a['dtype']} -> {b_shape}/{b['dtype']}")
             if b["dtype"] != np.float32:
-                raise AssertionError(f"{side} {i} must remain float32 for the Android cache path")
+                float_io = False
             print(f"{side}[{i}] {b_shape} {b['dtype'].__name__}")
     kv_shape = (1, bp.PMAX, bp.N_LAYERS * bp.N_HEADS, bp.HD)
     for i in (4, 5):
         if tuple(actual[0][i]["shape"]) != kv_shape:
             raise AssertionError(f"cache input {i} has wrong position-major shape")
+    if require_float_io and not float_io:
+        raise AssertionError("dynamic8 changed float32 I/O required by the Android cache path")
+    if not float_io:
+        print("WARNING: quantized external I/O is incompatible with the current Android float cache path")
 
 
-def check_short_rollout(path: Path, steps: int) -> None:
+class InterpreterRunner:
+    """Host parity fallback for int16 I/O unsupported by Python TensorBuffer.write."""
+
+    def __init__(self, path: Path):
+        from ai_edge_litert.interpreter import Interpreter
+
+        self.interpreter = Interpreter(model_path=str(path))
+        self.interpreter.allocate_tensors()
+        self.inputs = self.interpreter.get_input_details()
+        self.outputs = self.interpreter.get_output_details()
+
+    def __call__(self, *arrays):
+        for array, detail in zip(arrays, self.inputs):
+            value = bp.quant_to(array, detail["dtype"], detail["quantization"])
+            self.interpreter.set_tensor(detail["index"], np.ascontiguousarray(value))
+        self.interpreter.invoke()
+        return [bp.quant_from(
+            self.interpreter.get_tensor(detail["index"]),
+            detail["dtype"], detail["quantization"],
+        ) for detail in self.outputs]
+
+
+def check_short_rollout(path: Path, steps: int, compare_group_dyn8: bool) -> None:
     """Compare a short free run with eager fp32; this is a latent quality proxy."""
     model = bp.load_eager()
     flow_lm = model.flow_lm
@@ -69,7 +103,7 @@ def check_short_rollout(path: Path, steps: int) -> None:
     in_w = flow_lm.input_linear.weight.detach()
     x_ref = (flow_lm.bos_emb.detach() @ in_w.T).view(1, 1, -1)
     x_q = x_ref.numpy().copy()
-    runner = bp.CM(str(path))
+    runner = bp.CM(str(path)) if compare_group_dyn8 else InterpreterRunner(path)
     torch.manual_seed(3)
     latent_corr, latent_delta, kv_delta = [], [], []
     with torch.no_grad():
@@ -86,7 +120,7 @@ def check_short_rollout(path: Path, steps: int) -> None:
                 x_q, cos.reshape(1, 1, 1, bp.HD), sin.reshape(1, 1, 1, bp.HD),
                 mask, pk_q, pv_q, noise.numpy(),
             )[0].reshape(-1)
-            if step == 0:
+            if step == 0 and compare_group_dyn8:
                 group_graph = path.parent / "pt_flowlm_fused_dyn8_all.tflite"
                 if group_graph.is_file():
                     group = bp.run_signature(
@@ -137,22 +171,40 @@ def check_short_rollout(path: Path, steps: int) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--recipe", choices=CANDIDATE_STEMS, default="dynamic8")
     parser.add_argument("--out", type=Path, default=Path(os.environ.get("PT_OUT", bp.OUT)))
     parser.add_argument("--check-only", action="store_true")
     parser.add_argument("--steps", type=int, default=4, help="host free-run parity steps")
+    parser.add_argument("--calibration-samples", type=int, default=8)
+    parser.add_argument("--calibration-run", type=int, default=32)
     args = parser.parse_args()
     if args.steps < 1 or args.steps > 32:
         parser.error("--steps must be in 1..32")
     source = args.out / f"{SOURCE_STEM}.tflite"
-    candidate = args.out / f"{CANDIDATE_STEM}.tflite"
+    candidate = args.out / f"{CANDIDATE_STEMS[args.recipe]}.tflite"
     if not source.is_file():
         parser.error(f"missing source graph: {source}")
     if not args.check_only:
-        bp.to_quant(str(source), str(candidate), bp.QUANT_VARIANTS["dyn8_all"])
+        if args.recipe == "dynamic8":
+            bp.to_quant(str(source), str(candidate), bp.QUANT_VARIANTS["dyn8_all"])
+        else:
+            if args.calibration_samples < 1 or args.calibration_run < args.calibration_samples:
+                parser.error("static16 needs 1 <= calibration-samples <= calibration-run")
+            model = bp.load_eager()
+            samples = bp.quant_calibration(
+                model, n=args.calibration_samples, run=args.calibration_run)
+            for sample in samples:
+                for key in ("args_4", "args_5"):
+                    sample[key] = np.ascontiguousarray(sample[key].transpose(0, 2, 1, 3))
+            bp.to_quant(
+                str(source), str(candidate), bp.QUANT_VARIANTS["st16_all"],
+                calibration={"serving_default": samples},
+            )
+            del samples, model
     if not candidate.is_file():
         parser.error(f"missing candidate graph: {candidate}")
-    check_interface(source, candidate)
-    check_short_rollout(candidate, args.steps)
+    check_interface(source, candidate, require_float_io=args.recipe == "dynamic8")
+    check_short_rollout(candidate, args.steps, compare_group_dyn8=args.recipe == "dynamic8")
 
 
 if __name__ == "__main__":

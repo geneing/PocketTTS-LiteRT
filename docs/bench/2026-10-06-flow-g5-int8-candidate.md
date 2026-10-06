@@ -52,6 +52,7 @@ long-utterance harness was run here.
 | `pt_flowlm_fused_dyn8_all_no_truncation_g5.tflite` | 199,891,664 | `0d7e9a962705a453b792cd90b1816b671f394dce4c172a53ca1a81d82380545e` |
 | `pt_flowlm_fused_fp32_contiguous.tflite` | 338,170,404 | `908a5c9f9487d5ba44b6fe4e0d79f8921a626781fdf222a5c5e08ee5267326fa` |
 | `pt_flowlm_fused_dyn8_all_contiguous.tflite` | 85,707,824 | `0859169d1db2607512cca9f8a3591afdc0d5bbe1b6b3eb475c109f44d2f6abca` |
+| `pt_flowlm_fused_st16_all_contiguous.tflite` | 85,957,728 | `b89ac1662f01bbbe3f2f26a71582116f9b8b867f3f404b611929e68deb61ed39` |
 
 The 199.9 MB group-major AOT file is larger than its 87.5 MB dynamic INT8
 source and the 172.4 MB fp16 AOT file. LiteRT's public Interpreter exposes only
@@ -77,14 +78,28 @@ and latency protocol before adoption.
 
 `build_pockettts.py` already defines `st16_all`: static range,
 `ALL_SUPPORTED`, channelwise W8 and symmetric A16 using
-`MIN_MAX_UNIFORM_QUANT`. The pinned AI Edge Quantizer
-`RecipeManager.add_static_config(regex, operation_name,
-activation_num_bits=16, weight_num_bits=8, ...)` requires representative
-samples; `quant_calibration` supplies free-run step samples from a voice cache.
-For the position-major graph, each sample's `args_4`/`args_5` cache must be
-transposed from `[1,96,512,64]` to `[1,512,96,64]`. The config targets
-supported operations rather than forcing graph input/output quantization; the
-existing export script expects external float32 I/O. A generated static graph
-must still be inspected before Android use. If K/V become int16, the current
-`TensorBuffer.writeFloat`, native cache patch bridge, and `readFloat` protocol
-would not be compatible without app/JNI changes.
+`MIN_MAX_UNIFORM_QUANT`. It matches the pinned AI Edge Quantizer 0.8.0 built-in
+`recipe.static_wi8_ai16()` configuration. The pinned default policy covers
+`FULLY_CONNECTED`, `BATCH_MATMUL`, attention arithmetic and shape ops, and
+`INPUT`/`OUTPUT`. `quant_calibration` supplies free-run step samples from a
+voice cache; each sample's K/V was transposed from `[1,96,512,64]` to
+`[1,512,96,64]`. This experiment used eight samples over 32 steps:
+
+```bash
+.venv/bin/python scripts/quantize_flowlm_g5.py --recipe static16 \
+  --calibration-samples 8 --calibration-run 32 --steps 4
+```
+
+The resulting graph has 47 int8 weight tensors, int16 activations, and 48
+`QUANTIZE` ops. **All seven inputs and the packed output are int16**, including
+both full K/V caches. K and V external quantization scales differ (about
+`2.94e-4` and `4.38e-5`). The current Android `writeFloat`/`readFloat` and
+native float cache-row patch cannot use it. Python LiteRT `TensorBuffer.write`
+also rejects int16, so the host rollout used `Interpreter.set_tensor` and
+dequantized its output.
+
+Its four-step eager-fp32 latent correlations were `-0.0565`, `-0.0992`,
+`-0.0357`, and `-0.1376`; the maximum latent absolute difference was `6.401`
+and maximum K/V difference `5.900`. EOS logit differences ranged from `6.37`
+to `10.42`. This candidate fails the host quality proxy as well as the Android
+cache interface. No G5 AOT compile of the static graph is warranted.
