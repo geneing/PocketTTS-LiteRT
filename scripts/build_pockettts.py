@@ -719,29 +719,42 @@ def stage_fused(model):
             assert eager_k_diff <= 1e-5 and eager_v_diff <= 1e-5, (
                 f"eager prefill P={P} diverged from token oracle")
 
-    p = convert_multi(fused, example, extra, os.path.join(OUT, "pt_flowlm_fused.tflite"))
+    p = os.path.join(OUT, "pt_flowlm_fused.tflite")
+    if os.environ.get("PT_FUSED_REUSE") == "1":
+        assert os.path.isfile(p), f"PT_FUSED_REUSE=1 needs {p}"
+        print(f"reusing existing {p}; verify it was exported from this source")
+    else:
+        p = convert_multi(fused, example, extra, p)
     opcheck(p, "flowlm_fused")
-    fp16 = to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
-    opcheck(fp16, "flowlm_fused_fp16")
+    graphs = [("fp32", p)]
+    # The CPU-int8 prefill experiment only needs the fp32 source. Skipping the
+    # fp16 comparison avoids materializing another large graph in the same run.
+    if os.environ.get("PT_FUSED_FP16", "1") != "0":
+        fp16 = to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
+        opcheck(fp16, "flowlm_fused_fp16")
+        graphs.append(("fp16", fp16))
 
-    # The step signature, on the fp16 file that actually ships.
+    # Named prefill signatures precede the default fused step.
     c, s = rope_cos_sin_deint(off0)
     with torch.no_grad():
         ref = fused(bos_in.view(1, 1, -1), torch.from_numpy(c).view(1, 1, 1, HD),
                     torch.from_numpy(s).view(1, 1, 1, HD),
                     torch.from_numpy(make_mask(off0)), pk, pv, noises[0])
-    outs = run_signature(
-        fp16, None,
-        (bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
-         s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
-         noises[0].numpy()),
-        [1 + LDIM + 2 * G_KV])
-    print(f"fp16 fused one-step corr {corr(outs[0], ref.numpy()):.6f} "
-          f"max|d| {maxd(outs[0], ref.numpy()):.2e}")
+    step_idx = len(PREFILL_BUCKETS)
+    for label, graph in graphs:
+        outs = run_signature(
+            graph, step_idx,
+            (bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
+             s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
+             noises[0].numpy()),
+            [1 + LDIM + 2 * G_KV])
+        print(f"{label} fused step signature-index={step_idx} vs eager "
+              f"corr {corr(outs[0], ref.numpy()):.6f} "
+              f"max|d| {maxd(outs[0], ref.numpy()):.2e}")
 
     for P, (pre_args, real, nk_ref, nv_ref, _, _) in prefill_cases.items():
         sig = PREFILL_SIGNATURE_INDEX[P]
-        for label, graph in (("fp32", p), ("fp16", fp16)):
+        for label, graph in graphs:
             got = run_signature(graph, sig, tuple(a.numpy() for a in pre_args),
                                 [2 * P * G_KV])[0]
             nk_p = got[:P * G_KV].reshape(1, P, G_KV)

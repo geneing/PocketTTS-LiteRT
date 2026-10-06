@@ -1,7 +1,7 @@
 FlowLM option 2: bucketed CPU int8 prompt prefill
 Date: 2026-10-05
 Branch: codex/flowlm-option-2-int8-prefill
-Status: host validation in progress; Pixel 10 acceptance pending
+Status: CPU int8 host parity passed for isolated buckets; Pixel 10 acceptance pending
 
 Implementation
   Static, headless prefill signatures: P=16 (index 0), P=1 (1), P=8 (2);
@@ -21,16 +21,31 @@ Host validation
   without allocation succeeds, but a CompiledModel load of that graph peaked
   at 6,956,792 KiB RSS under an 8 GB process cap and printed XNNPACK runtime
   creation errors. The legacy P16 graph loaded at 708,156 KiB by the same
-  method. P32 was removed from the shipped bucket set before phone testing;
-  larger prompts use multiple P16 invocations.
-  Three-bucket graph generation and eager/fp32/int8 parity results:
-  PENDING. Python syntax and Android instrumentation compilation: PASS.
-  Graph SHA-256 and file size: PENDING.
+  method. P32 was removed from this experiment before int8 quantization;
+  larger prompts use multiple P16 invocations. P32 int8 load is unmeasured.
+
+  Three-bucket fp32 graph: 340,184,004 bytes. Eager P16/P8/P1 K/V maximum
+  difference from sequential eager: 0 for each bucket. Metadata opcheck:
+  no banned ops or >4D tensors. The fp16 byproduct could not finish under a
+  10 GB virtual-memory cap. An explicit-index TFLite fp32 parity attempt
+  also failed under the cap at XNNPACK tensor allocation. TFLite fp32 row
+  parity is therefore unverified; this graph is a quantization intermediate.
+
+  Three-bucket dynamic-range int8 graph: 89,402,224 bytes; SHA-256
+  d7ee9bc3e9ef13fe82776e4d3825a6555f20e42338e4fe79b778458d04e84b25.
+  CompiledModel.from_file peak RSS on WSL: 1,880,356 KiB under an 8 GB cap.
+  CPU int8 P16/P8/P1 headless output versus sequential CPU int8: K and V
+  max absolute difference 0.00e+00 for every real row (alba preset). The
+  first fused int8 step versus eager fp32 had EOS max difference 6.56e-01,
+  latent correlation 0.999813 / max difference 5.70e-02, K correlation
+  0.999912 / max difference 9.50e-02, and V correlation 0.999164 / max
+  difference 4.72e-02. These are quantization deltas, not prefill deltas.
+  Python syntax and Android instrumentation compilation: PASS.
 
 Pixel 10 acceptance still required
   1. Install this branch's debug app and test APK, preserving pushed models:
        .\gradlew :app:installDebug :app:installDebugAndroidTest
-  2. Push the new scripts/out/pt_flowlm_fused_dyn8_all.tflite into
+  2. Push this branch's scripts/out/pt_flowlm_fused_dyn8_all.tflite into
      /sdcard/Android/data/com.pockettts/files/ after host parity completes.
   3. Run exactly one instrumentation method (CPU dynamic int8):
        adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#compareBucketedInt8PrefillAgainstSequentialOracle com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
