@@ -41,17 +41,23 @@ class ResidentFusedStep(nn.Module):
     `write_mask` is a [1,1,PMAX,1] one-hot mask for the current cache position.
     """
 
-    def __init__(self, flow_lm):
+    def __init__(self, flow_lm, cache_update="where"):
         super().__init__()
         self.step = bp.FlowLMStep(flow_lm)
         self.head = bp.FlowHead(flow_lm)
+        self.cache_update = cache_update
 
     def forward(self, x, cos, sin, mask, pk, pv, noise, write_mask):
         cond, eos, new_k, new_v = self.step(x, cos, sin, mask, pk, pv)
         latent = self.head(cond, noise)
-        write = write_mask > 0.5
-        next_k = torch.where(write, new_k, pk)
-        next_v = torch.where(write, new_v, pv)
+        if self.cache_update == "arithmetic":
+            keep = 1.0 - write_mask
+            next_k = pk * keep + new_k * write_mask
+            next_v = pv * keep + new_v * write_mask
+        else:
+            write = write_mask > 0.5
+            next_k = torch.where(write, new_k, pk)
+            next_v = torch.where(write, new_v, pv)
         control = torch.cat([eos, latent], dim=-1)
         return control, next_k, next_v
 
@@ -112,15 +118,16 @@ def _verify_fp32(module, args, out: Path) -> None:
     print(f"verified one-hot K/V update at position {pos}")
 
 
-def export(out: Path) -> None:
+def export(out: Path, cache_update: str = "where") -> None:
     global _MODEL
     out.mkdir(parents=True, exist_ok=True)
     print("Loading pinned Pocket TTS eager model...")
     _MODEL = bp.load_eager()
-    module = ResidentFusedStep(_MODEL.flow_lm).eval()
+    module = ResidentFusedStep(_MODEL.flow_lm, cache_update).eval()
     pos, args = _inputs(_MODEL)
-    fp32 = out / FP32_NAME
-    fp16 = out / FP16_NAME
+    suffix = "" if cache_update == "where" else f"_{cache_update}"
+    fp32 = out / FP32_NAME.replace(".tflite", f"{suffix}.tflite")
+    fp16 = out / FP16_NAME.replace(".tflite", f"{suffix}.tflite")
 
     print("Checking eager output and cache-update shapes...")
     with torch.no_grad():
@@ -153,8 +160,9 @@ def main() -> int:
         default=Path(os.environ.get("PT_OUT", HERE / "out")),
         help="directory for the source and fp16 graphs (default: PT_OUT or scripts/out)",
     )
+    parser.add_argument("--cache-update", choices=("where", "arithmetic"), default="where")
     args = parser.parse_args()
-    export(args.out)
+    export(args.out, args.cache_update)
     return 0
 
 

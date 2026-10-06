@@ -1,9 +1,19 @@
 package com.pockettts
 
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioManager
+import android.media.AudioTrack
 import android.util.Half
 import android.util.Log
 import android.os.Debug
+import android.os.Build
+import android.os.OutcomeReceiver
 import android.os.PowerManager
+import android.os.PowerMonitor
+import android.os.PowerMonitorReadings
+import android.os.SystemClock
+import android.os.health.SystemHealthManager
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.google.ai.edge.litert.Accelerator
@@ -18,6 +28,7 @@ import dev.pockettts.Placement
 import dev.pockettts.SpTokenizer
 import dev.pockettts.Wav
 import org.junit.Assert.assertTrue
+import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -27,6 +38,8 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.LinkedHashMap
 import java.util.Locale
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.math.sqrt
 
 /** Text-driven FlowLM probe. Invoke with instrumentation args; outputs land in files/flowlm-harness. */
@@ -54,7 +67,24 @@ class FlowLmHarnessTest {
         val pssBeforeRunKb: Long,
         val pssAfterRunKb: Long,
         val wav: File,
+        val energy: EnergyProbe?,
     )
+
+    private data class EnergyProbe(
+        val synthesisElapsedMs: Long,
+        val audioOnlyElapsedMs: Long,
+        val repetitions: Int,
+        val synthesisJoules: Map<String, Double>,
+        val audioOnlyJoules: Map<String, Double>,
+        val incrementalJoules: Map<String, Double>,
+    )
+
+    private data class EnergyWindow(
+        val elapsedMs: Long,
+        val joules: Map<String, Double>,
+    )
+
+    private data class PowerSnapshot(val values: Map<PowerMonitor, Long>)
 
     @Test
     fun runTextPromptHarness() {
@@ -156,20 +186,35 @@ class FlowLmHarnessTest {
     /** End-to-end two-bank FlowLM cache chain against the shipped CPU int8 graph. */
     @Test
     fun npuResidentCacheSpeechPair() {
-        val residentBase = args.getString("residentGraph")?.trim()
-            ?.ifEmpty { DEFAULT_RESIDENT_GRAPH } ?: DEFAULT_RESIDENT_GRAPH
-        val residentGraph = PocketTts.g5Variant(residentBase)
+        assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
+        val health = requireNotNull(context.getSystemService(SystemHealthManager::class.java))
+        val relevantMonitors = supportedMonitors(health).filter { it.name.isRelevantPowerDomain() }
+        assumeTrue("device exposes no CPU/GPU/TPU/display power monitors", relevantMonitors.isNotEmpty())
+
+        val npuResidentCache = args.getString("npuResidentCache")
+            ?.toBooleanStrictOrNull() ?: true
+        val defaultNpuGraph = if (npuResidentCache) {
+            DEFAULT_RESIDENT_GRAPH
+        } else {
+            DEFAULT_NPU_NONRESIDENT_GRAPH
+        }
+        // Keep the old argument name for existing resident-cache invocations.
+        val npuBase = args.getString("npuGraph")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: args.getString("residentGraph")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: defaultNpuGraph
+        val npuGraph = PocketTts.g5Variant(npuBase)
         val referenceGraph = args.getString("referenceGraph")?.trim()
             ?.ifEmpty { PocketTts.LM } ?: PocketTts.LM
         val text = args.getString("text")?.trim().orEmpty().ifEmpty { RESIDENT_TEXT }
         val voice = args.getString("voice")?.trim()?.ifEmpty { "alba" } ?: "alba"
         val seed = args.getString("seed")?.toLongOrNull() ?: 42L
+        val energyRepeats = args.getString("energyRepeats")?.toIntOrNull()?.coerceAtLeast(1) ?: 8
         val order = args.getString("order")?.trim()?.lowercase(Locale.ROOT) ?: "npu-cpu"
         require(order == "npu-cpu" || order == "cpu-npu") {
             "order must be npu-cpu or cpu-npu"
         }
         val models = PocketTtsModels.default(context)
-        assertTrue("missing resident NPU graph ${File(modelDir, residentGraph)}", models.store.exists(residentGraph))
+        assertTrue("missing NPU graph ${File(modelDir, npuGraph)}", models.store.exists(npuGraph))
         assertTrue("missing CPU reference graph ${File(modelDir, referenceGraph)}", models.store.exists(referenceGraph))
 
         val runDir = File(
@@ -179,13 +224,13 @@ class FlowLmHarnessTest {
         ).apply { mkdirs() }
 
         fun runArm(arm: String): SpeechProbe {
-            val resident = arm == "npu"
-            val placement = if (resident) {
+            val isNpu = arm == "npu"
+            val placement = if (isNpu) {
                 Placement(Accel.NPU, Accel.NPU, Accel.GPU)
             } else {
                 Placement(Accel.CPU, Accel.NPU, Accel.GPU)
             }
-            val graph = if (resident) residentBase else referenceGraph
+            val graph = if (isNpu) npuBase else referenceGraph
             val engine = PocketTtsEngine(
                 context,
                 PocketTtsConfig(
@@ -193,7 +238,7 @@ class FlowLmHarnessTest {
                     placement = placement,
                     lmGraph = graph,
                     noiseSeed = seed,
-                    npuResidentCache = resident,
+                    npuResidentCache = isNpu && npuResidentCache,
                 ),
             )
             try {
@@ -201,13 +246,40 @@ class FlowLmHarnessTest {
                 val backends = engine.runtimeAccelerators
                 val warmup = engine.stream("A short warmup sentence.", voice) {}
                 assertTrue("$arm warmup produced no audio", warmup.audio.isNotEmpty())
+
+                // The first utterance supplies a same-workload audio-only baseline;
+                // the following utterance is the measured synthesis interval.
+                val baselineTake = engine.stream(text, voice) {}
+                assertTrue("$arm audio baseline sample is empty", baselineTake.audio.isNotEmpty())
+                val audioOnly = measurePlayback(health, relevantMonitors, baselineTake.audio, energyRepeats)
+                val powerBefore = powerSnapshot(health, relevantMonitors)
+                val synthesisStartMs = SystemClock.elapsedRealtime()
                 val pssBefore = Debug.getPss().toLong()
-                val result = engine.stream(text, voice) {}
+                var result = baselineTake
+                repeat(energyRepeats) {
+                    result = engine.stream(text, voice) {}
+                    assertTrue("$arm repeated run produced no audio", result.audio.isNotEmpty())
+                }
                 val pssAfter = Debug.getPss().toLong()
+                val synthesisElapsedMs = SystemClock.elapsedRealtime() - synthesisStartMs
+                val powerAfter = powerSnapshot(health, relevantMonitors)
                 assertTrue("$arm run produced no audio", result.audio.isNotEmpty())
+                val synthesisJoules = deltaJoules(powerBefore, powerAfter)
+                val scale = synthesisElapsedMs.toDouble() / audioOnly.elapsedMs.coerceAtLeast(1)
+                val incrementalJoules = synthesisJoules.mapValues { (name, joules) ->
+                    joules - (audioOnly.joules[name] ?: 0.0) * scale
+                }
+                val energy = EnergyProbe(
+                    synthesisElapsedMs = synthesisElapsedMs,
+                    audioOnlyElapsedMs = audioOnly.elapsedMs,
+                    repetitions = energyRepeats,
+                    synthesisJoules = synthesisJoules,
+                    audioOnlyJoules = audioOnly.joules,
+                    incrementalJoules = incrementalJoules,
+                )
                 val wav = File(runDir, "$arm.wav")
                 Wav.write(wav, result.audio)
-                return SpeechProbe(result, load, backends, pssBefore, pssAfter, wav)
+                return SpeechProbe(result, load, backends, pssBefore, pssAfter, wav, energy)
             } finally {
                 engine.close()
             }
@@ -219,15 +291,16 @@ class FlowLmHarnessTest {
         val candidate = requireNotNull(probes["npu"])
         val reference = requireNotNull(probes["cpu"])
         val quality = AudioQuality.compare(reference.result.audio, candidate.result.audio)
-        val graphFile = File(modelDir, residentGraph)
+        val graphFile = File(modelDir, npuGraph)
         val graphSha = sha256(graphFile)
         val thermal = context.getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1
-        val lines = listOf(
-            "FlowLM Tensor G5 resident-cache speech pair",
+        val lines = mutableListOf(
+            "FlowLM Tensor G5 NPU speech pair",
             "device=${android.os.Build.MODEL}/${android.os.Build.DEVICE} android=${android.os.Build.VERSION.RELEASE}",
             "fingerprint=${android.os.Build.FINGERPRINT}",
-            "order=$order seed=$seed voice=$voice text=$text",
-            "candidateGraph=$residentGraph sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
+            "order=$order seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
+            "powerMonitors=${relevantMonitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
+            "candidateGraph=$npuGraph npuResidentCache=$npuResidentCache sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
             "referenceGraph=$referenceGraph placement=lm:CPU dectx:NPU dec:GPU",
             "candidatePlacement=${candidate.backends} loadMs=${candidate.loadMs} pssKb=${candidate.pssBeforeRunKb}->${candidate.pssAfterRunKb}",
             "referencePlacement=${reference.backends} loadMs=${reference.loadMs} pssKb=${reference.pssBeforeRunKb}->${reference.pssAfterRunKb}",
@@ -235,14 +308,160 @@ class FlowLmHarnessTest {
             "reference frames=${reference.result.frames} audioSeconds=${reference.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${reference.result.ms} firstAudioMs=${reference.result.profile.firstChunkMs}",
             "candidate lmMs in/run/read=${candidate.result.profile.lmInMs}/${candidate.result.profile.lmRunMs}/${candidate.result.profile.lmReadMs} steps=${candidate.result.profile.lmSteps} hostBytesIn=${candidate.result.profile.lmInBytes} hostBytesOut=${candidate.result.profile.lmOutBytes}",
             "reference lmMs in/run/read=${reference.result.profile.lmInMs}/${reference.result.profile.lmRunMs}/${reference.result.profile.lmReadMs} steps=${reference.result.profile.lmSteps} hostBytesIn=${reference.result.profile.lmInBytes} hostBytesOut=${reference.result.profile.lmOutBytes}",
+            "candidate mimiMs dectx/seanet=${candidate.result.profile.decTxMs}/${candidate.result.profile.seanetMs}",
+            "reference mimiMs dectx/seanet=${reference.result.profile.decTxMs}/${reference.result.profile.seanetMs}",
             "waveform corr=${quality.corr} lag=${quality.lag} snrDb=${quality.snrDb} highBandErrDb=${quality.highBandErrDb} refHnrDb=${quality.refHnrDb} candidateHnrDb=${quality.candHnrDb}",
             "thermalStatus=$thermal candidateWav=${candidate.wav.absolutePath} referenceWav=${reference.wav.absolutePath}",
-            "cache buffers are ping-ponged; Kotlin reads only the 33-float control output; actual AHWB type/device-side copy volume remain unverified",
+            if (npuResidentCache) {
+                "cache buffers are ping-ponged; Kotlin reads only the 33-float control output; actual AHWB type/device-side copy volume remain unverified"
+            } else {
+                "nonresident graph returns only the updated KV rows; host supplies full KV inputs on each FlowLM invocation"
+            },
         )
+        candidate.energy?.let { lines += energyLine("candidate", it, candidate.result.audio.size) }
+        reference.energy?.let { lines += energyLine("reference", it, reference.result.audio.size) }
         File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
         lines.forEach { Log.i(TAG, it) }
-        assertTrue("resident run did not use NPU placement: ${candidate.backends}", candidate.backends["lm"] == Accel.NPU)
-        assertTrue("resident run produced no FlowLM frames", candidate.result.frames > 0)
+        assertTrue("candidate run did not use NPU placement: ${candidate.backends}", candidate.backends["lm"] == Accel.NPU)
+        assertTrue("NPU run produced no FlowLM frames", candidate.result.frames > 0)
+    }
+
+    private fun supportedMonitors(manager: SystemHealthManager): List<PowerMonitor> {
+        val latch = CountDownLatch(1)
+        var result: List<PowerMonitor> = emptyList()
+        manager.getSupportedPowerMonitors(null) {
+            result = it.toList()
+            latch.countDown()
+        }
+        assertTrue("timed out listing device power monitors", latch.await(30, TimeUnit.SECONDS))
+        return result
+    }
+
+    private fun powerSnapshot(
+        manager: SystemHealthManager,
+        monitors: List<PowerMonitor>,
+    ): PowerSnapshot {
+        val latch = CountDownLatch(1)
+        var readings: PowerMonitorReadings? = null
+        var failure: RuntimeException? = null
+        manager.getPowerMonitorReadings(
+            monitors,
+            null,
+            object : OutcomeReceiver<PowerMonitorReadings, RuntimeException> {
+                override fun onResult(result: PowerMonitorReadings) {
+                    readings = result
+                    latch.countDown()
+                }
+
+                override fun onError(error: RuntimeException) {
+                    failure = error
+                    latch.countDown()
+                }
+            },
+        )
+        assertTrue("timed out reading device power monitors", latch.await(30, TimeUnit.SECONDS))
+        failure?.let { throw AssertionError("could not read device power monitors", it) }
+        val result = requireNotNull(readings)
+        return PowerSnapshot(monitors.associateWith { result.getConsumedEnergy(it) })
+    }
+
+    private fun deltaJoules(before: PowerSnapshot, after: PowerSnapshot): Map<String, Double> =
+        before.values.mapNotNull { (monitor, start) ->
+            val end = after.values[monitor] ?: return@mapNotNull null
+            if (start < 0 || end < start) return@mapNotNull null
+            monitor.name to ((end - start) / 1_000_000.0)
+        }.toMap()
+
+    private fun measurePlayback(
+        manager: SystemHealthManager,
+        monitors: List<PowerMonitor>,
+        audio: FloatArray,
+        repetitions: Int,
+    ): EnergyWindow {
+        val track = newAudioTrack()
+        return try {
+            val before = powerSnapshot(manager, monitors)
+            val started = SystemClock.elapsedRealtime()
+            track.play()
+            repeat(repetitions) { writeAudio(track, audio) }
+            drainAudio(track, audio.size * repetitions)
+            val elapsedMs = SystemClock.elapsedRealtime() - started
+            val after = powerSnapshot(manager, monitors)
+            EnergyWindow(elapsedMs, deltaJoules(before, after))
+        } finally {
+            track.release()
+        }
+    }
+
+    private fun newAudioTrack(): AudioTrack {
+        val format = AudioFormat.Builder()
+            .setSampleRate(PocketTts.SAMPLE_RATE)
+            .setEncoding(AudioFormat.ENCODING_PCM_FLOAT)
+            .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+            .build()
+        val minBytes = AudioTrack.getMinBufferSize(
+            PocketTts.SAMPLE_RATE,
+            AudioFormat.CHANNEL_OUT_MONO,
+            AudioFormat.ENCODING_PCM_FLOAT,
+        )
+        check(minBytes > 0) { "AudioTrack does not support 24 kHz mono float PCM" }
+        return AudioTrack(
+            AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_MEDIA)
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .build(),
+            format,
+            maxOf(minBytes, PocketTts.SAMPLE_RATE * Float.SIZE_BYTES),
+            AudioTrack.MODE_STREAM,
+            AudioManager.AUDIO_SESSION_ID_GENERATE,
+        ).apply { setVolume(0.5f) }
+    }
+
+    private fun writeAudio(track: AudioTrack, audio: FloatArray) {
+        var offset = 0
+        while (offset < audio.size) {
+            val written = track.write(
+                audio,
+                offset,
+                minOf(4096, audio.size - offset),
+                AudioTrack.WRITE_BLOCKING,
+            )
+            check(written > 0) { "AudioTrack.write failed: $written" }
+            offset += written
+        }
+    }
+
+    private fun drainAudio(track: AudioTrack, samples: Int) {
+        val deadline = SystemClock.elapsedRealtime() +
+            samples * 1000L / PocketTts.SAMPLE_RATE + 15_000L
+        while (track.playbackHeadPosition < samples && SystemClock.elapsedRealtime() < deadline) {
+            SystemClock.sleep(20)
+        }
+        assertTrue("AudioTrack did not finish playback", track.playbackHeadPosition >= samples)
+        track.stop()
+    }
+
+    private fun energyLine(label: String, energy: EnergyProbe, samples: Int): String {
+        val audioSeconds = samples.toDouble() * energy.repetitions / PocketTts.SAMPLE_RATE
+        val perSecond = energy.incrementalJoules.mapValues { (_, joules) ->
+            joules / audioSeconds.coerceAtLeast(1e-9)
+        }
+        return "$label energy repeats=${energy.repetitions} synthesisMs=${energy.synthesisElapsedMs} " +
+            "audioOnlyMs=${energy.audioOnlyElapsedMs} " +
+            "synthesisJ=${renderEnergy(energy.synthesisJoules)} " +
+            "audioOnlyJ=${renderEnergy(energy.audioOnlyJoules)} " +
+            "incrementalJ=${renderEnergy(energy.incrementalJoules)} " +
+            "incrementalJPerSpeechSecond=${renderEnergy(perSecond)}"
+    }
+
+    private fun renderEnergy(values: Map<String, Double>): String =
+        values.toSortedMap().entries.joinToString(",") { (name, value) ->
+            "$name=${String.format(Locale.US, "%.3f", value)}"
+        }
+
+    private fun String.isRelevantPowerDomain(): Boolean {
+        val key = lowercase(Locale.ROOT)
+        return key.contains("cpu") || key.contains("gpu") || key.contains("tpu") || key.contains("display")
     }
 
     private fun runPrompt(
@@ -429,6 +648,7 @@ class FlowLmHarnessTest {
         const val REFERENCE_GRAPH = "pt_flowlm_fused_fp16.tflite"
         const val DEFAULT_TEXT = "Hello world. This is a FlowLM text probe."
         const val DEFAULT_RESIDENT_GRAPH = "pt_flowlm_fused_fp16_resident_no_truncation.tflite"
+        const val DEFAULT_NPU_NONRESIDENT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val RESIDENT_TEXT = "Hello there, how are you?"
     }
 }
