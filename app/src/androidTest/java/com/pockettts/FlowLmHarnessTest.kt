@@ -191,8 +191,18 @@ class FlowLmHarnessTest {
         val relevantMonitors = supportedMonitors(health).filter { it.name.isRelevantPowerDomain() }
         assumeTrue("device exposes no CPU/GPU/TPU/display power monitors", relevantMonitors.isNotEmpty())
 
+        val npuSliceCache = args.getString("npuSliceCache")
+            ?.toBooleanStrictOrNull() ?: false
         val npuResidentCache = args.getString("npuResidentCache")
-            ?.toBooleanStrictOrNull() ?: true
+            ?.toBooleanStrictOrNull() ?: !npuSliceCache
+        val verifyNpuSliceRows = args.getString("verifyNpuSliceRows")
+            ?.toBooleanStrictOrNull() ?: false
+        require(!(npuResidentCache && npuSliceCache)) {
+            "select either npuResidentCache or npuSliceCache"
+        }
+        require(!verifyNpuSliceRows || npuSliceCache) {
+            "verifyNpuSliceRows requires npuSliceCache"
+        }
         val defaultNpuGraph = if (npuResidentCache) {
             DEFAULT_RESIDENT_GRAPH
         } else {
@@ -205,7 +215,13 @@ class FlowLmHarnessTest {
         val npuGraph = PocketTts.g5Variant(npuBase)
         val referenceGraph = args.getString("referenceGraph")?.trim()
             ?.ifEmpty { PocketTts.LM } ?: PocketTts.LM
-        val text = args.getString("text")?.trim().orEmpty().ifEmpty { RESIDENT_TEXT }
+        val workload = args.getString("workload")?.trim()?.lowercase(Locale.ROOT) ?: "short"
+        val defaultText = when (workload) {
+            "short" -> RESIDENT_TEXT
+            "long" -> LONG_TEXT
+            else -> error("workload must be short or long; got '$workload'")
+        }
+        val text = args.getString("text")?.trim().orEmpty().ifEmpty { defaultText }
         val voice = args.getString("voice")?.trim()?.ifEmpty { "alba" } ?: "alba"
         val seed = args.getString("seed")?.toLongOrNull() ?: 42L
         val energyRepeats = args.getString("energyRepeats")?.toIntOrNull()?.coerceAtLeast(1) ?: 8
@@ -217,9 +233,14 @@ class FlowLmHarnessTest {
         assertTrue("missing NPU graph ${File(modelDir, npuGraph)}", models.store.exists(npuGraph))
         assertTrue("missing CPU reference graph ${File(modelDir, referenceGraph)}", models.store.exists(referenceGraph))
 
+        val cacheMode = when {
+            npuSliceCache -> "slice"
+            npuResidentCache -> "resident"
+            else -> "nonresident"
+        }
         val runDir = File(
-            context.getExternalFilesDir("flowlm-npu-resident")
-                ?: File(context.filesDir, "flowlm-npu-resident"),
+            context.getExternalFilesDir("flowlm-npu-$cacheMode")
+                ?: File(context.filesDir, "flowlm-npu-$cacheMode"),
             "speech-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
         ).apply { mkdirs() }
 
@@ -239,6 +260,8 @@ class FlowLmHarnessTest {
                     lmGraph = graph,
                     noiseSeed = seed,
                     npuResidentCache = isNpu && npuResidentCache,
+                    npuSliceCache = isNpu && npuSliceCache,
+                    verifyNpuSliceRows = isNpu && verifyNpuSliceRows,
                 ),
             )
             try {
@@ -298,9 +321,9 @@ class FlowLmHarnessTest {
             "FlowLM Tensor G5 NPU speech pair",
             "device=${android.os.Build.MODEL}/${android.os.Build.DEVICE} android=${android.os.Build.VERSION.RELEASE}",
             "fingerprint=${android.os.Build.FINGERPRINT}",
-            "order=$order seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
+            "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
             "powerMonitors=${relevantMonitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
-            "candidateGraph=$npuGraph npuResidentCache=$npuResidentCache sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
+            "candidateGraph=$npuGraph cacheMode=$cacheMode verifyNpuSliceRows=$verifyNpuSliceRows sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
             "referenceGraph=$referenceGraph placement=lm:CPU dectx:NPU dec:GPU",
             "candidatePlacement=${candidate.backends} loadMs=${candidate.loadMs} pssKb=${candidate.pssBeforeRunKb}->${candidate.pssAfterRunKb}",
             "referencePlacement=${reference.backends} loadMs=${reference.loadMs} pssKb=${reference.pssBeforeRunKb}->${reference.pssAfterRunKb}",
@@ -308,11 +331,14 @@ class FlowLmHarnessTest {
             "reference frames=${reference.result.frames} audioSeconds=${reference.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${reference.result.ms} firstAudioMs=${reference.result.profile.firstChunkMs}",
             "candidate lmMs in/run/read=${candidate.result.profile.lmInMs}/${candidate.result.profile.lmRunMs}/${candidate.result.profile.lmReadMs} steps=${candidate.result.profile.lmSteps} hostBytesIn=${candidate.result.profile.lmInBytes} hostBytesOut=${candidate.result.profile.lmOutBytes}",
             "reference lmMs in/run/read=${reference.result.profile.lmInMs}/${reference.result.profile.lmRunMs}/${reference.result.profile.lmReadMs} steps=${reference.result.profile.lmSteps} hostBytesIn=${reference.result.profile.lmInBytes} hostBytesOut=${reference.result.profile.lmOutBytes}",
+            "candidate nativeNs outputMap/cacheMap/rowCopy/unmap=${candidate.result.profile.lmOutputMapMs}/${candidate.result.profile.lmCacheMapMs}/${candidate.result.profile.lmCacheCopyMs}/${candidate.result.profile.lmCacheUnmapMs} bufferTypes=${candidate.result.profile.lmBufferTypes.ifEmpty { "n/a" }}",
             "candidate mimiMs dectx/seanet=${candidate.result.profile.decTxMs}/${candidate.result.profile.seanetMs}",
             "reference mimiMs dectx/seanet=${reference.result.profile.decTxMs}/${reference.result.profile.seanetMs}",
             "waveform corr=${quality.corr} lag=${quality.lag} snrDb=${quality.snrDb} highBandErrDb=${quality.highBandErrDb} refHnrDb=${quality.refHnrDb} candidateHnrDb=${quality.candHnrDb}",
             "thermalStatus=$thermal candidateWav=${candidate.wav.absolutePath} referenceWav=${reference.wav.absolutePath}",
-            if (npuResidentCache) {
+            if (npuSliceCache) {
+                "native slice path seeds K/V once, maps packed output and persistent K/V input buffers, then patches the new row; buffer type enums are from LiteRT 2.2.0"
+            } else if (npuResidentCache) {
                 "cache buffers are ping-ponged; Kotlin reads only the 33-float control output; actual AHWB type/device-side copy volume remain unverified"
             } else {
                 "nonresident graph returns only the updated KV rows; host supplies full KV inputs on each FlowLM invocation"
@@ -650,5 +676,10 @@ class FlowLmHarnessTest {
         const val DEFAULT_RESIDENT_GRAPH = "pt_flowlm_fused_fp16_resident_no_truncation.tflite"
         const val DEFAULT_NPU_NONRESIDENT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val RESIDENT_TEXT = "Hello there, how are you?"
+        val LONG_TEXT = """
+            Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.
+
+            By midmorning, the room is busy but calm. People take turns describing what stopped working, and the volunteers ask questions before reaching for a screwdriver. Some repairs succeed quickly; others become lessons in what to try next. Nobody is asked to pay, and nobody is hurried toward a perfect result. The goal is to help useful things last longer, share skills that might otherwise remain hidden, and make it easier for strangers to begin a conversation. At the end of the afternoon, the tables are cleared, the tools are counted, and a list of unfinished jobs is saved for next month.
+        """.trimIndent().replace('\n', ' ')
     }
 }
