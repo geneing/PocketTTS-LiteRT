@@ -5,6 +5,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <cstddef>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -14,6 +15,22 @@ namespace {
 using Buffer = void*;
 using GetType = int (*)(Buffer, int*);
 using GetPackedSize = int (*)(Buffer, size_t*);
+using GetSize = int (*)(Buffer, size_t*);
+// LiteRT 2.2.0 public, ABI-stable structs from litert_layout.h and
+// litert_model_types.h. Keep these checks beside the dlsym-based bridge.
+struct Layout {
+  unsigned int rank : 7;
+  unsigned int has_strides : 1;
+  int32_t dimensions[8];
+  uint32_t strides[8];
+};
+struct RankedType { int element_type; Layout layout; };
+static_assert(sizeof(Layout) == 68);
+static_assert(offsetof(Layout, dimensions) == 4);
+static_assert(offsetof(Layout, strides) == 36);
+static_assert(sizeof(RankedType) == 72);
+static_assert(offsetof(RankedType, layout) == 4);
+using GetTensorType = int (*)(Buffer, RankedType*);
 using Lock = int (*)(Buffer, void**, int);
 using Unlock = int (*)(Buffer);
 constexpr int kOk = 0;
@@ -25,10 +42,14 @@ struct Api {
   void* library = nullptr;
   GetType get_type = nullptr;
   GetPackedSize packed_size = nullptr;
+  GetSize size = nullptr;
+  GetSize offset = nullptr;
+  GetTensorType tensor_type = nullptr;
   Lock lock = nullptr;
   Unlock unlock = nullptr;
   bool valid() const {
-    return library && get_type && packed_size && lock && unlock;
+    return library && get_type && packed_size && size && offset &&
+           tensor_type && lock && unlock;
   }
 };
 
@@ -39,6 +60,9 @@ const Api& api() {
     if (!a.library) return a;
     a.get_type = reinterpret_cast<GetType>(dlsym(a.library, "LiteRtGetTensorBufferType"));
     a.packed_size = reinterpret_cast<GetPackedSize>(dlsym(a.library, "LiteRtGetTensorBufferPackedSize"));
+    a.size = reinterpret_cast<GetSize>(dlsym(a.library, "LiteRtGetTensorBufferSize"));
+    a.offset = reinterpret_cast<GetSize>(dlsym(a.library, "LiteRtGetTensorBufferOffset"));
+    a.tensor_type = reinterpret_cast<GetTensorType>(dlsym(a.library, "LiteRtGetTensorBufferTensorType"));
     a.lock = reinterpret_cast<Lock>(dlsym(a.library, "LiteRtLockTensorBuffer"));
     a.unlock = reinterpret_cast<Unlock>(dlsym(a.library, "LiteRtUnlockTensorBuffer"));
     return a;
@@ -75,12 +99,40 @@ Buffer handle(JNIEnv* env, jobject tensor_buffer) {
 
 bool expect_size(JNIEnv* env, const Api& a, Buffer buffer, size_t bytes,
                  const char* label) {
-  size_t actual = 0;
-  const int status = a.packed_size(buffer, &actual);
-  if (status != kOk || actual != bytes) {
-    fail(env, std::string(label) + " packed bytes: expected " +
-                  std::to_string(bytes) + ", got " + std::to_string(actual) +
-                  ", LiteRT status " + std::to_string(status));
+  size_t packed = 0, allocation = 0, offset = 0;
+  int buffer_type = -1;
+  RankedType tensor_type{};
+  const int packed_status = a.packed_size(buffer, &packed);
+  const int size_status = a.size(buffer, &allocation);
+  const int offset_status = a.offset(buffer, &offset);
+  const int type_status = a.get_type(buffer, &buffer_type);
+  const int tensor_status = a.tensor_type(buffer, &tensor_type);
+  if (packed_status != kOk || packed != bytes || size_status != kOk ||
+      offset_status != kOk || type_status != kOk || tensor_status != kOk) {
+    std::string shape = "[";
+    if (tensor_status == kOk && tensor_type.layout.rank <= 8) {
+      for (unsigned int i = 0; i < tensor_type.layout.rank; ++i) {
+        if (i) shape += ",";
+        shape += std::to_string(tensor_type.layout.dimensions[i]);
+      }
+    } else {
+      shape += "unknown";
+    }
+    shape += "]";
+    fail(env, std::string(label) + " buffer mismatch: expectedPacked=" +
+                  std::to_string(bytes) + " packed=" + std::to_string(packed) +
+                  " allocation=" + std::to_string(allocation) +
+                  " offset=" + std::to_string(offset) +
+                  " bufferType=" + std::to_string(buffer_type) +
+                  " elementType=" + std::to_string(tensor_type.element_type) +
+                  " rank=" + std::to_string(tensor_type.layout.rank) +
+                  " shape=" + shape + " hasStrides=" +
+                  std::to_string(tensor_type.layout.has_strides) +
+                  " statuses=" + std::to_string(packed_status) + "," +
+                  std::to_string(size_status) + "," +
+                  std::to_string(offset_status) + "," +
+                  std::to_string(type_status) + "," +
+                  std::to_string(tensor_status));
     return false;
   }
   return true;
