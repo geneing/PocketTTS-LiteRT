@@ -23,6 +23,8 @@ cache magnitudes. The output is opt-in and is never installed by this script.
 ``--recipe static16_floatio`` applies the corresponding W8/A16 recipe with
 the same float32 host interface. It is an isolated NPU quality experiment.
 ``--recipe static16_fc_floatio`` limits W8/A16 to fully connected operations.
+``--recipe static16_ffn12`` selects both large FFN matrices in each FlowLM
+layer; ``static16_ffn6`` selects only each FFN output matrix.
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ from __future__ import annotations
 import argparse
 import math
 import os
+import re
 from pathlib import Path
 
 import numpy as np
@@ -45,6 +48,8 @@ CANDIDATE_STEMS = {
     "static8": "pt_flowlm_fused_st8_floatio_contiguous",
     "static16_floatio": "pt_flowlm_fused_st16_floatio_contiguous",
     "static16_fc_floatio": "pt_flowlm_fused_st16_fc_floatio_contiguous",
+    "static16_ffn12": "pt_flowlm_fused_st16_ffn12_contiguous",
+    "static16_ffn6": "pt_flowlm_fused_st16_ffn6_contiguous",
 }
 
 
@@ -85,31 +90,76 @@ def check_interface(source: Path, quantized: Path, require_float_io: bool) -> No
         print("WARNING: quantized external I/O is incompatible with the current Android float cache path")
 
 
-def inspect_internal_quantization(path: Path, activation_bits: int) -> None:
+def inspect_internal_quantization(
+    path: Path, activation_bits: int, expected_int8_fc: int | None = None,
+) -> None:
     from collections import Counter
     from ai_edge_litert.interpreter import Interpreter
 
     interpreter = Interpreter(model_path=str(path))
-    tensors = Counter(str(detail["dtype"]) for detail in interpreter.get_tensor_details())
+    details = interpreter.get_tensor_details()
+    tensors = Counter(str(detail["dtype"]) for detail in details)
     ops = Counter(detail["op_name"] for detail in interpreter._get_ops_details())
     print(f"internal tensor dtypes: {dict(tensors)}")
     print(f"quantization ops: QUANTIZE={ops['QUANTIZE']} DEQUANTIZE={ops['DEQUANTIZE']}")
     activation_type = f"int{activation_bits}"
     if not any(activation_type in dtype for dtype in tensors) or ops["QUANTIZE"] == 0:
         raise AssertionError(f"static W8/A{activation_bits} recipe did not quantize activations")
+    by_index = {detail["index"]: detail for detail in details}
+    fc_weights = Counter()
+    for op in interpreter._get_ops_details():
+        if op["op_name"] == "FULLY_CONNECTED":
+            weight = by_index[int(op["inputs"][1])]
+            shape = tuple(int(x) for x in weight["shape"])
+            fc_weights[(shape, weight["dtype"].__name__)] += 1
+    print(f"fully connected weight coverage: {dict(fc_weights)}")
+    int8_count = sum(n for (_, dtype), n in fc_weights.items() if dtype == "int8")
+    if expected_int8_fc is not None and int8_count != expected_int8_fc:
+        raise AssertionError(f"expected {expected_int8_fc} INT8 FC ops, got {int8_count}")
+
+
+def selected_fc_regex(source: Path, shapes: set[tuple[int, int]], expected: int) -> str:
+    """Select source FFN ops by matrix shape, then match exact output names."""
+    from ai_edge_litert.interpreter import Interpreter
+
+    interpreter = Interpreter(model_path=str(source))
+    by_index = {detail["index"]: detail for detail in interpreter.get_tensor_details()}
+    names = []
+    for op in interpreter._get_ops_details():
+        if op["op_name"] != "FULLY_CONNECTED":
+            continue
+        weight = by_index[int(op["inputs"][1])]
+        if tuple(int(x) for x in weight["shape"]) in shapes:
+            name = by_index[int(op["outputs"][0])]["name"]
+            if "FlowLMStep_step" not in name:
+                raise AssertionError(f"unexpected non-backbone dense op {name}")
+            names.append(name)
+    if len(names) != expected or len(set(names)) != expected:
+        raise AssertionError(f"expected {expected} unique FFN ops, got {len(names)}")
+    print(f"selected {expected} FFN outputs: {names}")
+    # AEQ's get_op_scope joins output names and appends a trailing semicolon.
+    return "^(?:" + "|".join(re.escape(name) for name in names) + ");$"
 
 
 def quantize_static_floatio(
     source: Path, candidate: Path, samples: list[dict], activation_bits: int,
-    fully_connected_only: bool = False,
+    fully_connected_only: bool = False, ffn_selection: str | None = None,
 ) -> None:
     from ai_edge_quantizer import algorithm_manager, calibrator, qtyping, quantizer
 
     qt = quantizer.Quantizer(float_model=str(source))
-    if fully_connected_only:
+    if fully_connected_only or ffn_selection:
+        scope = ".*"
+        if ffn_selection:
+            shapes = {(1024, 4096)}
+            expected = 6
+            if ffn_selection == "ffn12":
+                shapes.add((4096, 1024))
+                expected = 12
+            scope = selected_fc_regex(source, shapes, expected)
         qt.load_quantization_recipe(bp.quant_recipe({
             "kind": "static", "ops": ["FULLY_CONNECTED"],
-            "weight_bits": 8, "act_bits": activation_bits, "regex": ".*",
+            "weight_bits": 8, "act_bits": activation_bits, "regex": scope,
         }))
     else:
         qt.load_quantization_recipe(f"static_wi8_ai{activation_bits}")
@@ -296,7 +346,10 @@ def main() -> None:
                         help="optional group-major CPU dyn8 graph for a paired free-run baseline")
     args = parser.parse_args()
     if args.steps is None:
-        args.steps = 32 if args.recipe in ("static8", "static16_floatio", "static16_fc_floatio") else 4
+        args.steps = 32 if args.recipe in (
+            "static8", "static16_floatio", "static16_fc_floatio",
+            "static16_ffn12", "static16_ffn6",
+        ) else 4
     if args.steps < 1 or args.steps > bp.PMAX:
         parser.error(f"--steps must be in 1..{bp.PMAX}")
     source = args.out / f"{SOURCE_STEM}.tflite"
@@ -334,11 +387,17 @@ def main() -> None:
             print(f"calibration settings: voices={voices} seed={args.calibration_seed} "
                   f"samples={len(samples)} run_per_voice={args.calibration_run}")
             candidate.unlink(missing_ok=True)
-            if args.recipe in ("static8", "static16_floatio", "static16_fc_floatio"):
+            if args.recipe in (
+                "static8", "static16_floatio", "static16_fc_floatio",
+                "static16_ffn12", "static16_ffn6",
+            ):
                 activation_bits = 8 if args.recipe == "static8" else 16
                 quantize_static_floatio(
                     source, candidate, samples, activation_bits,
                     fully_connected_only=args.recipe == "static16_fc_floatio",
+                    ffn_selection=(args.recipe.removeprefix("static16_")
+                                   if args.recipe in ("static16_ffn12", "static16_ffn6")
+                                   else None),
                 )
             else:
                 bp.to_quant(
@@ -349,8 +408,14 @@ def main() -> None:
     if not candidate.is_file():
         parser.error(f"missing candidate graph: {candidate}")
     check_interface(source, candidate, require_float_io=args.recipe != "static16")
-    if args.recipe in ("static8", "static16_floatio", "static16_fc_floatio"):
-        inspect_internal_quantization(candidate, 8 if args.recipe == "static8" else 16)
+    if args.recipe in (
+        "static8", "static16_floatio", "static16_fc_floatio",
+        "static16_ffn12", "static16_ffn6",
+    ):
+        expected_fc = (12 if args.recipe == "static16_ffn12" else
+                       6 if args.recipe == "static16_ffn6" else None)
+        inspect_internal_quantization(
+            candidate, 8 if args.recipe == "static8" else 16, expected_fc)
     if args.compare_dyn8 and not args.compare_dyn8.is_file():
         parser.error(f"missing CPU dyn8 baseline graph: {args.compare_dyn8}")
     check_short_rollout(candidate, args.steps,
