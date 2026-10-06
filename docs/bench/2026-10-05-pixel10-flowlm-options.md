@@ -61,7 +61,7 @@ Each option has its own branch and bench report. Device tests are run serially b
 | Option | Branch | Current implementation / gate | Pixel 10 result |
 |---|---|---|---|
 | 1. Persistent NPU KV cache | `codex/flowlm-option-1-npu-cache` | Tiny fixed-shape two-bank cache-chain proof | 32-step gate passed; host transfer 49 KB vs 25.2 MB, device-side copies and energy unverified |
-| 2. CPU int8 prompt prefill buckets | `codex/flowlm-option-2-int8-prefill` | Quantized fixed-bucket prefill graph | Int8 P1/P8/P16 host export/parity passed; Pixel load, runtime, and memory checks pending |
+| 2. CPU int8 prompt prefill buckets | `codex/flowlm-option-2-int8-prefill` | Quantized P1/P8/P16 headless prefill signatures | Pixel matrix passed exact K/V and first-decode parity for two voices, 1-385 tokens; peak RSS 2,384,056 KiB. Every tested prefill case was slower than sequential int8 (0.531-0.925x); do not enable |
 | 3. KV capacity buckets | `codex/flowlm-option-3-kv-capacity` | Smaller static capacities with 512 fallback and capacity checks | 256 short-prompt probe: 19.72 ms run vs 26.51 ms at 512, same latent bytes; 46-token prompt safely rejected at 256 and completed at 512. No full-speech win established |
 | 4. GPU resident KV cache | `codex/flowlm-option-4-gpu-cache` | Export/API feasibility gate | Stopped before artifact/device run: export service timed out; required GPU buffer interop remains unproven |
 | 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment requiring trained model changes | Stopped: no training corpus, pipeline, checkpoint, or held-out quality suite available; no model or device performance result |
