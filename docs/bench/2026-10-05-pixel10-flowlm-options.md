@@ -66,6 +66,7 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 4. GPU resident KV cache | `codex/flowlm-option-4-gpu-cache` | Export/API feasibility gate | Stopped before artifact/device run: export service timed out; required GPU buffer interop remains unproven |
 | 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment requiring trained model changes | Stopped: no training corpus, pipeline, checkpoint, or held-out quality suite available; no model or device performance result |
 | 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread counts 2/4/6 plus selective fp32 EOS gate | 18 prompt-only pairs were exact; 6 threads sped 385-token prompt compute 19-23%, but full-pipeline runs were slower in every completed short/medium/long case. Selective EOS export quantized to the baseline graph |
+| 7. G5 NPU slice cache | `codex/flowlm-kv-slice` | Full FlowLM graph on NPU; persistent AHWB K/V inputs with native per-position updates | First long pair: 32.906 s vs CPU int8 25.165 s (1.31x); input traffic fell about 104x. Reverse-order pair is running; cache row patch currently costs 2.381 s |
 
 ### Option 6: CPU thread tuning
 
@@ -99,3 +100,18 @@ The full console/logcat record is in ignored `scripts/out`.
 The baseline paragraph test is one long utterance on alba and a same-configuration repeat; it is a control repeatability check, not an A/B against an optimization. Option 2 completed its bucketed prompt/first-decode parity matrix but failed its prefill speed gate, so it was not promoted to full speech testing. Option 3 completed short streaming speech A/B pairs on two voices and both run orders after fixing the named-buffer bug; medium/long speech, energy, and listening remain open. Its 46-token Mary case safely exceeds the 256 capacity with the planned generation budget. Option 1 stopped at the tiny cache-chain gate because actual device-side cache copy volume is unknown. Options 4 and 5 stopped before a Pixel candidate artifact/model was available. Option 6 completed short, medium, and long full-pipeline pairs on both voices; every case was slower at six threads, and long energy estimates were 10-12% higher. Full-pipeline tests for 2/4 threads and listening review remain incomplete.
 
 No option has completed the full acceptance matrix of three prompt lengths, three audio lengths, two voices, reversed paired runs against CPU int8, first-audio percentiles, audio-subtracted PowerMonitor energy, sustained thermal checks, and listening review. No performance win or production-path change is claimed. The exact requirements are in [`flowlm-pixel10-optimization-research.md`](../flowlm-pixel10-optimization-research.md).
+
+## Option 7: Tensor G5 NPU with persistent slice cache
+
+The opt-in prototype runs the fused FP16 FlowLM on the Pixel 10 NPU. It seeds K/V once into persistent LiteRT `AHWB` input buffers, then maps the NPU output and updates only the selected cache position through the native LiteRT 2.2.0 buffer bridge. A preceding short diagnostic verified the K/V rows exactly. The full long run disabled row verification to avoid adding synchronization to its timing. The dispatch report for the model artifact states one G5 partition (715/715 ops).
+
+The first long paired run used the harness's fixed 201-word paragraph, Alba, seed 42, 759 frames / 60.72 s audio, with NPU first and CPU reference second. It completed without frame truncation. This is one paired order, not acceptance. The reversed-order pair is in progress.
+
+| Arm | Inference | LM input / run / read | Mimi decoder transformer / SEANet | First audio | Host bytes into LM |
+|---|---:|---:|---:|---:|---:|
+| FP16 G5 NPU + slice cache | 32.906 s | 1.040 / 16.586 / 2.934 s | 3.395 / 4.728 s | 1.634 s | 268,080,192 B |
+| CPU int8 reference | 25.165 s | 2.407 / 15.309 / 0.129 s | 1.741 / 4.447 s | 1.127 s | 27,900,154,944 B |
+
+The NPU candidate is 1.31x slower by inference time. Its aggregate native cache bridge stages were output map 115 ms, cache map 103 ms, row copy 2,381 ms, and unmap 104 ms across 1,107 decode/prompt steps. The row copy dominates this path: it writes 96 small, 256-byte rows into group-major cache banks at a 32,768-float stride. Host input bytes fell about 104x against the explicit full-cache CPU path, while measured LM execution remained 1.277 s slower than CPU and LM output/cache handling remained 2.805 s slower. A contiguous cache layout or graph-side cache update is the next optimization target.
+
+Audio duration and frame count matched, but the long free-running waveform correlation was only 0.0915 (lag 0); that does not pass the listening/quality gate. Short-probe exact row verification checks cache-write integrity, not long-run speech equivalence. Single-pair PowerMonitor values are recorded in the device report but are not sufficient to claim an energy result. Thermal status was 0. Local WAVs and the complete device report are under ignored `build/flowlm-kv-slice/2026-10-06-npu-cpu/`; device report source: `/sdcard/Android/data/com.pockettts/files/flowlm-npu-slice/speech-20261006-082717-444/report.txt`.
