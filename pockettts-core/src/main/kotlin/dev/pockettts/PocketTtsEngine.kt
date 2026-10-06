@@ -168,6 +168,13 @@ class PocketTtsEngine(
      */
     internal val usesNpuResidentCache: Boolean = config.npuResidentCache
     internal val usesNpuSliceCache: Boolean = config.npuSliceCache
+    internal val usesNpuPositionMajorCache: Boolean = config.npuPositionMajorCache
+    private val positionMajorSeedK: FloatArray? = if (usesNpuPositionMajorCache) {
+        FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
+    } else null
+    private val positionMajorSeedV: FloatArray? = if (usesNpuPositionMajorCache) {
+        FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
+    } else null
     internal val lmResidentIn: MutableList<TensorBuffer>? =
         if (usesNpuResidentCache) lm.createInputBuffers().toMutableList() else null
     internal val lmResidentOut: MutableList<TensorBuffer>? =
@@ -300,8 +307,28 @@ class PocketTtsEngine(
         val expected = PocketTts.G * PocketTts.PMAX * PocketTts.HD
         require(k.size == expected && v.size == expected)
         val start = System.nanoTime()
-        lmIn[4].writeFloat(k)
-        lmIn[5].writeFloat(v)
+        if (usesNpuPositionMajorCache) {
+            fun positionMajor(groupMajor: FloatArray, out: FloatArray) {
+                for (p in 0 until PocketTts.PMAX) {
+                    for (g in 0 until PocketTts.G) {
+                        System.arraycopy(
+                            groupMajor, (g * PocketTts.PMAX + p) * PocketTts.HD,
+                            out, (p * PocketTts.G + g) * PocketTts.HD,
+                            PocketTts.HD,
+                        )
+                    }
+                }
+            }
+            val seedK = requireNotNull(positionMajorSeedK)
+            val seedV = requireNotNull(positionMajorSeedV)
+            positionMajor(k, seedK)
+            positionMajor(v, seedV)
+            lmIn[4].writeFloat(seedK)
+            lmIn[5].writeFloat(seedV)
+        } else {
+            lmIn[4].writeFloat(k)
+            lmIn[5].writeFloat(v)
+        }
         return System.nanoTime() - start
     }
 
@@ -326,12 +353,14 @@ class PocketTtsEngine(
         val timings = LongArray(4)
         val control = NpuSliceCacheBridge.update(
             lmIn[4], lmIn[5], lmOut[0], position,
-            PocketTts.PMAX, PocketTts.G, PocketTts.HD, timings,
+            PocketTts.PMAX, PocketTts.G, PocketTts.HD,
+            usesNpuPositionMajorCache, timings,
         )
         if (config.verifyNpuSliceRows) {
             val delta = NpuSliceCacheBridge.rowMaxDifference(
                 lmIn[4], lmIn[5], lmOut[0], position,
                 PocketTts.PMAX, PocketTts.G, PocketTts.HD,
+                usesNpuPositionMajorCache,
             )
             check(delta == 0f) { "NPU slice K/V row mismatch at $position: $delta" }
         }

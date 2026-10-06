@@ -248,7 +248,7 @@ extern "C" JNIEXPORT jfloatArray JNICALL
 Java_dev_pockettts_NpuSliceCacheBridge_update(
     JNIEnv* env, jobject, jobject cache_k_obj, jobject cache_v_obj,
     jobject output_obj, jint position, jint capacity, jint groups,
-    jint head_dim, jlongArray timings) {
+    jint head_dim, jboolean position_major, jlongArray timings) {
   const auto& a = api();
   if (!a.valid()) { fail(env, "LiteRT 2.2.0 tensor buffer C ABI unavailable"); return nullptr; }
   if (!geometry(env, position, capacity, groups, head_dim)) return nullptr;
@@ -281,12 +281,19 @@ Java_dev_pockettts_NpuSliceCacheBridge_update(
   if (!control) return nullptr;
   env->SetFloatArrayRegion(control, 0, kControl, values);
   if (env->ExceptionCheck()) return nullptr;
-  for (int g = 0; g < groups; ++g) {
-    const size_t dst = (static_cast<size_t>(g) * capacity + position) * head_dim;
-    const size_t src = static_cast<size_t>(g) * head_dim;
-    std::memcpy(keys + dst, values + kControl + src, head_dim * sizeof(float));
-    std::memcpy(vals + dst, values + kControl + row_floats + src,
-                head_dim * sizeof(float));
+  if (position_major) {
+    const size_t dst = static_cast<size_t>(position) * row_floats;
+    std::memcpy(keys + dst, values + kControl, row_floats * sizeof(float));
+    std::memcpy(vals + dst, values + kControl + row_floats,
+                row_floats * sizeof(float));
+  } else {
+    for (int g = 0; g < groups; ++g) {
+      const size_t dst = (static_cast<size_t>(g) * capacity + position) * head_dim;
+      const size_t src = static_cast<size_t>(g) * head_dim;
+      std::memcpy(keys + dst, values + kControl + src, head_dim * sizeof(float));
+      std::memcpy(vals + dst, values + kControl + row_floats + src,
+                  head_dim * sizeof(float));
+    }
   }
   const int64_t t3 = now_ns();
   if (!cache_k.unmap(env, "K cache") || !cache_v.unmap(env, "V cache") ||
@@ -301,7 +308,7 @@ extern "C" JNIEXPORT jfloat JNICALL
 Java_dev_pockettts_NpuSliceCacheBridge_rowMaxDifference(
     JNIEnv* env, jobject, jobject cache_k_obj, jobject cache_v_obj,
     jobject output_obj, jint position, jint capacity, jint groups,
-    jint head_dim) {
+    jint head_dim, jboolean position_major) {
   const auto& a = api();
   if (!a.valid()) { fail(env, "LiteRT 2.2.0 tensor buffer C ABI unavailable"); return 0; }
   if (!geometry(env, position, capacity, groups, head_dim)) return 0;
@@ -324,7 +331,9 @@ Java_dev_pockettts_NpuSliceCacheBridge_rowMaxDifference(
   const auto* vals = static_cast<const float*>(cache_v.data);
   float max_delta = 0;
   for (int g = 0; g < groups; ++g) {
-    const size_t dst = (static_cast<size_t>(g) * capacity + position) * head_dim;
+    const size_t dst = position_major
+        ? (static_cast<size_t>(position) * groups + g) * head_dim
+        : (static_cast<size_t>(g) * capacity + position) * head_dim;
     const size_t src = static_cast<size_t>(g) * head_dim;
     for (int h = 0; h < head_dim; ++h) {
       max_delta = std::max(max_delta, std::abs(keys[dst + h] - values[kControl + src + h]));

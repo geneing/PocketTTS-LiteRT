@@ -70,6 +70,8 @@ class PocketTtsConfig(
     val npuResidentCache: Boolean = false,
     /** Patch one output K/V row into persistent LiteRT inputs through a native buffer lock. */
     val npuSliceCache: Boolean = false,
+    /** Use a position-major K/V graph so each native cache row write is contiguous. */
+    val npuPositionMajorCache: Boolean = false,
     /** Check every patched row against the graph output; adds synchronization overhead. */
     val verifyNpuSliceRows: Boolean = false,
 ) {
@@ -87,6 +89,9 @@ class PocketTtsConfig(
             require(lmGraph != null) { "NPU slice cache requires its AOT lmGraph override" }
             require(lmSteps == 1) { "NPU slice cache supports one LM step per invocation" }
             require(!usePrefill) { "NPU slice cache uses the one-step graph for prompt tokens" }
+        }
+        require(!npuPositionMajorCache || npuSliceCache) {
+            "position-major cache requires NPU slice cache"
         }
         require(!verifyNpuSliceRows || npuSliceCache) {
             "row verification requires NPU slice cache"

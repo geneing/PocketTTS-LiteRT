@@ -15,6 +15,7 @@ internal object NpuSliceCacheBridge {
     external fun update(
         cacheK: TensorBuffer, cacheV: TensorBuffer, stepOutput: TensorBuffer,
         position: Int, capacity: Int, groups: Int, headDim: Int,
+        positionMajor: Boolean,
         timings: LongArray,
     ): FloatArray
 
@@ -22,5 +23,6 @@ internal object NpuSliceCacheBridge {
     external fun rowMaxDifference(
         cacheK: TensorBuffer, cacheV: TensorBuffer, stepOutput: TensorBuffer,
         position: Int, capacity: Int, groups: Int, headDim: Int,
+        positionMajor: Boolean,
     ): Float
 }
