@@ -34,7 +34,10 @@ class FlowLmHarnessTest {
         val output: FloatArray,
         val tokenCount: Int,
         val loadMs: Double,
+        val inputMs: Double,
         val runMs: Double,
+        val readMs: Double,
+        val cpuThreads: Int?,
     )
 
     private data class Metrics(val corr: Double, val mad: Double, val msd: Double)
@@ -51,6 +54,13 @@ class FlowLmHarnessTest {
             ?: listOf(Accel.NPU, Accel.GPU, Accel.CPU)
         // LiteRT's dispatch setup is process-global; initialize an NPU graph first.
         val backends = (requested.filter { it == Accel.NPU } + requested.filter { it != Accel.NPU }).distinct()
+        val cpuThreads = args.getString("cpuThreads")?.trim()?.takeIf { it.isNotEmpty() }?.let { value ->
+            value.toIntOrNull()?.also { require(it > 0) { "cpuThreads must be positive" } }
+                ?: throw IllegalArgumentException("invalid cpuThreads: $value")
+        }
+        require(cpuThreads == null || Accel.CPU in backends) {
+            "cpuThreads requires CPU in the backends argument"
+        }
         val tokenizer = SpTokenizer(File(modelDir, PocketTts.TOKENIZER))
         val tokenIds = tokenizer.encode(text)
         require(tokenIds.isNotEmpty()) { "text encoded to no tokens" }
@@ -76,6 +86,7 @@ class FlowLmHarnessTest {
         lines += "graph=$baseGraph"
         lines += "tokens=${tokenIds.size} ids=${tokenIds.joinToString(",")}"
         lines += "output=one fused output vector per prompt token; zero noise; voice KV prefix=${voiceState.length} tokens"
+        lines += "candidateCpuThreads=${cpuThreads ?: "LiteRT default"}; referenceCpuThreads=LiteRT default"
 
         val environment = if (Accel.NPU in backends) {
             runCatching {
@@ -90,7 +101,10 @@ class FlowLmHarnessTest {
             for (backend in backends) {
                 val graph = if (backend == Accel.NPU) PocketTts.g5Variant(baseGraph) else baseGraph
                 val result = try {
-                    runPrompt(backend, graph, tokenIds, embed, voiceState, environment)
+                    runPrompt(
+                        backend, graph, tokenIds, embed, voiceState, environment,
+                        cpuThreads = cpuThreads.takeIf { backend == Accel.CPU },
+                    )
                 } catch (t: Throwable) {
                     lines += "$backend FAILED: ${t.message ?: t::class.java.simpleName}"
                     Log.e(TAG, "backend=$backend graph=$graph failed", t)
@@ -107,8 +121,8 @@ class FlowLmHarnessTest {
             writeFloats(File(runDir, "cpu-reference.f32le"), reference.output)
             lines += String.format(
                 Locale.US,
-                "CPU reference: graph=%s load=%.2f ms run=%.2f ms values=%d saved=cpu-reference.f32le",
-                reference.graph, reference.loadMs, reference.runMs, reference.output.size,
+                "CPU reference: graph=%s load=%.2f ms input=%.2f ms run=%.2f ms read=%.2f ms values=%d saved=cpu-reference.f32le",
+                reference.graph, reference.loadMs, reference.inputMs, reference.runMs, reference.readMs, reference.output.size,
             )
             for ((backend, result) in candidates) {
                 val file = "${backend.name.lowercase(Locale.ROOT)}-candidate.f32le"
@@ -117,8 +131,9 @@ class FlowLmHarnessTest {
                     val m = metrics(reference.output, result.output)
                     lines += String.format(
                         Locale.US,
-                        "%s candidate: graph=%s load=%.2f ms run=%.2f ms corr=%.8f mean_abs_diff=%.8g mean_square_diff=%.8g saved=%s",
-                        backend, result.graph, result.loadMs, result.runMs, m.corr, m.mad, m.msd, file,
+                        "%s candidate: graph=%s cpuThreads=%s load=%.2f ms input=%.2f ms run=%.2f ms read=%.2f ms corr=%.8f mean_abs_diff=%.8g mean_square_diff=%.8g saved=%s",
+                        backend, result.graph, result.cpuThreads?.toString() ?: "LiteRT-default",
+                        result.loadMs, result.inputMs, result.runMs, result.readMs, m.corr, m.mad, m.msd, file,
                     )
                 } catch (t: Throwable) {
                     lines += "$backend candidate comparison failed: ${t.message}; output saved=$file"
@@ -143,6 +158,7 @@ class FlowLmHarnessTest {
         embedBytes: ByteArray,
         voice: VoiceState,
         environment: Environment?,
+        cpuThreads: Int? = null,
     ): Run {
         check(backend != Accel.NPU || environment != null) { "NPU environment is unavailable" }
         val path = File(modelDir, graph)
@@ -153,6 +169,9 @@ class FlowLmHarnessTest {
             Accel.NPU -> Accelerator.NPU
         }
         val options = CompiledModel.Options(accelerator)
+        if (backend == Accel.CPU && cpuThreads != null) {
+            options.cpuOptions = CompiledModel.CpuOptions(numThreads = cpuThreads)
+        }
         if (backend == Accel.GPU32) {
             options.gpuOptions = CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
         }
@@ -180,7 +199,9 @@ class FlowLmHarnessTest {
                 val outputPerToken = 1 + PocketTts.LDIM + 2 * PocketTts.G * PocketTts.HD
                 val all = FloatArray(tokenIds.size * outputPerToken)
                 var outputOffset = 0
+                var inputElapsed = 0L
                 var elapsed = 0L
+                var readElapsed = 0L
                 for (id in tokenIds) {
                     val embedding = FloatArray(PocketTts.H)
                     var offset = id * PocketTts.H * Short.SIZE_BYTES
@@ -189,6 +210,7 @@ class FlowLmHarnessTest {
                         offset += Short.SIZE_BYTES
                     }
                     rope(pos, cosine, sine)
+                    val inputStarted = System.nanoTime()
                     input[0].writeFloat(embedding)
                     input[1].writeFloat(cosine)
                     input[2].writeFloat(sine)
@@ -196,10 +218,13 @@ class FlowLmHarnessTest {
                     input[4].writeFloat(pk)
                     input[5].writeFloat(pv)
                     input[6].writeFloat(zeroNoise)
+                    inputElapsed += System.nanoTime() - inputStarted
                     val started = System.nanoTime()
                     if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
                     elapsed += System.nanoTime() - started
+                    val readStarted = System.nanoTime()
                     val values = output.single().readFloat()
+                    readElapsed += System.nanoTime() - readStarted
                     check(values.size == outputPerToken) {
                         "FlowLM output width changed: expected $outputPerToken, got ${values.size}"
                     }
@@ -216,7 +241,10 @@ class FlowLmHarnessTest {
                     for (h in 0 until PocketTts.NH) mask[h * (PocketTts.PMAX + 1) + pos] = 0f
                     pos++
                 }
-                return Run(backend, graph, all, tokenIds.size, loadMs, elapsed / 1e6)
+                return Run(
+                    backend, graph, all, tokenIds.size, loadMs,
+                    inputElapsed / 1e6, elapsed / 1e6, readElapsed / 1e6, cpuThreads,
+                )
             } finally {
                 input.forEach { it.close() }
                 output.forEach { it.close() }

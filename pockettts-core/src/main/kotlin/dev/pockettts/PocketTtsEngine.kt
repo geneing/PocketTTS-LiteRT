@@ -65,6 +65,13 @@ class PocketTtsEngine(
         return env
     }
 
+    private fun cpuOptions(key: String): CompiledModel.Options =
+        CompiledModel.Options(Accelerator.CPU).apply {
+            if (key == "lm" || key == "lm_ms") {
+                config.lmCpuThreads?.let { cpuOptions = CompiledModel.CpuOptions(numThreads = it) }
+            }
+        }
+
     private fun load(name: String, key: String, accel: Accel): CompiledModel {
         val file = if (accel == Accel.NPU) PocketTts.g5Variant(name) else name
         val p = models.store.file(file).absolutePath
@@ -72,7 +79,7 @@ class PocketTtsEngine(
         var actualAccel = accel
         val model = try {
             when (accel) {
-                Accel.CPU -> CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null)
+                Accel.CPU -> CompiledModel.create(p, cpuOptions(key), null)
                 Accel.GPU, Accel.GPU32 -> {
                     val opts = CompiledModel.Options(Accelerator.GPU)
                     val gpu = if (accel == Accel.GPU32) {
@@ -103,7 +110,7 @@ class PocketTtsEngine(
                 "$key graph $name failed to load on $accel; retrying on CPU",
                 e,
             )
-            CompiledModel.create(p, CompiledModel.Options(Accelerator.CPU), null)
+            CompiledModel.create(p, cpuOptions(key), null)
         }
         loadMs[key] = (System.nanoTime() - t) / 1_000_000
         loadedAccelerators[key] = actualAccel

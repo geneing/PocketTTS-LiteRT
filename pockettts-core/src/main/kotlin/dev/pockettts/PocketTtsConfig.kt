@@ -60,9 +60,15 @@ class PocketTtsConfig(
     val voices: List<Voice> = defaultVoices(models),
     /** Override the streaming SEANet graph filename; null selects [PocketTts.deconlyGraph]. */
     val streamDecoderGraph: String? = null,
+    /**
+     * Optional LiteRT CPU/XNNPACK thread count for Flow-LM graphs. Null keeps
+     * LiteRT's runtime default, including the shipped dynamic-int8 baseline.
+     */
+    val lmCpuThreads: Int? = null,
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }
+        require(lmCpuThreads == null || lmCpuThreads > 0) { "lmCpuThreads must be positive" }
     }
 
     companion object {

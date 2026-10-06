@@ -6,7 +6,9 @@ import android.media.AudioManager
 import android.media.AudioTrack
 import android.os.BatteryManager
 import android.os.Build
+import android.os.Debug
 import android.os.OutcomeReceiver
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.health.SystemHealthManager
 import android.os.PowerMonitor
@@ -20,6 +22,7 @@ import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsConfig
 import dev.pockettts.PocketTtsEngine
 import dev.pockettts.PocketTtsModels
+import dev.pockettts.SpTokenizer
 import dev.pockettts.TtsResult
 import dev.pockettts.Wav
 import org.junit.Assert.assertEquals
@@ -28,6 +31,7 @@ import org.junit.Assume.assumeTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.security.MessageDigest
 import java.util.Locale
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -70,6 +74,16 @@ class PowerBenchmarkTest {
         lmGraph = PocketTts.LM,
         lmSteps = 1,
     )
+
+    @Test
+    fun flowLmCpuThreadsPower() {
+        val args = InstrumentationRegistry.getArguments()
+        val cpuThreads = args.getString("flowLmCpuThreads")?.toIntOrNull()
+        assumeTrue("pass -e flowLmCpuThreads=<positive count>", cpuThreads != null && cpuThreads > 0)
+        val text = args.getString("flowLmText")?.trim()?.takeIf { it.isNotEmpty() } ?: PARAGRAPH
+        val voice = args.getString("flowLmVoice")?.trim()?.takeIf { it.isNotEmpty() } ?: "alba"
+        runFlowLmCpuThreadsPowerBenchmark(cpuThreads!!, text, voice)
+    }
 
     @Test
     fun longParagraphFlowLmNpuFp16NoTruncationPower() = runFlowLmNpuPowerBenchmark()
@@ -379,6 +393,206 @@ class PowerBenchmarkTest {
         } finally {
             if (!referenceEngineClosed) referenceEngine.close()
         }
+    }
+
+    /**
+     * Compare the shipped CPU dynamic-int8 graph at LiteRT's default thread
+     * count with an opt-in XNNPACK thread count. Runs A/B and then B/A, with a
+     * fresh engine for each sample so graph, placement, seed, and decoder policy
+     * stay explicit and identical across the pair.
+     */
+    private fun runFlowLmCpuThreadsPowerBenchmark(cpuThreads: Int, text: String, voice: String) {
+        assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
+
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val health = requireNotNull(context.getSystemService(SystemHealthManager::class.java))
+        val monitors = supportedMonitors(health)
+        assumeTrue("device does not expose power monitors", monitors.isNotEmpty())
+        val relevant = monitors.filter { monitor ->
+            val name = monitor.name.lowercase(Locale.ROOT)
+            name.contains("cpu") || name.contains("gpu") || name.contains("tpu")
+        }
+        assertTrue("no CPU/GPU/TPU energy monitors: ${monitors.map { it.name }}", relevant.isNotEmpty())
+
+        val dir = context.getExternalFilesDir(null) ?: context.filesDir
+        val models = PocketTtsModels.default(context)
+        val defaultPlacement = Placement.default(context, dir)
+        assumeTrue(
+            "CPU thread comparison requires default CPU LM placement; detected ${defaultPlacement.label}",
+            defaultPlacement.lm == Accel.CPU,
+        )
+        assumeTrue("missing dynamic-int8 reference graph: ${PocketTts.LM}", models.store.exists(PocketTts.LM))
+        val graphFile = models.store.file(PocketTts.LM)
+        val graphSha256 = sha256(graphFile)
+        val tokenCount = SpTokenizer(File(dir, PocketTts.TOKENIZER)).encode(text).size
+        require(tokenCount > 0) { "benchmark text encoded to no tokens" }
+        val seed = FLOW_LM_SEED
+        val powerManager = context.getSystemService(PowerManager::class.java)
+        val sampleDir = context.getExternalFilesDir("power-benchmark")
+            ?: File(context.filesDir, "power-benchmark")
+
+        Log.i(
+            TAG,
+            "CPU thread test device=${Build.MODEL}/${Build.DEVICE} fingerprint=${Build.FINGERPRINT} " +
+                "sdk=${Build.VERSION.SDK_INT} LiteRT=2.2.0 dispatch=unused(CPU) " +
+                "graph=${PocketTts.LM} graphSha256=$graphSha256 placement=${defaultPlacement.label} " +
+                "seed=$seed voice=$voice promptTokens=$tokenCount textChars=${text.length} " +
+                "energy=CPU+GPU+TPU PowerMonitor synthesize+play minus duration-scaled PCM-only playback",
+        )
+
+        data class ThreadRun(
+            val label: String,
+            val cpuThreads: Int?,
+            val loadMs: Long,
+            val allGraphLoadMs: Map<String, Long>,
+            val graphBytes: Long,
+            val warmupMs: Long,
+            val firstAudioMs: Double,
+            val speedTake: TtsResult,
+            val audioOnly: Measurement,
+            val full: MeasurementWithResult,
+            val repeatCorr: Double,
+            val pssBeforeKb: Long,
+            val pssLoadedKb: Long,
+            val pssAfterKb: Long,
+            val thermalStart: Int,
+            val thermalEnd: Int,
+        )
+
+        fun runVariant(label: String, threads: Int?): ThreadRun {
+            val thermalStart = powerManager?.currentThermalStatus ?: -1
+            val pssBefore = Debug.getPss()
+            val engine = PocketTtsEngine(
+                context,
+                PocketTtsConfig(
+                    models = models,
+                    placement = defaultPlacement,
+                    lmGraph = PocketTts.LM,
+                    lmSteps = 1,
+                    noiseSeed = seed,
+                    lmCpuThreads = threads,
+                ),
+            )
+            try {
+                assertEquals("Flow-LM must run on CPU", Accel.CPU, engine.runtimeAccelerators["lm"])
+                val loadMs = engine.loadMs["lm"] ?: error("missing LM load timing")
+                val allGraphLoadMs = engine.loadMs.toMap()
+                val pssLoaded = Debug.getPss()
+                val warmup = engine.stream("A short warmup sentence.", voice) {}
+                assertTrue("$label warmup produced no audio", warmup.audio.isNotEmpty())
+
+                var firstChunkAtNs = 0L
+                val started = System.nanoTime()
+                val speedTake = engine.stream(text, voice) {
+                    if (firstChunkAtNs == 0L) firstChunkAtNs = System.nanoTime()
+                }
+                assertTrue("$label produced no audio", speedTake.audio.isNotEmpty())
+                assertTrue("$label emitted no first audio chunk", firstChunkAtNs != 0L)
+                val firstAudioMs = (firstChunkAtNs - started) / 1e6
+
+                val audioOnly = measurePlayback(health, relevant, speedTake.audio)
+                val full = measureSynthesisPlayback(health, relevant, engine)
+                val repeatCorr = AudioQuality.compare(speedTake.audio, full.result.audio).corr
+                assertTrue(
+                    "$label same-config repeat correlation: $repeatCorr",
+                    repeatCorr >= MIN_REPEAT_CORRELATION,
+                )
+                val file = "flowlm-cpu-threads-$label.wav"
+                saveSample(sampleDir, file, full.result.audio)
+                return ThreadRun(
+                    label = label,
+                    cpuThreads = threads,
+                    loadMs = loadMs,
+                    allGraphLoadMs = allGraphLoadMs,
+                    graphBytes = graphFile.length(),
+                    warmupMs = warmup.ms,
+                    firstAudioMs = firstAudioMs,
+                    speedTake = speedTake,
+                    audioOnly = audioOnly,
+                    full = full,
+                    repeatCorr = repeatCorr,
+                    pssBeforeKb = pssBefore,
+                    pssLoadedKb = pssLoaded,
+                    pssAfterKb = Debug.getPss(),
+                    thermalStart = thermalStart,
+                    thermalEnd = powerManager?.currentThermalStatus ?: -1,
+                )
+            } finally {
+                engine.close()
+            }
+        }
+
+        fun report(sample: ThreadRun) {
+            val incremental = incrementalEnergy(sample.audioOnly, sample.full)
+            val joules = incremental.values.sum()
+            val audioSeconds = sample.full.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE
+            val rtf = audioSeconds / (sample.speedTake.ms.coerceAtLeast(1) / 1000.0)
+            Log.i(
+                TAG,
+                "threadSample=${sample.label} requestedThreads=${sample.cpuThreads ?: "LiteRT-default"} " +
+                    "graph=${PocketTts.LM} placement=${defaultPlacement.label} seed=$seed voice=$voice " +
+                    "promptTokens=$tokenCount graphBytes=${sample.graphBytes} lmLoadMs=${sample.loadMs} " +
+                    "allGraphLoadMs=${sample.allGraphLoadMs} warmupMs=${sample.warmupMs} " +
+                    "firstAudioMs=${fmt(sample.firstAudioMs)} inferenceMs=${sample.speedTake.ms} " +
+                    "audioSeconds=${fmt(audioSeconds)} rtf=${fmt(rtf)} frames=${sample.full.result.frames} " +
+                    "repeatCorr=${fmt(sample.repeatCorr)} pssKb=${sample.pssBeforeKb}/${sample.pssLoadedKb}/${sample.pssAfterKb} " +
+                    "thermalStatus=${sample.thermalStart}->${sample.thermalEnd}",
+            )
+            logFlowLmStages(sample.label, sample.full.result, sample.full.elapsedMs)
+            logEnergy("${sample.label} audio-only", sample.audioOnly.deltaJoules)
+            logEnergy("${sample.label} synthesize+play", sample.full.deltaJoules)
+            logEnergy("${sample.label} incremental CPU/GPU/TPU model estimate", incremental)
+            Log.i(
+                TAG,
+                "${sample.label} incrementalTotalJ=${fmt(joules)} " +
+                    "incrementalJPerAudioSecond=${fmt(joules / audioSeconds.coerceAtLeast(0.001))} " +
+                    "fullWallMs=${sample.full.elapsedMs} audioOnlyMs=${sample.audioOnly.elapsedMs}",
+            )
+        }
+
+        val defaultAB = runVariant("ab-default", null)
+        val threadedAB = runVariant("ab-threads-$cpuThreads", cpuThreads)
+        val threadedBA = runVariant("ba-threads-$cpuThreads", cpuThreads)
+        val defaultBA = runVariant("ba-default", null)
+        listOf(defaultAB, threadedAB, threadedBA, defaultBA).forEach(::report)
+
+        val qualityAB = AudioQuality.compare(defaultAB.full.result.audio, threadedAB.full.result.audio)
+        val qualityBA = AudioQuality.compare(defaultBA.full.result.audio, threadedBA.full.result.audio)
+        Log.i(
+            TAG,
+            "CPU thread paired diagnostic order=default->threads then threads->default " +
+                "graph=${PocketTts.LM} placement=${defaultPlacement.label} seed=$seed " +
+                "ABcorr=${fmt(qualityAB.corr)} ABsamples=${defaultAB.full.result.audio.size}/${threadedAB.full.result.audio.size} " +
+                "BAcorr=${fmt(qualityBA.corr)} BAsamples=${defaultBA.full.result.audio.size}/${threadedBA.full.result.audio.size} " +
+                "threadFirstAudioP50P95=${percentiles(listOf(threadedAB.firstAudioMs, threadedBA.firstAudioMs))} " +
+                "defaultFirstAudioP50P95=${percentiles(listOf(defaultAB.firstAudioMs, defaultBA.firstAudioMs))}",
+        )
+    }
+
+    private fun percentiles(values: List<Double>): String {
+        val sorted = values.sorted()
+        require(sorted.isNotEmpty())
+        fun at(p: Double): Double {
+            val position = (sorted.size - 1) * p
+            val lower = position.toInt()
+            val upper = kotlin.math.ceil(position).toInt()
+            val fraction = position - lower
+            return sorted[lower] + (sorted[upper] - sorted[lower]) * fraction
+        }
+        return "${fmt(at(0.50))}/${fmt(at(0.95))}ms"
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(1 shl 20)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private fun logFlowLmStages(label: String, result: TtsResult, playbackElapsedMs: Long) {
