@@ -65,7 +65,7 @@ latency gate:
 
 | AOT candidate | Frames, NPU / CPU | End-to-end, NPU / CPU | Run stage, NPU / CPU | First audio, NPU / CPU |
 |---|---:|---:|---:|---:|
-| Group-major dynamic INT8 `no_truncation` | 753 / 759 | 52.38 / 24.76 s (`2.11×`) | not recorded here | not recorded here |
+| Group-major dynamic INT8 `no_truncation` | 753 / 759 | 52.380 / 24.764 s (`2.11×`) | 36.345 / 14.962 s (`2.43×`) | 2.901 / 1.143 s (`2.54×`) |
 | Position-major dynamic INT8 `half` | 753 / 759 | 53.008 / 24.933 s (`2.13×`) | 37.099 / 14.951 s (`2.48×`) | 2.883 / 1.105 s (`2.61×`) |
 
 No reverse pair was run after the group-major failure. These are forward
@@ -74,6 +74,16 @@ unlikely to be explained by different generation lengths. The position-major
 layout and `half` truncation did not restore a latency advantage over CPU INT8
 in this protocol. The position-major output quality has not been independently
 established by this timing result.
+
+The stage timings identify where the measured gap occurs: each NPU LM
+`CompiledModel.run()` total was 36.3-37.1 s, versus about 15.0 s for the CPU
+int8 graph. In the same runs, NPU host input transfer was 0.99-1.21 s versus
+2.43-2.45 s on CPU; the cache-row patch was 1.91-2.28 s, and packed-output
+readback 2.50-2.87 s. So cache input transfer is not the source of the INT8
+slowdown; graph execution dominates. All graph ops were compiled into one
+opaque G5 dispatch partition. Without vendor dispatch profiling, these results
+do not isolate whether the internal cost comes from INT8 weight handling,
+kernel selection, or another compiler/runtime choice.
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|

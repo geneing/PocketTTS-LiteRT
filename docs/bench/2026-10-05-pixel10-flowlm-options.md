@@ -149,9 +149,13 @@ run on the same long Alba workload. The group-major graph used `no_truncation`;
 the position-major graph used `half` truncation. Both completed in one G5
 partition but took about 2.1x as long as CPU int8 and stopped six frames short
 of the CPU output. The position-major INT8 graph did not preserve the FP16
-position-major speed result. See the [candidate report](2026-10-06-flow-g5-int8-candidate.md)
-for host quality checks, exact artifact hashes, and AOT details. Neither
-candidate is enabled by the production path.
+position-major speed result. The NPU LM graph-run stage itself took 36.3-37.1 s
+versus about 15.0 s on CPU, while host cache input took 0.99-1.21 s on NPU
+versus 2.43-2.45 s on CPU. The compiled dispatch is opaque, so the precise
+inside-kernel cause is not established; the measured slowdown is in graph
+execution, not host cache input. See the [candidate report](2026-10-06-flow-g5-int8-candidate.md)
+for stage metrics, host quality checks, exact artifact hashes, and AOT details.
+Neither candidate is enabled by the production path.
 
 ### How other runtimes manage KV state
 
