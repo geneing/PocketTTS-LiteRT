@@ -71,6 +71,7 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 9. G5 static INT8 | `codex/flowlm-g5-static-int8` | Calibrated W8/A8 NPU recipe with float external tensors | Host quality failed at step 0 (latent corr 0.0105, EOS delta 6.465); 32-step minimum corr -0.1744. Stopped before AOT or Pixel test; see [candidate report](2026-10-06-flow-g5-static-int8-candidate.md) |
 | 10. G5 `HIGH_PERFORMANCE` runtime mode | `codex/flowlm-g5-high-performance` | Native LiteRT C opaque `google_tensor` option, `performance_mode=3`; harness-only opt-in | Two long Alba pairs averaged 29.827 / 25.052 s NPU/CPU (`1.191x`), all 759 frames; mean first audio 1.524 / 1.137 s. Improves NPU time 8.7% over option 7 position-major FP16, but still misses parity; see [candidate report](2026-10-06-g5-high-performance.md) |
 | 11. G5 FP16 `half` truncation | `codex/flowlm-g5-half-truncation` | Existing position-major FP16 graph compiled with AOT `--truncation half` | Host/AOT only: 717/717 ops in one G5 partition; 33.3 s compile, same 172.4 MB size as no-truncation but different SHA. Pixel latency/quality pending |
+| 12. G5 static W8/A16 | `codex/flowlm-g5-static-w8a16` | Calibrated AEQ W8/A16; all-op and FC-only variants preserve float32 I/O | Host parity failed: all-op first-step latent corr -0.074; FC-only 0.950 at step 0 but minimum 0.011 by step 32. Stopped before AOT/Pixel; see [candidate report](2026-10-06-flow-g5-static-w8a16-candidate.md) |
 
 ### Option 6: CPU thread tuning
 
@@ -208,6 +209,17 @@ different checksum, `fb66bc91257207b809a4aab4a77e33168cd105cd4ee266405798a4937cc
 No compiled-program parity or device timing has been collected yet. The
 [candidate report](2026-10-06-flow-g5-fp16-half-truncation-candidate.md) records
 the source and artifact checksums and AOT limits.
+
+### Option 12: calibrated static W8/A16
+
+Two AEQ 0.8.0 candidates preserved the Android float32 tensor interface: one
+quantized all supported operations, and the other quantized fully connected
+operations only. The all-op graph failed on step zero (latent correlation
+-0.0736, EOS delta 6.485); FC-only began at 0.9497 correlation but drifted to a
+32-step minimum of 0.0106, with EOS delta up to 5.98. Neither passed host
+parity, so neither was AOT compiled or run on the Pixel. The exact tensor counts,
+calibration setup, checksums, and step traces are in the [W8/A16 candidate
+report](2026-10-06-flow-g5-static-w8a16-candidate.md).
 
 ### How other runtimes manage KV state
 

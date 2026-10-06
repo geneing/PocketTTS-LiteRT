@@ -152,3 +152,10 @@ Its four-step eager-fp32 latent correlations were `-0.0565`, `-0.0992`,
 and maximum K/V difference `5.900`. EOS logit differences ranged from `6.37`
 to `10.42`. This candidate fails the host quality proxy as well as the Android
 cache interface. No G5 AOT compile of the static graph is warranted.
+
+A follow-up on branch `codex/flowlm-g5-static-w8a16` explicitly disabled
+quantization for INPUT/OUTPUT, preserving the app's float32 interface. Its
+all-supported-ops variant still failed at step zero (latent correlation
+-0.0736); an FC-only variant began at 0.9497 but fell to 0.0106 minimum over
+32 autoregressive steps. Neither passed the host parity gate, so neither was
+AOT compiled. See the [float-interface W8/A16 report](2026-10-06-flow-g5-static-w8a16-candidate.md).
