@@ -70,7 +70,7 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 8. G5 dynamic INT8 | `codex/flowlm-g5-int8` | W8/float-activation candidates; group-major `no_truncation` and position-major `half` | Long Alba group-major pairs averaged 52.224/25.021 s NPU/CPU (2.09x); position-major averaged 53.074/25.206 s (2.11x). Both emitted 753/759 frames in both orders. Fails speed and completion; see [candidate report](2026-10-06-flow-g5-int8-candidate.md) |
 | 9. G5 static INT8 | `codex/flowlm-g5-static-int8` | Calibrated W8/A8 NPU recipe with float external tensors | Host quality failed at step 0 (latent corr 0.0105, EOS delta 6.465); 32-step minimum corr -0.1744. Stopped before AOT or Pixel test; see [candidate report](2026-10-06-flow-g5-static-int8-candidate.md) |
 | 10. G5 `HIGH_PERFORMANCE` runtime mode | `codex/flowlm-g5-high-performance` | Native LiteRT C opaque `google_tensor` option, `performance_mode=3`; harness-only opt-in | Two long Alba pairs averaged 29.827 / 25.052 s NPU/CPU (`1.191x`), all 759 frames; mean first audio 1.524 / 1.137 s. Improves NPU time 8.7% over option 7 position-major FP16, but still misses parity; see [candidate report](2026-10-06-g5-high-performance.md) |
-| 11. G5 FP16 `half` truncation | `codex/flowlm-g5-half-truncation` | Existing position-major FP16 graph compiled with AOT `--truncation half` | Host/AOT only: 717/717 ops in one G5 partition; 33.3 s compile, same 172.4 MB size as no-truncation but different SHA. Pixel latency/quality pending |
+| 11. G5 FP16 `half` truncation | `codex/flowlm-g5-half-truncation` | Existing position-major FP16 graph compiled with AOT `--truncation half` | Two long Alba pairs averaged 32.066 / 24.782 s NPU/CPU (`1.294x`); both emitted only 750/759 frames. Similar to default FP16 NPU speed and fails completion; see [candidate report](2026-10-06-flow-g5-fp16-half-truncation-candidate.md) |
 | 12. G5 static W8/A16 | `codex/flowlm-g5-static-w8a16` | Calibrated AEQ W8/A16; all-op, FC-only, and selective FFN variants preserve float32 I/O | All-op/FC-only variants failed host parity. Selective FFN12 reached first-step corr 0.9998 and 32-step min 0.670; G5 AOT compiled 694/694 ops in one partition. Pixel speed/speech acceptance pending; see [initial report](2026-10-06-flow-g5-static-w8a16-candidate.md) and [selective/AOT report](2026-10-06-flow-g5-selective-w8a16-candidate.md) |
 | 13. G5 dynamic INT8 + `HIGH_PERFORMANCE` | `codex/flowlm-g5-high-performance` | Existing position-major W8/float AOT artifact with native `performance_mode=3` | Two long Alba pairs averaged 51.919 / 24.793 s NPU/CPU (`2.094x`), 753/759 frames. About 2% faster than default-mode INT8, still fails speed and completion; details in [runtime report](2026-10-06-g5-high-performance.md) |
 
@@ -208,11 +208,15 @@ of 759 frames; this improved the default INT8 NPU timing by only about 2%.
 
 The existing position-major FP16 source was compiled with `--truncation half`.
 The compiler completed in 33.3 s with 717/717 ops in one G5 partition. The
-artifact is 172,399,184 bytes (the same size as `no_truncation`) but has a
-different checksum, `fb66bc91257207b809a4aab4a77e33168cd105cd4ee266405798a4937ccfdfac`.
-No compiled-program parity or device timing has been collected yet. The
-[candidate report](2026-10-06-flow-g5-fp16-half-truncation-candidate.md) records
-the source and artifact checksums and AOT limits.
+172,399,184-byte artifact has checksum
+`fb66bc91257207b809a4aab4a77e33168cd105cd4ee266405798a4937ccfdfac`. Two
+long Alba pairs in opposite orders averaged 32.066 s NPU versus 24.782 s CPU
+(1.294x); both NPU arms emitted 750 of 759 frames. First audio averaged 1.657
+versus 1.136 s. The row patch was 1.83-1.84 s, thermal status was 0, and the
+free-running waveform correlation was 0.2216 (diagnostic only). It did not
+improve materially on default FP16 NPU timing and failed the output-completion
+gate. See the [candidate report](2026-10-06-flow-g5-fp16-half-truncation-candidate.md)
+for the paired timings, stage metrics, report paths and hashes.
 
 ### Option 12: calibrated static W8/A16
 
