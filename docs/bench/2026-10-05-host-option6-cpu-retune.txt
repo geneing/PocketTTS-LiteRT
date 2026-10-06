@@ -1,0 +1,61 @@
+FlowLM Pixel 10 option 6: host gate and device measurement plan
+Date: 2026-10-05
+Branch: codex/flowlm-option-6-cpu-retune
+Status: implementation and host validation complete; Pixel 10 measurements pending.
+
+Control
+  Graph: pt_flowlm_fused_dyn8_all.tflite (shipped CPU dynamic int8)
+  SHA-256: 895cd59e4c8256000e9bd3855e6b6f87f00e3ad9a2b093cbe70df018370a10f9
+  Size: 87,504,288 bytes in the local scripts/out baseline.
+  Placement: production default; FlowLM CPU, Mimi decoder as resolved by Placement.default.
+  Runtime: Android LiteRT 2.2.0; CPU dispatch unused. Device fingerprint must be
+  captured by the instrumentation logs, as no Pixel run has occurred on this branch.
+
+Thread-count candidate
+  PocketTtsConfig.lmCpuThreads configures the FlowLM CompiledModel CPU options
+  alone. Null retains the LiteRT default. This is opt-in and leaves production
+  settings unchanged.
+  FlowLmHarnessTest.compareCpuThreadsPromptPaired runs A/B/B/A with a fresh
+  model for each arm and records graph load, input/KV copy, compute, readback,
+  first run, warm run per token, total prompt, graph checksum, device fingerprint,
+  and paired output differences. Use promptTokens 4, 33, and near with alba and
+  marius; near means PMAX - voiceLength - 1. Repeated source token IDs isolate
+  prompt length from tokenizer differences. This is a prompt-only diagnostic.
+  PowerBenchmarkTest.flowLmCpuThreadsPower runs a separate A/B/B/A full-pipeline
+  experiment on the same graph and default decoder placement, seed 42. It
+  records per-arm load, first audio, inference wall time, RTF, graph bytes,
+  process PSS and cumulative RSS high water, thermal status, and PCM. Energy is
+  the sum of CPU/GPU/TPU Android PowerMonitor deltas during synthesize+play,
+  minus a duration-scaled PCM-only playback interval. It logs total incremental
+  joules, joules per audio second, p50/p95 (n=2 per arm), and speed drift.
+  flowLmText and flowLmVoice arguments apply to both synthesis and repeat
+  measurement. Test short, medium, and compiled-in long PARAGRAPH text with two
+  voices and 2/4/6 thread candidates. One instrumentation method per run.
+  Listen to saved WAVs and confirm complete text before accepting any setting.
+
+Selective fp32 EOS candidate: stopped at host gate
+  Export controls: PT_EOS_FP32=1, PT_FUSED_FP16=0, PT_QUANT=dyn8_all.
+  Candidate: pt_flowlm_fused_dyn8_all_eosfp32.tflite
+  SHA-256: 4dcb6e40520df422face7929828a68d4ade19d0696b2b0da3711e4e5da4897d9
+  Size: 87,507,760 bytes.
+  WSL2 exporter: Python 3.10, torch 2.12.1+cpu, litert-torch 0.9.3,
+  ai-edge-litert 2.1.6, ai-edge-quantizer 0.8.0; pinned pocket-tts 001cf6e.
+  The fp32 export wrote the graph and passed op metadata validation, but the
+  fp32 interpreter parity check exhausted a 10 GB virtual-memory cap.
+  The subsequent dynamic-int8 quantization succeeded. It reported first-step
+  EOS max absolute difference 0.560 versus the eager fp32 reference, latent
+  corr 0.999813, K corr 0.999912, V corr 0.999164. These are diagnostic
+  measurements, not evidence of better speech or a selective precision change.
+  Structural comparison to the shipped baseline: both have 7,147 operators
+  with identical types and connectivity; both have 7,264 tensors with matching
+  dtype/shape; all readable constant tensor buffers compare exactly equal.
+  Their file size/hash differences therefore do not establish a different
+  executable graph. The requested selective fp32 EOS projection was folded
+  into the same quantized computation. Do not spend Pixel time on this candidate.
+
+Host validation
+  .\gradlew :app:compileDebugAndroidTestKotlin --offline --quiet : PASS.
+  No adb, installation, or Pixel instrumentation was run by this agent.
+  Device acceptance remains open for the thread-count candidate. A win requires
+  improved paired full-pipeline time or joules without truncation or audible
+  degradation, under the same decoder placement and workload.

@@ -170,7 +170,13 @@ class FlowLmHarnessTest {
         val voice = readVoice(File(modelDir, PocketTts.voiceFile(voiceName)))
         val sourceIds = SpTokenizer(File(modelDir, PocketTts.TOKENIZER)).encode(text)
         require(sourceIds.isNotEmpty()) { "text encoded to no tokens" }
-        val wantedTokens = args.getString("promptTokens")?.toIntOrNull() ?: sourceIds.size
+        val tokenArg = args.getString("promptTokens")?.trim()
+        val wantedTokens = when (tokenArg) {
+            null, "" -> sourceIds.size
+            "near" -> PocketTts.PMAX - voice.length - 1
+            else -> tokenArg.toIntOrNull()
+                ?: error("promptTokens must be a positive count or near: $tokenArg")
+        }
         require(wantedTokens > 0 && voice.length + wantedTokens < PocketTts.PMAX) {
             "promptTokens=$wantedTokens exceeds capacity after voice length ${voice.length}"
         }
