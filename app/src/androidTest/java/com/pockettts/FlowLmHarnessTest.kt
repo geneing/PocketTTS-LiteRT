@@ -10,6 +10,8 @@ import com.google.ai.edge.litert.Environment
 import dev.pockettts.Accel
 import dev.pockettts.PocketTts
 import dev.pockettts.SpTokenizer
+import org.junit.Assert.assertArrayEquals
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -19,6 +21,8 @@ import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import kotlin.math.ceil
+import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
 /** Text-driven FlowLM probe. Invoke with instrumentation args; outputs land in files/flowlm-harness. */
@@ -31,19 +35,62 @@ class FlowLmHarnessTest {
     private data class Run(
         val backend: Accel,
         val graph: String,
+        val capacity: Int,
+        val kvPrecision: KvPrecision,
         val output: FloatArray,
         val tokenCount: Int,
         val loadMs: Double,
+        val stageMs: Double,
         val runMs: Double,
+        val readMs: Double,
+        val kvTransformMs: Double,
+        val kvInputBytes: Long,
     )
 
     private data class Metrics(val corr: Double, val mad: Double, val msd: Double)
+    private enum class KvPrecision { FP32, FP16, INT8_PER_HEAD }
+
+    @Test
+    fun capacityPlannerAndVoicePrefixRepackingAreExact() {
+        assertEquals(128, PocketTts.smallestFlowLmCapacity(127, 0, 0))
+        assertEquals(256, PocketTts.smallestFlowLmCapacity(128, 0, 0))
+        assertEquals(256, PocketTts.smallestFlowLmCapacity(120, 10, 20))
+        assertEquals("pt_flowlm_fused_dyn8_all_pmax256.tflite",
+            PocketTts.flowLmCapacityGraph(PocketTts.LM, 256))
+        assertEquals(PocketTts.LM, PocketTts.flowLmCapacityGraph(PocketTts.LM, PocketTts.PMAX))
+
+        val source = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
+        val length = 2
+        for (g in 0 until PocketTts.G) {
+            val start = g * PocketTts.PMAX * PocketTts.HD
+            for (i in 0 until length * PocketTts.HD) source[start + i] = g * 10000f + i
+        }
+        val packed = repackVoice(source, length, 128)
+        for (g in 0 until PocketTts.G) {
+            val src = g * PocketTts.PMAX * PocketTts.HD
+            val dst = g * 128 * PocketTts.HD
+            assertArrayEquals(
+                source.copyOfRange(src, src + length * PocketTts.HD),
+                packed.copyOfRange(dst, dst + length * PocketTts.HD),
+                0f,
+            )
+            assertTrue((dst + length * PocketTts.HD until dst + 128 * PocketTts.HD)
+                .all { packed[it] == 0f })
+        }
+    }
 
     @Test
     fun runTextPromptHarness() {
         val text = args.getString("text")?.trim().orEmpty().ifEmpty { DEFAULT_TEXT }
         val voice = args.getString("voice")?.trim()?.ifEmpty { "alba" } ?: "alba"
         val baseGraph = args.getString("lmGraph")?.trim()?.ifEmpty { DEFAULT_GRAPH } ?: DEFAULT_GRAPH
+        val candidateCapacity = args.getString("lmCapacity")?.toIntOrNull() ?: graphCapacity(baseGraph)
+        require(candidateCapacity in PocketTts.FLOWLM_CAPACITIES) {
+            "lmCapacity must be one of ${PocketTts.FLOWLM_CAPACITIES}, got $candidateCapacity"
+        }
+        val candidateGraph = PocketTts.flowLmCapacityGraph(baseGraph, candidateCapacity)
+        val kvPrecision = parseKvPrecision(args.getString("kvPrecision"))
+        val includeFirstDecode = args.getString("firstDecode")?.toBooleanStrictOrNull() ?: true
         val requested = args.getString("backends")
             ?.split(',', ';', ' ')
             ?.mapNotNull { runCatching { Accel.valueOf(it.trim().uppercase(Locale.ROOT)) }.getOrNull() }
@@ -56,11 +103,19 @@ class FlowLmHarnessTest {
         require(tokenIds.isNotEmpty()) { "text encoded to no tokens" }
 
         val voiceState = readVoice(File(modelDir, PocketTts.voiceFile(voice)))
-        require(tokenIds.size + voiceState.length < PocketTts.PMAX) {
+        require(tokenIds.size + voiceState.length < candidateCapacity) {
             "prompt has ${tokenIds.size} tokens; voice '$voice' leaves only " +
-                "${PocketTts.PMAX - voiceState.length - 1} FlowLM positions"
+                "${candidateCapacity - voiceState.length - 1} FlowLM positions at capacity $candidateCapacity"
         }
+        val plannedFrames = args.getString("plannedFrames")?.toIntOrNull()
+            ?: plannedFrameBudget(tokenIds.size)
+        require(plannedFrames >= 0) { "plannedFrames cannot be negative" }
+        val recommendedCapacity = PocketTts.smallestFlowLmCapacity(
+            voiceState.length, tokenIds.size, plannedFrames,
+        )
+        val plannedFits = recommendedCapacity != null && candidateCapacity >= recommendedCapacity
         val embed = File(modelDir, PocketTts.EMBED).readBytes()
+        val bosInput = readFloats(File(modelDir, PocketTts.BOS), PocketTts.H)
         val nEmbeddings = embed.size / 2 / PocketTts.H
         require(tokenIds.all { it in 0 until nEmbeddings }) { "tokenizer id outside embedding table" }
 
@@ -73,9 +128,15 @@ class FlowLmHarnessTest {
         lines += "device=${android.os.Build.MODEL} (${android.os.Build.DEVICE}) Android ${android.os.Build.VERSION.RELEASE}"
         lines += "text=$text"
         lines += "voice=$voice"
-        lines += "graph=$baseGraph"
+        lines += "graph=$candidateGraph capacity=$candidateCapacity kvPrecision=$kvPrecision"
         lines += "tokens=${tokenIds.size} ids=${tokenIds.joinToString(",")}"
-        lines += "output=one fused output vector per prompt token; zero noise; voice KV prefix=${voiceState.length} tokens"
+        lines += "output=prompt fused outputs plus ${if (includeFirstDecode) "one zero-noise BOS decode step" else "no decode step"}; voice KV prefix=${voiceState.length} tokens"
+        lines += "plannedFrames=$plannedFrames recommendedCapacity=${recommendedCapacity ?: "unsupported"} fitsCapacity=$plannedFits; prompt-only probe; planned fit is required for full speech"
+        lines += String.format(
+            Locale.US,
+            "KV input bytes/call: fp32=%d fp16-equivalent=%d int8-equivalent=%d; harness graph I/O remains fp32",
+            kvBytes(candidateCapacity, 4), kvBytes(candidateCapacity, 2), kvBytes(candidateCapacity, 1),
+        )
 
         val environment = if (Accel.NPU in backends) {
             runCatching {
@@ -88,9 +149,21 @@ class FlowLmHarnessTest {
         val candidates = LinkedHashMap<Accel, Run>()
         try {
             for (backend in backends) {
-                val graph = if (backend == Accel.NPU) PocketTts.g5Variant(baseGraph) else baseGraph
+                val graph = if (backend == Accel.NPU) PocketTts.g5Variant(candidateGraph) else candidateGraph
                 val result = try {
-                    runPrompt(backend, graph, tokenIds, embed, voiceState, environment)
+                    if (candidateCapacity < PocketTts.PMAX && backend == Accel.NPU) {
+                        error("reduced-capacity graphs have not passed the Tensor G5 AOT gate")
+                    }
+                    if (!plannedFits) {
+                        error(
+                            "capacity $candidateCapacity cannot fit voice=${voiceState.length} + " +
+                                "prompt=${tokenIds.size} + plannedFrames=$plannedFrames; select a larger bucket"
+                        )
+                    }
+                    runPrompt(
+                        backend, graph, tokenIds, embed, voiceState, environment,
+                        candidateCapacity, kvPrecision, bosInput, includeFirstDecode,
+                    )
                 } catch (t: Throwable) {
                     lines += "$backend FAILED: ${t.message ?: t::class.java.simpleName}"
                     Log.e(TAG, "backend=$backend graph=$graph failed", t)
@@ -99,16 +172,21 @@ class FlowLmHarnessTest {
                 if (result != null) candidates[backend] = result
             }
 
-            // CPU fp16 is the reference. Running it after the candidates also
+            // The shipped CPU dynamic-int8 graph is the A/B reference. Running it after the candidates also
             // preserves the runtime's required NPU-first initialization order.
             val referenceGraph = args.getString("referenceGraph")
                 ?.trim()?.ifEmpty { REFERENCE_GRAPH } ?: REFERENCE_GRAPH
-            val reference = runPrompt(Accel.CPU, referenceGraph, tokenIds, embed, voiceState, environment)
+            val referenceCapacity = graphCapacity(referenceGraph)
+            val reference = runPrompt(
+                Accel.CPU, referenceGraph, tokenIds, embed, voiceState, environment,
+                referenceCapacity, KvPrecision.FP32, bosInput, includeFirstDecode,
+            )
             writeFloats(File(runDir, "cpu-reference.f32le"), reference.output)
             lines += String.format(
                 Locale.US,
-                "CPU reference: graph=%s load=%.2f ms run=%.2f ms values=%d saved=cpu-reference.f32le",
-                reference.graph, reference.loadMs, reference.runMs, reference.output.size,
+                "CPU reference: graph=%s capacity=%d load=%.2f ms stage=%.2f ms run=%.2f ms read=%.2f ms values=%d saved=cpu-reference.f32le",
+                reference.graph, reference.capacity, reference.loadMs, reference.stageMs,
+                reference.runMs, reference.readMs, reference.output.size,
             )
             for ((backend, result) in candidates) {
                 val file = "${backend.name.lowercase(Locale.ROOT)}-candidate.f32le"
@@ -117,20 +195,23 @@ class FlowLmHarnessTest {
                     val m = metrics(reference.output, result.output)
                     lines += String.format(
                         Locale.US,
-                        "%s candidate: graph=%s load=%.2f ms run=%.2f ms corr=%.8f mean_abs_diff=%.8g mean_square_diff=%.8g saved=%s",
-                        backend, result.graph, result.loadMs, result.runMs, m.corr, m.mad, m.msd, file,
+                        "%s candidate: graph=%s capacity=%d precision=%s load=%.2f ms stage=%.2f ms run=%.2f ms read=%.2f ms kv_transform=%.2f ms kv_in_bytes=%d corr=%.8f mean_abs_diff=%.8g mean_square_diff=%.8g saved=%s",
+                        backend, result.graph, result.capacity, result.kvPrecision, result.loadMs,
+                        result.stageMs, result.runMs, result.readMs, result.kvTransformMs,
+                        result.kvInputBytes, m.corr, m.mad, m.msd, file,
                     )
                 } catch (t: Throwable) {
                     lines += "$backend candidate comparison failed: ${t.message}; output saved=$file"
                 }
             }
             lines += "CPU self-check: corr=1.00000000 mean_abs_diff=0 mean_square_diff=0"
-            lines += "raw outputs are little-endian float32; ${PocketTts.H} embedding width; ${tokenIds.size} prompt tokens"
+            lines += "raw outputs are little-endian float32; ${PocketTts.H} embedding width; ${tokenIds.size} prompt tokens plus ${if (includeFirstDecode) 1 else 0} decode step"
             val report = lines.joinToString("\n", postfix = "\n")
             File(runDir, "report.txt").writeText(report)
             report.lines().forEach { Log.i(TAG, it) }
             Log.i(TAG, "saved FlowLM probe files to ${runDir.absolutePath}")
-            assertTrue("CPU fp16 reference produced no output", reference.output.isNotEmpty())
+            assertTrue("no candidate backend completed; see report.txt", candidates.isNotEmpty())
+            assertTrue("CPU production reference produced no output", reference.output.isNotEmpty())
         } finally {
             environment?.close()
         }
@@ -143,6 +224,10 @@ class FlowLmHarnessTest {
         embedBytes: ByteArray,
         voice: VoiceState,
         environment: Environment?,
+        capacity: Int,
+        kvPrecision: KvPrecision,
+        bosInput: FloatArray,
+        includeFirstDecode: Boolean,
     ): Run {
         check(backend != Accel.NPU || environment != null) { "NPU environment is unavailable" }
         val path = File(modelDir, graph)
@@ -164,31 +249,36 @@ class FlowLmHarnessTest {
             val input = stepInput ?: model.createInputBuffers()
             val output = if (stepInput != null) model.createOutputBuffers(1) else model.createOutputBuffers()
             try {
-                val pk = voice.k.copyOf()
-                val pv = voice.v.copyOf()
-                val mask = FloatArray(PocketTts.NH * (PocketTts.PMAX + 1)) { PocketTts.MASK_NEG }
+                require(capacity in PocketTts.FLOWLM_CAPACITIES)
+                require(voice.length < capacity) {
+                    "voice prefix ${voice.length} does not fit FlowLM capacity $capacity"
+                }
+                val pk = repackVoice(voice.k, voice.length, capacity)
+                val pv = repackVoice(voice.v, voice.length, capacity)
+                val mask = FloatArray(PocketTts.NH * (capacity + 1)) { PocketTts.MASK_NEG }
                 var pos = voice.length
                 for (h in 0 until PocketTts.NH) {
-                    val row = h * (PocketTts.PMAX + 1)
+                    val row = h * (capacity + 1)
                     for (p in 0 until pos) mask[row + p] = 0f
-                    mask[row + PocketTts.PMAX] = 0f
+                    mask[row + capacity] = 0f
                 }
                 val cosine = FloatArray(PocketTts.HD)
                 val sine = FloatArray(PocketTts.HD)
                 val zeroNoise = FloatArray(PocketTts.LDIM)
                 val embed = ByteBuffer.wrap(embedBytes).order(ByteOrder.LITTLE_ENDIAN)
                 val outputPerToken = 1 + PocketTts.LDIM + 2 * PocketTts.G * PocketTts.HD
-                val all = FloatArray(tokenIds.size * outputPerToken)
+                val all = FloatArray((tokenIds.size + if (includeFirstDecode) 1 else 0) * outputPerToken)
                 var outputOffset = 0
-                var elapsed = 0L
-                for (id in tokenIds) {
-                    val embedding = FloatArray(PocketTts.H)
-                    var offset = id * PocketTts.H * Short.SIZE_BYTES
-                    for (i in embedding.indices) {
-                        embedding[i] = Half.toFloat(embed.getShort(offset))
-                        offset += Short.SIZE_BYTES
-                    }
+                var stageNs = 0L
+                var runNs = 0L
+                var readNs = 0L
+                var kvTransformNs = 0L
+                fun runStep(embedding: FloatArray) {
                     rope(pos, cosine, sine)
+                    val transformStart = System.nanoTime()
+                    transformKv(pk, pv, capacity, pos, kvPrecision)
+                    kvTransformNs += System.nanoTime() - transformStart
+                    val stageStart = System.nanoTime()
                     input[0].writeFloat(embedding)
                     input[1].writeFloat(cosine)
                     input[2].writeFloat(sine)
@@ -196,10 +286,13 @@ class FlowLmHarnessTest {
                     input[4].writeFloat(pk)
                     input[5].writeFloat(pv)
                     input[6].writeFloat(zeroNoise)
+                    stageNs += System.nanoTime() - stageStart
                     val started = System.nanoTime()
                     if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
-                    elapsed += System.nanoTime() - started
+                    runNs += System.nanoTime() - started
+                    val readStart = System.nanoTime()
                     val values = output.single().readFloat()
+                    readNs += System.nanoTime() - readStart
                     check(values.size == outputPerToken) {
                         "FlowLM output width changed: expected $outputPerToken, got ${values.size}"
                     }
@@ -209,14 +302,37 @@ class FlowLmHarnessTest {
                     val kvStart = 1 + PocketTts.LDIM
                     for (g in 0 until PocketTts.G) {
                         System.arraycopy(values, kvStart + g * PocketTts.HD, pk,
-                            g * PocketTts.PMAX * PocketTts.HD + pos * PocketTts.HD, PocketTts.HD)
+                            g * capacity * PocketTts.HD + pos * PocketTts.HD, PocketTts.HD)
                         System.arraycopy(values, kvStart + PocketTts.G * PocketTts.HD + g * PocketTts.HD, pv,
-                            g * PocketTts.PMAX * PocketTts.HD + pos * PocketTts.HD, PocketTts.HD)
+                            g * capacity * PocketTts.HD + pos * PocketTts.HD, PocketTts.HD)
                     }
-                    for (h in 0 until PocketTts.NH) mask[h * (PocketTts.PMAX + 1) + pos] = 0f
+                    for (h in 0 until PocketTts.NH) mask[h * (capacity + 1) + pos] = 0f
                     pos++
                 }
-                return Run(backend, graph, all, tokenIds.size, loadMs, elapsed / 1e6)
+                for (id in tokenIds) {
+                    val embedding = FloatArray(PocketTts.H)
+                    var offset = id * PocketTts.H * Short.SIZE_BYTES
+                    for (i in embedding.indices) {
+                        embedding[i] = Half.toFloat(embed.getShort(offset))
+                        offset += Short.SIZE_BYTES
+                    }
+                    runStep(embedding)
+                }
+                if (includeFirstDecode) runStep(bosInput)
+                return Run(
+                    backend = backend,
+                    graph = graph,
+                    capacity = capacity,
+                    kvPrecision = kvPrecision,
+                    output = all,
+                    tokenCount = tokenIds.size + if (includeFirstDecode) 1 else 0,
+                    loadMs = loadMs,
+                    stageMs = stageNs / 1e6,
+                    runMs = runNs / 1e6,
+                    readMs = readNs / 1e6,
+                    kvTransformMs = kvTransformNs / 1e6,
+                    kvInputBytes = kvBytes(capacity, Float.SIZE_BYTES),
+                )
             } finally {
                 input.forEach { it.close() }
                 output.forEach { it.close() }
@@ -227,6 +343,88 @@ class FlowLmHarnessTest {
     }
 
     private data class VoiceState(val length: Int, val k: FloatArray, val v: FloatArray)
+
+    private fun graphCapacity(graph: String): Int {
+        val match = Regex("_pmax(\\d+)(?:_g5)?\\.tflite$").find(graph)
+        return match?.groupValues?.get(1)?.toIntOrNull() ?: PocketTts.PMAX
+    }
+
+    private fun parseKvPrecision(value: String?): KvPrecision = when (
+        value?.trim()?.uppercase(Locale.ROOT)?.replace('-', '_')
+    ) {
+        null, "", "FP32", "FLOAT32" -> KvPrecision.FP32
+        "FP16", "FLOAT16" -> KvPrecision.FP16
+        "INT8", "INT8_PER_HEAD" -> KvPrecision.INT8_PER_HEAD
+        else -> error("kvPrecision must be fp32, fp16, or int8_per_head; got '$value'")
+    }
+
+    private fun plannedFrameBudget(tokenCount: Int): Int = ceil(
+        (tokenCount / PocketTts.TOKENS_PER_SECOND + PocketTts.GEN_SECONDS_PADDING) *
+            PocketTts.FRAME_RATE,
+    ).toInt()
+
+    private fun kvBytes(capacity: Int, bytesPerValue: Int): Long =
+        2L * PocketTts.G * capacity * PocketTts.HD * bytesPerValue
+
+    /** Repack only the live voice prefix from the on-disk 512-row stride. */
+    private fun repackVoice(source: FloatArray, length: Int, capacity: Int): FloatArray {
+        val expected = PocketTts.G * PocketTts.PMAX * PocketTts.HD
+        require(source.size == expected) { "voice KV size changed: expected $expected, got ${source.size}" }
+        require(length < capacity) { "voice prefix $length does not fit capacity $capacity" }
+        val target = FloatArray(PocketTts.G * capacity * PocketTts.HD)
+        for (g in 0 until PocketTts.G) {
+            System.arraycopy(
+                source, g * PocketTts.PMAX * PocketTts.HD,
+                target, g * capacity * PocketTts.HD,
+                length * PocketTts.HD,
+            )
+        }
+        return target
+    }
+
+    /**
+     * Fidelity-only simulation of lower-precision cache storage. The current
+     * graph buffers remain float32, so this does not reduce LiteRT transfer bytes.
+     */
+    private fun transformKv(
+        k: FloatArray,
+        v: FloatArray,
+        capacity: Int,
+        liveLength: Int,
+        precision: KvPrecision,
+    ) {
+        when (precision) {
+            KvPrecision.FP32 -> Unit
+            KvPrecision.FP16 -> {
+                for (g in 0 until PocketTts.G) {
+                    val base = g * capacity * PocketTts.HD
+                    val live = liveLength * PocketTts.HD
+                    for (i in 0 until live) {
+                        k[base + i] = Half.toFloat(Half.toHalf(k[base + i]))
+                        v[base + i] = Half.toFloat(Half.toHalf(v[base + i]))
+                    }
+                }
+            }
+            KvPrecision.INT8_PER_HEAD -> {
+                for (g in 0 until PocketTts.G) {
+                    val base = g * capacity * PocketTts.HD
+                    quantizePerHead(k, base, liveLength * PocketTts.HD)
+                    quantizePerHead(v, base, liveLength * PocketTts.HD)
+                }
+            }
+        }
+    }
+
+    private fun quantizePerHead(values: FloatArray, start: Int, count: Int) {
+        var maxAbs = 0f
+        for (i in 0 until count) maxAbs = maxOf(maxAbs, kotlin.math.abs(values[start + i]))
+        if (maxAbs == 0f) return
+        val scale = maxAbs / 127f
+        for (i in 0 until count) {
+            val q = (values[start + i] / scale).roundToInt().coerceIn(-127, 127)
+            values[start + i] = q * scale
+        }
+    }
 
     private fun readVoice(file: File): VoiceState {
         require(file.isFile) { "missing voice state: $file" }
@@ -301,10 +499,20 @@ class FlowLmHarnessTest {
         file.writeBytes(bytes.array())
     }
 
+    private fun readFloats(file: File, expected: Int): FloatArray {
+        require(file.isFile) { "missing float asset: $file" }
+        val bytes = file.readBytes()
+        require(bytes.size == expected * Float.SIZE_BYTES) {
+            "unexpected float asset size for $file: expected ${expected * Float.SIZE_BYTES}, got ${bytes.size}"
+        }
+        val input = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
+        return FloatArray(expected) { input.float }
+    }
+
     private companion object {
         const val TAG = "FlowLmHarness"
         const val DEFAULT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
-        const val REFERENCE_GRAPH = "pt_flowlm_fused_fp16.tflite"
+        const val REFERENCE_GRAPH = "pt_flowlm_fused_dyn8_all.tflite"
         const val DEFAULT_TEXT = "Hello world. This is a FlowLM text probe."
     }
 }
