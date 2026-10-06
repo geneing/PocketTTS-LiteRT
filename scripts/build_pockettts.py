@@ -67,6 +67,11 @@ PMAX = 512            # flow-LM KV capacity: voice (~142) + text (~55) + gen (~2
 PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "16"))
 PREFILL_BUCKETS = (16, 1, 8, 32) if PREFILL_TOKENS > 0 else ()
 PREFILL_SIGNATURE_INDEX = {p: i for i, p in enumerate(PREFILL_BUCKETS)}
+PREFILL_ORACLE_TEXT = (
+    "Pocket TTS reads a longer prompt on a phone to check that all thirty two "
+    "causal text rows preserve the voice and match the sequential flow model. "
+    "The following sentence adds more words for a complete fixed bucket."
+)
 FLOW_DIM = 512
 FLOW_DEPTH = 6
 
@@ -674,9 +679,11 @@ def stage_fused(model):
     extra = []
     prefill_cases = {}
     if PREFILL_TOKENS > 0:
-        rec, _ = record_reference(
-            model, "alba", "Hello world. I am Pocket TTS running on a phone.")
+        rec, _ = record_reference(model, "alba", PREFILL_ORACLE_TEXT)
         prompt_ids = rec["tokens"][0].tolist()
+        assert len(prompt_ids) >= max(PREFILL_BUCKETS), (
+            f"prefill oracle only has {len(prompt_ids)} tokens, "
+            f"needs {max(PREFILL_BUCKETS)}")
         for P in PREFILL_BUCKETS:
             pre = PrefillStep(flm, P).eval()
             # The module constructor clones weights. Share the exact step module
@@ -1760,9 +1767,11 @@ def stage_quant(model):
                     torch.from_numpy(mask), pk, pv, noise).numpy()
     emb_w = flm.conditioner.embed.weight.detach()
     if PREFILL_BUCKETS:
-        prefill_rec, _ = record_reference(
-            model, "alba", "Hello world. I am Pocket TTS running on a phone.")
+        prefill_rec, _ = record_reference(model, "alba", PREFILL_ORACLE_TEXT)
         prefill_ids = prefill_rec["tokens"][0].tolist()
+        assert len(prefill_ids) >= max(PREFILL_BUCKETS), (
+            f"prefill oracle only has {len(prefill_ids)} tokens, "
+            f"needs {max(PREFILL_BUCKETS)}")
     else:
         prefill_ids = []
 

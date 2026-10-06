@@ -199,6 +199,7 @@ class FlowLmHarnessTest {
             "voices=${voiceNames.joinToString()} text=$sourceText",
         )
         val zeroNoise = FloatArray(PocketTts.LDIM)
+        var firstFailure: String? = null
         try {
             for (voiceName in voiceNames) {
                 val voice = readVoice(File(modelDir, PocketTts.voiceFile(voiceName)))
@@ -332,28 +333,33 @@ class FlowLmHarnessTest {
                         val candV = getKvRow(candidatePv, positionLabel)
                         val kDiff = maxDiff(refK, candK)
                         val vDiff = maxDiff(refV, candV)
+                        val kGroup = firstKvGroupMismatch(refK, candK)
+                        val vGroup = firstKvGroupMismatch(refV, candV)
                         lines += String.format(
                             Locale.US,
-                            "  position=%d K corr=%.8f max_abs_diff=%.8g V corr=%.8f max_abs_diff=%.8g",
+                            "  position=%d K corr=%.8f max_abs_diff=%.8g first_bad_group=%s " +
+                                "V corr=%.8f max_abs_diff=%.8g first_bad_group=%s",
                             positionLabel, metrics(refK, candK).corr, kDiff,
-                            metrics(refV, candV).corr, vDiff,
+                            kGroup ?: "none", metrics(refV, candV).corr, vDiff, vGroup ?: "none",
                         )
-                        check(kDiff <= PREFILL_PARITY_TOLERANCE) {
-                            "first K divergence: voice=$voiceName tokens=$count position=$positionLabel " +
+                        if (kDiff > PREFILL_PARITY_TOLERANCE && firstFailure == null) {
+                            firstFailure = "first K divergence: voice=$voiceName tokens=$count position=$positionLabel " +
                                 "bucket_plan=${bucketPlan.joinToString("+")} max_abs_diff=$kDiff " +
+                                "group=$kGroup " +
                                 "tolerance=$PREFILL_PARITY_TOLERANCE"
                         }
-                        check(vDiff <= PREFILL_PARITY_TOLERANCE) {
-                            "first V divergence: voice=$voiceName tokens=$count position=$positionLabel " +
+                        if (vDiff > PREFILL_PARITY_TOLERANCE && firstFailure == null) {
+                            firstFailure = "first V divergence: voice=$voiceName tokens=$count position=$positionLabel " +
                                 "bucket_plan=${bucketPlan.joinToString("+")} max_abs_diff=$vDiff " +
+                                "group=$vGroup " +
                                 "tolerance=$PREFILL_PARITY_TOLERANCE"
                         }
                     }
                     val prefixKDiff = maxPrefixDiff(candidatePk, voice.k, voice.length)
                     val prefixVDiff = maxPrefixDiff(candidatePv, voice.v, voice.length)
                     lines += "  voice_prefix K max_abs_diff=$prefixKDiff V max_abs_diff=$prefixVDiff"
-                    check(prefixKDiff == 0.0 && prefixVDiff == 0.0) {
-                        "prefill modified voice prefix for $voiceName/$count"
+                    if ((prefixKDiff != 0.0 || prefixVDiff != 0.0) && firstFailure == null) {
+                        firstFailure = "prefill modified voice prefix for $voiceName/$count"
                     }
 
                     val firstPos = voice.length + count
@@ -405,20 +411,23 @@ class FlowLmHarnessTest {
                         firstCandidate.copyOfRange(1 + PocketTts.LDIM + PocketTts.G * PocketTts.HD,
                             firstCandidate.size),
                     )
-                    check(eosDiff <= PREFILL_PARITY_TOLERANCE &&
+                    if (!(eosDiff <= PREFILL_PARITY_TOLERANCE &&
                         latentDiff <= PREFILL_PARITY_TOLERANCE &&
                         firstKDiff <= PREFILL_PARITY_TOLERANCE &&
-                        firstVDiff <= PREFILL_PARITY_TOLERANCE) {
-                        "first post-prefill BOS decode diverged for voice=$voiceName tokens=$count: " +
+                        firstVDiff <= PREFILL_PARITY_TOLERANCE) && firstFailure == null) {
+                        firstFailure = "first post-prefill BOS decode diverged for voice=$voiceName tokens=$count: " +
                             "eos=$eosDiff latent=$latentDiff K=$firstKDiff V=$firstVDiff " +
                             "tolerance=$PREFILL_PARITY_TOLERANCE"
                     }
                 }
             }
+            lines += "acceptance=${if (firstFailure == null) "PASS" else "FAIL"}"
+            firstFailure?.let { lines += it }
             val report = lines.joinToString("\n", postfix = "\n")
             File(runDir, "report.txt").writeText(report)
             Log.i(TAG, "prefill detail report saved to ${File(runDir, "report.txt").absolutePath}")
             assertTrue("CPU int8 prefill produced no measurements", lines.size > 6)
+            check(firstFailure == null) { firstFailure ?: "prefill parity failed" }
         } finally {
             stepBuffers.close()
             model.close()
@@ -764,6 +773,22 @@ class FlowLmHarnessTest {
             max = maxOf(max, kotlin.math.abs(x - y))
         }
         return max
+    }
+
+    /** Check each layer/head separately so the report locates the first bad KV group. */
+    private fun firstKvGroupMismatch(reference: FloatArray, candidate: FloatArray): String? {
+        require(reference.size == PocketTts.G * PocketTts.HD && candidate.size == reference.size)
+        for (group in 0 until PocketTts.G) {
+            var max = 0.0
+            for (d in 0 until PocketTts.HD) {
+                val i = group * PocketTts.HD + d
+                max = maxOf(max, kotlin.math.abs(reference[i].toDouble() - candidate[i].toDouble()))
+            }
+            if (max > PREFILL_PARITY_TOLERANCE) {
+                return "layer=${group / PocketTts.NH},head=${group % PocketTts.NH},max=$max"
+            }
+        }
+        return null
     }
 
     private fun runPrompt(
