@@ -132,6 +132,25 @@ class InterpreterRunner:
         ) for detail in self.outputs]
 
 
+class GroupDyn8Runner:
+    """Reuse the shipped model's one-step signature (index 1; prefill is 0)."""
+
+    def __init__(self, path: Path):
+        from ai_edge_litert.compiled_model import CompiledModel
+
+        self.model = CompiledModel.from_file(str(path))
+        self.inputs = self.model.create_input_buffers(1)
+        self.outputs = self.model.create_output_buffers(1)
+        if len(self.inputs) != 7 or len(self.outputs) != 1:
+            raise AssertionError("CPU dyn8 baseline does not have the expected step signature")
+
+    def __call__(self, *arrays):
+        for buffer, array in zip(self.inputs, arrays):
+            buffer.write(np.ascontiguousarray(array, dtype=np.float32).ravel())
+        self.model.run_by_index(1, self.inputs, self.outputs)
+        return [np.array(self.outputs[0].read(1 + bp.LDIM + 2 * bp.G_KV, np.float32))]
+
+
 def check_short_rollout(
     path: Path, steps: int, compare_group_dyn8: bool,
     baseline_graph: Path | None = None, voice: str = "alba",
@@ -151,7 +170,7 @@ def check_short_rollout(
     x_q = x_ref.numpy().copy()
     float_io = all(d["dtype"] == np.float32 for side in signature(path) for d in side)
     runner = bp.CM(str(path)) if float_io else InterpreterRunner(path)
-    baseline_runner = bp.CM(str(baseline_graph)) if baseline_graph else None
+    baseline_runner = GroupDyn8Runner(baseline_graph) if baseline_graph else None
     if baseline_runner:
         pk_base, pv_base = pk_ref.numpy().copy(), pv_ref.numpy().copy()
         x_base = x_ref.numpy().copy()
@@ -218,6 +237,12 @@ def check_short_rollout(
                 baseline_lat_delta.append(bp.maxd(base_lat, latent_ref))
                 baseline_eos_delta.append(abs(float(base[0] - ref[0])))
                 baseline_kv_delta.append(bp.maxd(base[1 + bp.LDIM:], ref[1 + bp.LDIM:]))
+                print(
+                    f"  CPU dyn8 step {step}: eos_delta={baseline_eos_delta[-1]:.3e} "
+                    f"latent_corr={baseline_corr[-1]:.8f} "
+                    f"latent_max_delta={baseline_lat_delta[-1]:.3e} "
+                    f"kv_max_delta={baseline_kv_delta[-1]:.3e}"
+                )
                 pk_base[0, :, pos] = base[1 + bp.LDIM:1 + bp.LDIM + bp.G_KV].reshape(-1, bp.HD)
                 pv_base[0, :, pos] = base[1 + bp.LDIM + bp.G_KV:].reshape(-1, bp.HD)
                 x_base = (base_lat @ in_w.numpy().T).reshape(1, 1, -1)
