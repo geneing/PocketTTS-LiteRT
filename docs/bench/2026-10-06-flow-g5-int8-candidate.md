@@ -69,15 +69,17 @@ latency and completion gates:
 | Group-major dynamic INT8 `no_truncation` | CPU → NPU | 753 / 759 | 52.068 / 25.278 s (`2.06×`) | 36.503 / 15.268 s (`2.39×`) | 2.831 / 1.148 s (`2.47×`) |
 | Group-major dynamic INT8 `no_truncation` | Mean | 753 / 759 | 52.224 / 25.021 s (`2.09×`) | 36.424 / 15.115 s (`2.41×`) | 2.866 / 1.146 s (`2.50×`) |
 | Position-major dynamic INT8 `half` | NPU → CPU | 753 / 759 | 53.008 / 24.933 s (`2.13×`) | 37.099 / 14.951 s (`2.48×`) | 2.883 / 1.105 s (`2.61×`) |
+| Position-major dynamic INT8 `half` | CPU → NPU | 753 / 759 | 53.139 / 25.479 s (`2.09×`) | 37.127 / 15.448 s (`2.40×`) | 2.846 / 1.136 s (`2.51×`) |
+| Position-major dynamic INT8 `half` | Mean | 753 / 759 | 53.074 / 25.206 s (`2.11×`) | 37.113 / 15.200 s (`2.44×`) | 2.865 / 1.121 s (`2.56×`) |
 
-The reversed group-major pair confirms its slowdown is not explained by run
-order. Both group-major runs and the position-major forward run stopped six
-frames before CPU, so they also fail the completion gate. The position-major
-layout and `half` truncation did not restore a latency advantage over CPU INT8
-in this protocol. A reverse-order position-major pair remains pending; the
-existing position-major long-run report with both orders is the FP16 baseline,
-not this INT8 candidate. The position-major INT8 output quality has not been
-independently established by these timing results.
+The reversed pairs confirm the roughly 2.1× slowdown is not explained by run
+order. Both NPU graphs stopped six frames before CPU in both orders, so they
+also fail the completion gate. Position-major layout and `half` truncation did
+not restore a latency advantage over CPU INT8. Their long free-running
+waveform correlations were 0.115/0.081 for the group-major/position-major
+CPU-first pair; these are diagnostics, not standalone speech-quality verdicts.
+The WAVs for the reversed position-major pair are preserved under ignored
+`build/flowlm-g5-int8/dyn8-reversed-position-major-device/`.
 
 The stage timings identify where the measured gap occurs: each NPU LM
 `CompiledModel.run()` total was 36.3-37.1 s, versus about 15.0 s for the CPU
