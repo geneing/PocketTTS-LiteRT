@@ -1,5 +1,6 @@
 package com.pockettts
 
+import android.os.Debug
 import android.util.Half
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -7,6 +8,8 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
+import com.google.ai.edge.litert.TensorBuffer
+import com.google.ai.edge.litert.TensorBufferType
 import dev.pockettts.Accel
 import dev.pockettts.PocketTts
 import dev.pockettts.SpTokenizer
@@ -35,6 +38,18 @@ class FlowLmHarnessTest {
         val tokenCount: Int,
         val loadMs: Double,
         val runMs: Double,
+        val otherInputWriteMsPerStep: Double,
+        val cacheInputWriteMsPerStep: Double,
+        val outputReadMsPerStep: Double,
+        val hostCacheUpdateMsPerStep: Double,
+        val cacheInputBytesPerStep: Long,
+        val otherInputBytesPerStep: Long,
+        val outputBytesPerStep: Long,
+        val cacheBufferRequirements: String,
+        val pssBeforeLoadKb: Long,
+        val pssAfterLoadKb: Long,
+        val pssAfterBuffersKb: Long,
+        val pssAfterRunKb: Long,
     )
 
     private data class Metrics(val corr: Double, val mad: Double, val msd: Double)
@@ -76,6 +91,8 @@ class FlowLmHarnessTest {
         lines += "graph=$baseGraph"
         lines += "tokens=${tokenIds.size} ids=${tokenIds.joinToString(",")}"
         lines += "output=one fused output vector per prompt token; zero noise; voice KV prefix=${voiceState.length} tokens"
+        lines += tensorBufferApiDiagnostic()
+        lines += "cache_chain=UNIMPLEMENTED; this probe measures array staging and does not claim accelerator-resident KV"
 
         val environment = if (Accel.NPU in backends) {
             runCatching {
@@ -110,6 +127,7 @@ class FlowLmHarnessTest {
                 "CPU reference: graph=%s load=%.2f ms run=%.2f ms values=%d saved=cpu-reference.f32le",
                 reference.graph, reference.loadMs, reference.runMs, reference.output.size,
             )
+            lines += stageTimingLine("CPU reference", reference)
             for ((backend, result) in candidates) {
                 val file = "${backend.name.lowercase(Locale.ROOT)}-candidate.f32le"
                 writeFloats(File(runDir, file), result.output)
@@ -120,6 +138,7 @@ class FlowLmHarnessTest {
                         "%s candidate: graph=%s load=%.2f ms run=%.2f ms corr=%.8f mean_abs_diff=%.8g mean_square_diff=%.8g saved=%s",
                         backend, result.graph, result.loadMs, result.runMs, m.corr, m.mad, m.msd, file,
                     )
+                    lines += stageTimingLine("$backend candidate", result)
                 } catch (t: Throwable) {
                     lines += "$backend candidate comparison failed: ${t.message}; output saved=$file"
                 }
@@ -156,14 +175,35 @@ class FlowLmHarnessTest {
         if (backend == Accel.GPU32) {
             options.gpuOptions = CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
         }
+        val pssBeforeLoadKb = Debug.getPss()
         val loadStart = System.nanoTime()
         val model = CompiledModel.create(path.absolutePath, options, if (backend == Accel.NPU) environment else null)
         val loadMs = (System.nanoTime() - loadStart) / 1e6
+        val pssAfterLoadKb = Debug.getPss()
         try {
             val stepInput = runCatching { model.createInputBuffers(1) }.getOrNull()
             val input = stepInput ?: model.createInputBuffers()
             val output = if (stepInput != null) model.createOutputBuffers(1) else model.createOutputBuffers()
+            val pssAfterBuffersKb = Debug.getPss()
             try {
+                val cacheBufferRequirements = if (backend == Accel.NPU) {
+                    listOf("pk", "pv").joinToString("; ") { name ->
+                        val namedSignature = runCatching {
+                            val req = model.getInputBufferRequirements(name, "serving_default")
+                            "$name types=${req.supportedTypes.joinToString(",")} bytes=${req.bufferSize} strides=${req.strides}"
+                        }
+                        namedSignature.getOrElse { signatureError ->
+                            runCatching {
+                                val req = model.getInputBufferRequirements(name)
+                                "$name default_signature types=${req.supportedTypes.joinToString(",")} " +
+                                    "bytes=${req.bufferSize} strides=${req.strides}"
+                            }.getOrElse { defaultError ->
+                                "$name query_failed serving_default=${signatureError.message ?: signatureError::class.java.simpleName}; " +
+                                    "default=${defaultError.message ?: defaultError::class.java.simpleName}"
+                            }
+                        }
+                    }
+                } else "not queried"
                 val pk = voice.k.copyOf()
                 val pv = voice.v.copyOf()
                 val mask = FloatArray(PocketTts.NH * (PocketTts.PMAX + 1)) { PocketTts.MASK_NEG }
@@ -181,6 +221,10 @@ class FlowLmHarnessTest {
                 val all = FloatArray(tokenIds.size * outputPerToken)
                 var outputOffset = 0
                 var elapsed = 0L
+                var otherInputWriteNanos = 0L
+                var cacheInputWriteNanos = 0L
+                var outputReadNanos = 0L
+                var hostCacheUpdateNanos = 0L
                 for (id in tokenIds) {
                     val embedding = FloatArray(PocketTts.H)
                     var offset = id * PocketTts.H * Short.SIZE_BYTES
@@ -189,17 +233,24 @@ class FlowLmHarnessTest {
                         offset += Short.SIZE_BYTES
                     }
                     rope(pos, cosine, sine)
+                    var writeStarted = System.nanoTime()
                     input[0].writeFloat(embedding)
                     input[1].writeFloat(cosine)
                     input[2].writeFloat(sine)
                     input[3].writeFloat(mask)
+                    input[6].writeFloat(zeroNoise)
+                    otherInputWriteNanos += System.nanoTime() - writeStarted
+
+                    writeStarted = System.nanoTime()
                     input[4].writeFloat(pk)
                     input[5].writeFloat(pv)
-                    input[6].writeFloat(zeroNoise)
+                    cacheInputWriteNanos += System.nanoTime() - writeStarted
                     val started = System.nanoTime()
                     if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
                     elapsed += System.nanoTime() - started
+                    val readStarted = System.nanoTime()
                     val values = output.single().readFloat()
+                    outputReadNanos += System.nanoTime() - readStarted
                     check(values.size == outputPerToken) {
                         "FlowLM output width changed: expected $outputPerToken, got ${values.size}"
                     }
@@ -207,16 +258,42 @@ class FlowLmHarnessTest {
                     outputOffset += values.size
 
                     val kvStart = 1 + PocketTts.LDIM
+                    val cacheUpdateStarted = System.nanoTime()
                     for (g in 0 until PocketTts.G) {
                         System.arraycopy(values, kvStart + g * PocketTts.HD, pk,
                             g * PocketTts.PMAX * PocketTts.HD + pos * PocketTts.HD, PocketTts.HD)
                         System.arraycopy(values, kvStart + PocketTts.G * PocketTts.HD + g * PocketTts.HD, pv,
                             g * PocketTts.PMAX * PocketTts.HD + pos * PocketTts.HD, PocketTts.HD)
                     }
+                    hostCacheUpdateNanos += System.nanoTime() - cacheUpdateStarted
                     for (h in 0 until PocketTts.NH) mask[h * (PocketTts.PMAX + 1) + pos] = 0f
                     pos++
                 }
-                return Run(backend, graph, all, tokenIds.size, loadMs, elapsed / 1e6)
+                val tokenCount = tokenIds.size
+                val cacheInputBytesPerStep = (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+                val otherInputBytesPerStep = (
+                    PocketTts.H + 2 * PocketTts.HD + mask.size + PocketTts.LDIM
+                    ).toLong() * Float.SIZE_BYTES
+                return Run(
+                    backend = backend,
+                    graph = graph,
+                    output = all,
+                    tokenCount = tokenCount,
+                    loadMs = loadMs,
+                    runMs = elapsed / 1e6,
+                    otherInputWriteMsPerStep = otherInputWriteNanos / tokenCount / 1e6,
+                    cacheInputWriteMsPerStep = cacheInputWriteNanos / tokenCount / 1e6,
+                    outputReadMsPerStep = outputReadNanos / tokenCount / 1e6,
+                    hostCacheUpdateMsPerStep = hostCacheUpdateNanos / tokenCount / 1e6,
+                    cacheInputBytesPerStep = cacheInputBytesPerStep,
+                    otherInputBytesPerStep = otherInputBytesPerStep,
+                    outputBytesPerStep = outputPerToken.toLong() * Float.SIZE_BYTES,
+                    cacheBufferRequirements = cacheBufferRequirements,
+                    pssBeforeLoadKb = pssBeforeLoadKb,
+                    pssAfterLoadKb = pssAfterLoadKb,
+                    pssAfterBuffersKb = pssAfterBuffersKb,
+                    pssAfterRunKb = Debug.getPss(),
+                )
             } finally {
                 input.forEach { it.close() }
                 output.forEach { it.close() }
@@ -227,6 +304,39 @@ class FlowLmHarnessTest {
     }
 
     private data class VoiceState(val length: Int, val k: FloatArray, val v: FloatArray)
+
+    private fun stageTimingLine(label: String, run: Run): String = String.format(
+        Locale.US,
+        "%s per_step: host_small_write=%.3f ms host_KV_write=%.3f ms run=%.3f ms output_read=%.3f ms host_KV_update=%.3f ms; host_write_bytes=%d (KV=%d, other=%d) output_read_bytes=%d; PSS_kB=[before_load=%d, after_load=%d, after_buffers=%d, after_run=%d]; cache_requirements={%s}",
+        label,
+        run.otherInputWriteMsPerStep,
+        run.cacheInputWriteMsPerStep,
+        run.runMs / run.tokenCount,
+        run.outputReadMsPerStep,
+        run.hostCacheUpdateMsPerStep,
+        run.cacheInputBytesPerStep + run.otherInputBytesPerStep,
+        run.cacheInputBytesPerStep,
+        run.otherInputBytesPerStep,
+        run.outputBytesPerStep,
+        run.pssBeforeLoadKb,
+        run.pssAfterLoadKb,
+        run.pssAfterBuffersKb,
+        run.pssAfterRunKb,
+        run.cacheBufferRequirements,
+    )
+
+    /** The public Kotlin API exposes requirements, but not external-buffer import or actual buffer type. */
+    private fun tensorBufferApiDiagnostic(): String {
+        val methods = TensorBuffer::class.java.methods.map { it.name }
+        val io = methods.filter { it.startsWith("read") || it.startsWith("write") }.distinct().sorted()
+        val externalBufferApi = methods.filter {
+            it.contains("ahwb", ignoreCase = true) || it.contains("bufferType", ignoreCase = true) ||
+                it.contains("from", ignoreCase = true)
+        }.distinct().sorted()
+        return "Kotlin TensorBuffer API: io=$io external_buffer_methods=$externalBufferApi " +
+            "declared_buffer_types=${TensorBufferType.values().joinToString(",")}; " +
+            "actual_created_buffer_type=not exposed"
+    }
 
     private fun readVoice(file: File): VoiceState {
         require(file.isFile) { "missing voice state: $file" }
