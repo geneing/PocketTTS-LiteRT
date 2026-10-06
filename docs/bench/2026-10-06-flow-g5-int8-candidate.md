@@ -1,7 +1,7 @@
 # FlowLM dynamic INT8 on Tensor G5: opt-in candidates
 
-This is a host and AOT checkpoint, not a Pixel quality or latency result. The
-production graph remains `pt_flowlm_fused_dyn8_all.tflite` on CPU by default.
+This is a host, AOT, and initial Pixel checkpoint. The production graph remains
+`pt_flowlm_fused_dyn8_all.tflite` on CPU by default.
 
 ## Reproduction and interfaces
 
@@ -43,8 +43,16 @@ correlation `0.99950914`, maximum latent absolute difference `0.06940`, and
 maximum K/V absolute difference `0.3640` by step 4. The first-step EOS logit
 difference was `0.6556`; later EOS differences were `0.2444`, `0.2223`, and
 `0.1625`. This establishes float interface and short-rollout behavior, not
-speech quality, EOS stopping agreement, or Pixel latency. No device test or
-long-utterance harness was run here.
+speech quality or EOS stopping agreement. No device test or long-utterance
+harness was run by the exporter.
+
+The Pixel long-utterance harness run supplied by the parent task for the
+**group-major dynamic INT8 `no_truncation` AOT** failed its latency gate:
+`753` candidate frames versus `759` CPU-control frames, and `52.38 s` versus
+`24.76 s` end-to-end (`2.11×` slower). The reverse pair was not run. This
+result applies to that 199.9 MB, two-signature group-major artifact; it does
+not measure the single-signature position-major candidate or the G5 compiler's
+`half` truncation setting.
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
