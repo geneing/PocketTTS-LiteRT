@@ -83,7 +83,8 @@ Pixel 10 paired measurements
   estimate can include overlapping domains and is not a whole-device energy
   total. Saved WAVs are on-device under
   `files/power-benchmark/flowlm-cpu-variant-*.wav`; the run log is the ignored
-  `scripts/out/option6-power-all.log`.
+  `scripts/out/option6-power-all.log`. The final Marius long A/B/B/A WAVs were
+  pulled locally to `scripts/out/option6-long-marius/` for listening review.
 
 Prompt-only thread matrix
   All 18 paired cases passed for both voices, prompt lengths 4, 33, and 385,
