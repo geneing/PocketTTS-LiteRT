@@ -7,6 +7,7 @@ import android.media.AudioTrack
 import android.os.BatteryManager
 import android.os.Build
 import android.os.OutcomeReceiver
+import android.os.PowerManager
 import android.os.SystemClock
 import android.os.health.SystemHealthManager
 import android.os.PowerMonitor
@@ -73,6 +74,7 @@ class PowerBenchmarkTest {
         // the CPU reference and the candidate's prompt/step graph.
         lmGraph = PocketTts.LM,
         lmSteps = 4,
+        runReversedOrder = true,
     )
 
     @Test
@@ -256,6 +258,7 @@ class PowerBenchmarkTest {
         lmPlacement: Accel,
         lmGraph: String?,
         lmSteps: Int,
+        runReversedOrder: Boolean = false,
     ) {
         assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
 
@@ -299,13 +302,19 @@ class PowerBenchmarkTest {
 
             val referenceTake = referenceEngine.stream(PARAGRAPH, "alba") {}
             assertTrue("reference produced no audio", referenceTake.audio.isNotEmpty())
-            val audioBaseline = measurePlayback(health, relevant, referenceTake.audio)
-            val referencePlayback = measureSynthesisPlayback(health, relevant, referenceEngine)
+            val audioBaseline = measurePlayback(
+                health, relevant, referenceTake.audio, captureThermalStatus = runReversedOrder,
+            )
+            val referencePlayback = measureSynthesisPlayback(
+                health, relevant, referenceEngine, captureThermalStatus = runReversedOrder,
+            )
             val referenceRepeatQuality = AudioQuality.compare(referenceTake.audio, referencePlayback.result.audio)
             assertTrue(
                 "reference repeat correlation: ${referenceRepeatQuality.corr}",
                 referenceRepeatQuality.corr >= MIN_REPEAT_CORRELATION,
             )
+            val referenceRuntimeAccelerators = referenceEngine.runtimeAccelerators
+            assertEquals("CPU dynamic-int8 reference LM did not load on CPU", Accel.CPU, referenceRuntimeAccelerators["lm"])
 
             val sampleDir = context.getExternalFilesDir("power-benchmark")
                 ?: File(context.filesDir, "power-benchmark")
@@ -332,12 +341,22 @@ class PowerBenchmarkTest {
                 val candidateSpeedRun = candidateEngine.stream(PARAGRAPH, "alba") {}
                 assertTrue("candidate speed run produced no audio", candidateSpeedRun.audio.isNotEmpty())
 
-                val candidatePlayback = measureSynthesisPlayback(health, relevant, candidateEngine)
+                val candidatePlayback = measureSynthesisPlayback(
+                    health,
+                    relevant,
+                    candidateEngine,
+                    captureThermalStatus = runReversedOrder,
+                )
                 saveSample(sampleDir, "flowlm-$caseName-candidate.wav", candidatePlayback.result.audio)
 
                 val quality = AudioQuality.compare(referencePlayback.result.audio, candidatePlayback.result.audio)
+                val candidateRepeatQuality = AudioQuality.compare(candidateSpeedRun.audio, candidatePlayback.result.audio)
+                assertTrue(
+                    "candidate repeat correlation: ${candidateRepeatQuality.corr}",
+                    candidateRepeatQuality.corr >= MIN_REPEAT_CORRELATION,
+                )
                 val referenceRtf = referenceTake.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
-                    (referenceTake.ms / 1000.0)
+                    (referenceTake.ms.coerceAtLeast(1) / 1000.0)
                 val candidateRtf = candidateSpeedRun.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
                     (candidateSpeedRun.ms / 1000.0)
                 val audioSeconds = candidatePlayback.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE
@@ -351,33 +370,47 @@ class PowerBenchmarkTest {
                     "Flow-LM paired case=$caseName seed=$FLOW_LM_SEED " +
                         "referencePlacement=$referencePlacement candidateRequestedPlacement=${candidateEngine.placements} " +
                         "candidateRuntimeAccelerators=${candidateEngine.runtimeAccelerators} " +
-                        "referenceGraph=$referenceGraph candidateMultiGraph=$candidateMultiGraph",
+                        "referenceRuntimeAccelerators=$referenceRuntimeAccelerators " +
+                        "referenceGraph=$referenceGraph candidateMultiGraph=$candidateMultiGraph " +
+                        "voice=alba decoderPlacement=${defaultPlacement.dectx}/${defaultPlacement.deconly}",
                 )
                 Log.i(
                     TAG,
-                    "paragraph chars=${PARAGRAPH.length} words=$words audio=${fmt(audioSeconds)}s " +
+                    "order=reference-first paragraph chars=${PARAGRAPH.length} words=$words audio=${fmt(audioSeconds)}s " +
                         "referenceSamples=${referencePlayback.result.audio.size} " +
                         "candidateSamples=${candidatePlayback.result.audio.size} " +
                         "referenceNoPlay=${referenceTake.ms}ms candidateNoPlay=${candidateSpeedRun.ms}ms " +
                         "referenceRtf=${fmt(referenceRtf)}x candidateRtf=${fmt(candidateRtf)}x " +
+                        "referenceFirstAudio=${referencePlayback.result.profile.firstChunkMs}ms " +
+                        "candidateFirstAudio=${candidatePlayback.result.profile.firstChunkMs}ms " +
                         "referencePlaybackWall=${referencePlayback.elapsedMs}ms " +
                         "candidatePlaybackWall=${candidatePlayback.elapsedMs}ms " +
                         "qualityCorr=${fmt(quality.corr)}",
                 )
-                logFlowLmStages("reference", referencePlayback.result, referencePlayback.elapsedMs)
-                logFlowLmStages("candidate", candidatePlayback.result, candidatePlayback.elapsedMs)
+                logFlowLmStages("reference-first CPU dyn8", referencePlayback.result, referencePlayback.elapsedMs)
+                logFlowLmStages("reference-first GPU fp16 ms$lmSteps", candidatePlayback.result, candidatePlayback.elapsedMs)
 
-                logEnergy("audio-only", audioBaseline.deltaJoules)
-                logEnergy("reference synthesize+play", referencePlayback.deltaJoules)
+                logEnergy("order=reference-first audio-only", audioBaseline.deltaJoules)
+                logEnergy("order=reference-first CPU dyn8 synthesize+play", referencePlayback.deltaJoules)
                 logEnergy(
-                    "reference incremental model energy (full minus duration-scaled audio-only)",
+                    "order=reference-first CPU dyn8 incremental model energy",
                     incrementalEnergy(audioBaseline, referencePlayback),
                 )
-                logEnergy("candidate synthesize+play", candidatePlayback.deltaJoules)
+                logEnergy("order=reference-first GPU fp16 ms$lmSteps synthesize+play", candidatePlayback.deltaJoules)
                 logEnergy(
-                    "candidate incremental model energy (full minus duration-scaled audio-only)",
+                    "order=reference-first GPU fp16 ms$lmSteps incremental model energy",
                     incrementalEnergy(audioBaseline, candidatePlayback),
                 )
+
+                if (runReversedOrder) {
+                    Log.i(
+                        TAG,
+                        "thermal source=PowerManager.currentThermalStatus; direct temperature=unavailable",
+                    )
+                    logMeasurementInterval("order=reference-first audio-only", audioBaseline)
+                    logMeasurementInterval("order=reference-first CPU dyn8", referencePlayback.measurement)
+                    logMeasurementInterval("order=reference-first GPU fp16 ms$lmSteps", candidatePlayback.measurement)
+                }
 
                 // Preserve correlation and length in the log/samples. The user
                 // has judged the low-correlation GPU candidates acceptable by ear.
@@ -385,11 +418,193 @@ class PowerBenchmarkTest {
                 if (lmSteps > 1) {
                     assertEquals("requested multi-step Flow-LM backend loaded", lmPlacement, actualMultiBackend)
                 }
+                assertEquals("decoder-transformer backend differs from CPU reference", referenceRuntimeAccelerators["dectx"], candidateEngine.runtimeAccelerators["dectx"])
+                assertEquals("SEANet backend differs from CPU reference", referenceRuntimeAccelerators["dec"], candidateEngine.runtimeAccelerators["dec"])
             } finally {
                 candidateEngine.close()
             }
+
+            if (runReversedOrder) {
+                runFlowLmPowerBenchmarkCandidateFirst(
+                    caseName = caseName,
+                    lmPlacement = lmPlacement,
+                    lmGraph = referenceGraph,
+                    lmSteps = lmSteps,
+                    models = models,
+                    defaultPlacement = defaultPlacement,
+                    health = health,
+                    monitors = relevant,
+                    referenceAudio = referencePlayback.result.audio,
+                    sampleDir = sampleDir,
+                )
+            }
         } finally {
             if (!referenceEngineClosed) referenceEngine.close()
+        }
+    }
+
+    /** Repeat the paired power run in candidate-then-reference order. */
+    private fun runFlowLmPowerBenchmarkCandidateFirst(
+        caseName: String,
+        lmPlacement: Accel,
+        lmGraph: String,
+        lmSteps: Int,
+        models: PocketTtsModels,
+        defaultPlacement: Placement,
+        health: SystemHealthManager,
+        monitors: List<PowerMonitor>,
+        referenceAudio: FloatArray,
+        sampleDir: File,
+    ) {
+        val context = InstrumentationRegistry.getInstrumentation().targetContext
+        val candidatePlacement = defaultPlacement.copy(lm = lmPlacement)
+        val candidateEngine = PocketTtsEngine(
+            context,
+            PocketTtsConfig(
+                models = models,
+                placement = candidatePlacement,
+                lmGraph = lmGraph,
+                lmSteps = lmSteps,
+                noiseSeed = FLOW_LM_SEED,
+            ),
+        )
+
+        val candidateRuntimeAccelerators: Map<String, Accel>
+        val candidateSpeedRun: TtsResult
+        val candidatePlayback: MeasurementWithResult
+        val audioBaseline: Measurement
+        try {
+            assertEquals("candidate Flow-LM backend", lmPlacement, candidateEngine.runtimeAccelerators["lm"])
+            if (lmSteps > 1) {
+                assertEquals(
+                    "candidate multistep Flow-LM backend",
+                    lmPlacement,
+                    candidateEngine.runtimeAccelerators["lm_ms"],
+                )
+            }
+            val warmup = candidateEngine.stream("A short warmup sentence.", "alba") {}
+            assertTrue("candidate warmup produced no audio", warmup.audio.isNotEmpty())
+            candidateSpeedRun = candidateEngine.stream(PARAGRAPH, "alba") {}
+            assertTrue("candidate speed run produced no audio", candidateSpeedRun.audio.isNotEmpty())
+
+            audioBaseline = measurePlayback(
+                health,
+                monitors,
+                referenceAudio,
+                captureThermalStatus = true,
+            )
+            candidatePlayback = measureSynthesisPlayback(
+                health,
+                monitors,
+                candidateEngine,
+                captureThermalStatus = true,
+            )
+            val repeatQuality = AudioQuality.compare(candidateSpeedRun.audio, candidatePlayback.result.audio)
+            assertTrue(
+                "candidate repeat correlation in candidate-first order: ${repeatQuality.corr}",
+                repeatQuality.corr >= MIN_REPEAT_CORRELATION,
+            )
+            candidateRuntimeAccelerators = candidateEngine.runtimeAccelerators
+        } finally {
+            candidateEngine.close()
+        }
+
+        val referenceEngine = PocketTtsEngine(
+            context,
+            PocketTtsConfig(
+                models = models,
+                placement = defaultPlacement,
+                lmGraph = lmGraph,
+                lmSteps = 1,
+                noiseSeed = FLOW_LM_SEED,
+            ),
+        )
+        try {
+            val referenceRuntimeAccelerators = referenceEngine.runtimeAccelerators
+            assertEquals("CPU dynamic-int8 reference backend", Accel.CPU, referenceRuntimeAccelerators["lm"])
+            val warmup = referenceEngine.stream("A short warmup sentence.", "alba") {}
+            assertTrue("reference warmup produced no audio", warmup.audio.isNotEmpty())
+            val referenceSpeedRun = referenceEngine.stream(PARAGRAPH, "alba") {}
+            assertTrue("reference speed run produced no audio", referenceSpeedRun.audio.isNotEmpty())
+            val referencePlayback = measureSynthesisPlayback(
+                health,
+                monitors,
+                referenceEngine,
+                captureThermalStatus = true,
+            )
+            val referenceRepeatQuality = AudioQuality.compare(referenceSpeedRun.audio, referencePlayback.result.audio)
+            assertTrue(
+                "reference repeat correlation in candidate-first order: ${referenceRepeatQuality.corr}",
+                referenceRepeatQuality.corr >= MIN_REPEAT_CORRELATION,
+            )
+            assertEquals(
+                "decoder-transformer backend differs within candidate-first pair",
+                candidateRuntimeAccelerators["dectx"],
+                referenceRuntimeAccelerators["dectx"],
+            )
+            assertEquals(
+                "SEANet backend differs within candidate-first pair",
+                candidateRuntimeAccelerators["dec"],
+                referenceRuntimeAccelerators["dec"],
+            )
+
+            val quality = AudioQuality.compare(referencePlayback.result.audio, candidatePlayback.result.audio)
+            val referenceRtf = referenceSpeedRun.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                (referenceSpeedRun.ms.coerceAtLeast(1) / 1000.0)
+            val candidateRtf = candidateSpeedRun.audio.size.toDouble() / PocketTts.SAMPLE_RATE /
+                (candidateSpeedRun.ms.coerceAtLeast(1) / 1000.0)
+            val words = PARAGRAPH.split(Regex("\\s+")).size
+            val candidateMultiGraph = if (lmSteps > 1) PocketTts.msGraph(lmSteps) else "none"
+
+            saveSample(
+                sampleDir,
+                "flowlm-$caseName-candidate-first-cpu-dyn8-reference.wav",
+                referencePlayback.result.audio,
+            )
+            saveSample(
+                sampleDir,
+                "flowlm-$caseName-candidate-first-candidate.wav",
+                candidatePlayback.result.audio,
+            )
+            Log.i(
+                TAG,
+                "Flow-LM paired order=candidate-first case=$caseName seed=$FLOW_LM_SEED voice=alba " +
+                    "textChars=${PARAGRAPH.length} referenceGraph=$lmGraph candidateMultiGraph=$candidateMultiGraph " +
+                    "candidateRuntimeAccelerators=$candidateRuntimeAccelerators " +
+                    "referenceRuntimeAccelerators=$referenceRuntimeAccelerators " +
+                    "decoderPlacement=${defaultPlacement.dectx}/${defaultPlacement.deconly}",
+            )
+            Log.i(
+                TAG,
+                "order=candidate-first words=$words " +
+                    "referenceMs=${referencePlayback.elapsedMs} candidateMs=${candidatePlayback.elapsedMs} " +
+                    "referenceNoPlayMs=${referenceSpeedRun.ms} candidateNoPlayMs=${candidateSpeedRun.ms} " +
+                    "referenceRtf=${fmt(referenceRtf)}x candidateRtf=${fmt(candidateRtf)}x " +
+                    "referenceSamples=${referencePlayback.result.audio.size} " +
+                    "candidateSamples=${candidatePlayback.result.audio.size} " +
+                    "referenceFirstAudio=${referenceSpeedRun.profile.firstChunkMs}ms " +
+                    "candidateFirstAudio=${candidateSpeedRun.profile.firstChunkMs}ms " +
+                    "qualityCorr=${fmt(quality.corr)}",
+            )
+            logFlowLmStages("candidate-first CPU dyn8 reference", referencePlayback.result, referencePlayback.elapsedMs)
+            logFlowLmStages("candidate-first GPU fp16 ms$lmSteps candidate", candidatePlayback.result, candidatePlayback.elapsedMs)
+
+            logMeasurementInterval("order=candidate-first audio-only", audioBaseline)
+            logMeasurementInterval("order=candidate-first GPU fp16 ms$lmSteps", candidatePlayback.measurement)
+            logMeasurementInterval("order=candidate-first CPU dyn8", referencePlayback.measurement)
+            logEnergy("order=candidate-first audio-only", audioBaseline.deltaJoules)
+            logEnergy("order=candidate-first GPU fp16 ms$lmSteps synthesize+play", candidatePlayback.deltaJoules)
+            logEnergy(
+                "order=candidate-first GPU fp16 ms$lmSteps incremental model energy",
+                incrementalEnergy(audioBaseline, candidatePlayback),
+            )
+            logEnergy("order=candidate-first CPU dyn8 synthesize+play", referencePlayback.deltaJoules)
+            logEnergy(
+                "order=candidate-first CPU dyn8 incremental model energy",
+                incrementalEnergy(audioBaseline, referencePlayback),
+            )
+        } finally {
+            referenceEngine.close()
         }
     }
 
@@ -400,6 +615,7 @@ class PowerBenchmarkTest {
             TAG,
             "$label streamMs=${result.ms}ms playbackWall=${playbackElapsedMs}ms " +
                 "audio=${fmt(audioSeconds)}s frames=${result.frames} " +
+                "firstAudio=${profile.firstChunkMs}ms " +
                 "lmSteps=${profile.lmSteps} lmInvocations=${profile.lmInvocations}",
         )
         Log.i(
@@ -543,17 +759,20 @@ class PowerBenchmarkTest {
         health: SystemHealthManager,
         monitors: List<PowerMonitor>,
         audio: FloatArray,
+        captureThermalStatus: Boolean = false,
     ): Measurement {
         val track = newTrack()
         return try {
             val before = powerSnapshot(health, monitors)
+            val thermalStart = if (captureThermalStatus) currentThermalStatus() else null
             val startMs = SystemClock.elapsedRealtime()
             track.play()
             writeAudio(track, audio)
             drain(track, audio.size)
             val elapsedMs = SystemClock.elapsedRealtime() - startMs
+            val thermalEnd = if (captureThermalStatus) currentThermalStatus() else null
             val after = powerSnapshot(health, monitors)
-            Measurement(before, after, elapsedMs, deltaJoules(before, after))
+            Measurement(before, after, elapsedMs, deltaJoules(before, after), thermalStart, thermalEnd)
         } finally {
             track.release()
         }
@@ -563,10 +782,12 @@ class PowerBenchmarkTest {
         health: SystemHealthManager,
         monitors: List<PowerMonitor>,
         engine: PocketTtsEngine,
+        captureThermalStatus: Boolean = false,
     ): MeasurementWithResult {
         val track = newTrack()
         return try {
             val before = powerSnapshot(health, monitors)
+            val thermalStart = if (captureThermalStatus) currentThermalStatus() else null
             val startMs = SystemClock.elapsedRealtime()
             track.play()
             val result = engine.newSession("alba").use { session ->
@@ -574,13 +795,32 @@ class PowerBenchmarkTest {
             }
             drain(track, result.audio.size)
             val elapsedMs = SystemClock.elapsedRealtime() - startMs
+            val thermalEnd = if (captureThermalStatus) currentThermalStatus() else null
             val after = powerSnapshot(health, monitors)
             MeasurementWithResult(
-                Measurement(before, after, elapsedMs, deltaJoules(before, after)),
+                Measurement(before, after, elapsedMs, deltaJoules(before, after), thermalStart, thermalEnd),
                 result,
             )
         } finally {
             track.release()
+        }
+    }
+
+    private fun currentThermalStatus(): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return "unavailable_api<29"
+        val power = InstrumentationRegistry.getInstrumentation().targetContext
+            .getSystemService(PowerManager::class.java)
+            ?: return "unavailable_no_power_manager"
+        val status = power.currentThermalStatus
+        return when (status) {
+            PowerManager.THERMAL_STATUS_NONE -> "none"
+            PowerManager.THERMAL_STATUS_LIGHT -> "light"
+            PowerManager.THERMAL_STATUS_MODERATE -> "moderate"
+            PowerManager.THERMAL_STATUS_SEVERE -> "severe"
+            PowerManager.THERMAL_STATUS_CRITICAL -> "critical"
+            PowerManager.THERMAL_STATUS_EMERGENCY -> "emergency"
+            PowerManager.THERMAL_STATUS_SHUTDOWN -> "shutdown"
+            else -> "unknown_$status"
         }
     }
 
@@ -692,6 +932,15 @@ class PowerBenchmarkTest {
         Log.i(TAG, "$label: $rendered")
     }
 
+    private fun logMeasurementInterval(label: String, measurement: Measurement) {
+        Log.i(
+            TAG,
+            "$label duration=${measurement.elapsedMs}ms " +
+                "thermalStart=${measurement.thermalStartStatus ?: "not-captured"} " +
+                "thermalEnd=${measurement.thermalEndStatus ?: "not-captured"}",
+        )
+    }
+
     private fun saveSample(directory: File, name: String, audio: FloatArray) {
         assertTrue("could not create sample directory: ${directory.absolutePath}", directory.mkdirs() || directory.isDirectory)
         val file = File(directory, name)
@@ -716,6 +965,8 @@ class PowerBenchmarkTest {
         val after: Snapshot,
         val elapsedMs: Long,
         val deltaJoules: Map<String, Double>,
+        val thermalStartStatus: String?,
+        val thermalEndStatus: String?,
     )
 
     private data class MeasurementWithResult(
