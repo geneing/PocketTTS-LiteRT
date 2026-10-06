@@ -129,6 +129,7 @@ class FlowLmHarnessTest {
                         var source = bankA
                         var destination = if (tryAlias) bankA else bankB
                         var result = "PASS"
+                        var completed = 0
                         for (step in 1..steps) {
                             if (useHostCacheWrites) {
                                 val t = System.nanoTime()
@@ -151,6 +152,7 @@ class FlowLmHarnessTest {
                             val scalar = scalarBuffer.readFloat().single()
                             scalarReadNs += System.nanoTime() - t
                             check(scalar == step.toFloat()) { "step $step scalar=$scalar, expected $step; cache chaining lost state" }
+                            completed++
                             if (useHostCacheWrites) {
                                 cache[0] += row[0]
                             } else if (!tryAlias) {
@@ -160,11 +162,15 @@ class FlowLmHarnessTest {
                             }
                         }
                         val pssAfterRun = Debug.getPss()
-                        lines += "status=$result steps=$steps scalar_expected=1..$steps"
-                        lines += String.format(Locale.US,
-                            "load_ms=%.3f initial_cache_write_ms=%.3f row_write_ms_per_step=%.3f full_cache_write_ms_per_step=%.3f run_ms_per_step=%.3f scalar_read_sync_ms_per_step=%.3f",
-                            loadMs, initMs, rowWriteNs / steps / 1e6, cacheWriteNs / steps / 1e6,
-                            runNs / steps / 1e6, scalarReadNs / steps / 1e6)
+                        lines += "status=$result completed_steps=$completed requested_steps=$steps scalar_expected=1..$completed"
+                        if (result == "PASS") {
+                            lines += String.format(Locale.US,
+                                "load_ms=%.3f initial_cache_write_ms=%.3f row_write_ms_per_step=%.3f full_cache_write_ms_per_step=%.3f run_ms_per_step=%.3f scalar_read_sync_ms_per_step=%.3f",
+                                loadMs, initMs, rowWriteNs / steps / 1e6, cacheWriteNs / steps / 1e6,
+                                runNs / steps / 1e6, scalarReadNs / steps / 1e6)
+                        } else {
+                            lines += "timing=invalid because the requested alias route failed"
+                        }
                         lines += "host_bytes_per_step=${CACHE_ROW_BYTES + if (useHostCacheWrites) CACHE_BYTES else 0} host_read_bytes_per_step=${Float.SIZE_BYTES} initial_host_cache_bytes=$CACHE_BYTES"
                         lines += "pss_kb=[before=$pssBefore,after_load=$pssAfterLoad,after_buffers=$pssAfterBuffers,after_run=$pssAfterRun]"
                         lines += "device_side_copy_bytes_per_step=unverified; requires Tensor dispatch trace or hardware counters"
