@@ -19,6 +19,10 @@ whether the external float32 cache protocol survives quantization.
 explicitly leaving every external input and output float32. Calibration walks
 an eager free run from pinned preset voice states, sampling positions and K/V
 cache magnitudes. The output is opt-in and is never installed by this script.
+
+``--recipe static16_floatio`` applies the corresponding W8/A16 recipe with
+the same float32 host interface. It is an isolated NPU quality experiment.
+``--recipe static16_fc_floatio`` limits W8/A16 to fully connected operations.
 """
 
 from __future__ import annotations
@@ -39,6 +43,8 @@ CANDIDATE_STEMS = {
     "dynamic8": "pt_flowlm_fused_dyn8_all_contiguous",
     "static16": "pt_flowlm_fused_st16_all_contiguous",
     "static8": "pt_flowlm_fused_st8_floatio_contiguous",
+    "static16_floatio": "pt_flowlm_fused_st16_floatio_contiguous",
+    "static16_fc_floatio": "pt_flowlm_fused_st16_fc_floatio_contiguous",
 }
 
 
@@ -79,7 +85,7 @@ def check_interface(source: Path, quantized: Path, require_float_io: bool) -> No
         print("WARNING: quantized external I/O is incompatible with the current Android float cache path")
 
 
-def inspect_internal_quantization(path: Path) -> None:
+def inspect_internal_quantization(path: Path, activation_bits: int) -> None:
     from collections import Counter
     from ai_edge_litert.interpreter import Interpreter
 
@@ -88,15 +94,25 @@ def inspect_internal_quantization(path: Path) -> None:
     ops = Counter(detail["op_name"] for detail in interpreter._get_ops_details())
     print(f"internal tensor dtypes: {dict(tensors)}")
     print(f"quantization ops: QUANTIZE={ops['QUANTIZE']} DEQUANTIZE={ops['DEQUANTIZE']}")
-    if not any("int8" in dtype for dtype in tensors) or ops["QUANTIZE"] == 0:
-        raise AssertionError("static8 recipe did not produce internally quantized tensors")
+    activation_type = f"int{activation_bits}"
+    if not any(activation_type in dtype for dtype in tensors) or ops["QUANTIZE"] == 0:
+        raise AssertionError(f"static W8/A{activation_bits} recipe did not quantize activations")
 
 
-def quantize_static8(source: Path, candidate: Path, samples: list[dict]) -> None:
+def quantize_static_floatio(
+    source: Path, candidate: Path, samples: list[dict], activation_bits: int,
+    fully_connected_only: bool = False,
+) -> None:
     from ai_edge_quantizer import algorithm_manager, calibrator, qtyping, quantizer
 
     qt = quantizer.Quantizer(float_model=str(source))
-    qt.load_quantization_recipe("static_wi8_ai8")
+    if fully_connected_only:
+        qt.load_quantization_recipe(bp.quant_recipe({
+            "kind": "static", "ops": ["FULLY_CONNECTED"],
+            "weight_bits": 8, "act_bits": activation_bits, "regex": ".*",
+        }))
+    else:
+        qt.load_quantization_recipe(f"static_wi8_ai{activation_bits}")
     for op in (qtyping.TFLOperationName.INPUT, qtyping.TFLOperationName.OUTPUT):
         qt.update_quantization_recipe(
             regex=".*", operation_name=op,
@@ -132,6 +148,24 @@ class InterpreterRunner:
         ) for detail in self.outputs]
 
 
+class GroupStepRunner:
+    """Run the shipped group-major graph's step signature (prefill is index 0)."""
+
+    def __init__(self, path: Path):
+        from ai_edge_litert.compiled_model import CompiledModel
+
+        self.model = CompiledModel.from_file(str(path))
+        self.index = 1
+        self.inputs = self.model.create_input_buffers(self.index)
+        self.outputs = self.model.create_output_buffers(self.index)
+
+    def __call__(self, *arrays):
+        for buffer, array in zip(self.inputs, arrays):
+            buffer.write(np.ascontiguousarray(array, dtype=np.float32).ravel())
+        self.model.run_by_index(self.index, self.inputs, self.outputs)
+        return [np.array(self.outputs[0].read(1 + bp.LDIM + 2 * bp.G_KV, np.float32))]
+
+
 def check_short_rollout(
     path: Path, steps: int, compare_group_dyn8: bool,
     baseline_graph: Path | None = None, voice: str = "alba",
@@ -151,7 +185,7 @@ def check_short_rollout(
     x_q = x_ref.numpy().copy()
     float_io = all(d["dtype"] == np.float32 for side in signature(path) for d in side)
     runner = bp.CM(str(path)) if float_io else InterpreterRunner(path)
-    baseline_runner = bp.CM(str(baseline_graph)) if baseline_graph else None
+    baseline_runner = GroupStepRunner(baseline_graph) if baseline_graph else None
     if baseline_runner:
         pk_base, pv_base = pk_ref.numpy().copy(), pv_ref.numpy().copy()
         x_base = x_ref.numpy().copy()
@@ -251,7 +285,7 @@ def main() -> None:
     parser.add_argument("--recipe", choices=CANDIDATE_STEMS, default="dynamic8")
     parser.add_argument("--out", type=Path, default=Path(os.environ.get("PT_OUT", bp.OUT)))
     parser.add_argument("--check-only", action="store_true")
-    parser.add_argument("--steps", type=int, help="host free-run parity steps (static8 default 32; others 4)")
+    parser.add_argument("--steps", type=int, help="host free-run parity steps (float-I/O static default 32; others 4)")
     parser.add_argument("--calibration-samples", type=int, default=8)
     parser.add_argument("--calibration-run", type=int, default=128)
     parser.add_argument("--calibration-voices", default="alba",
@@ -262,7 +296,7 @@ def main() -> None:
                         help="optional group-major CPU dyn8 graph for a paired free-run baseline")
     args = parser.parse_args()
     if args.steps is None:
-        args.steps = 32 if args.recipe == "static8" else 4
+        args.steps = 32 if args.recipe in ("static8", "static16_floatio", "static16_fc_floatio") else 4
     if args.steps < 1 or args.steps > bp.PMAX:
         parser.error(f"--steps must be in 1..{bp.PMAX}")
     source = args.out / f"{SOURCE_STEM}.tflite"
@@ -300,8 +334,12 @@ def main() -> None:
             print(f"calibration settings: voices={voices} seed={args.calibration_seed} "
                   f"samples={len(samples)} run_per_voice={args.calibration_run}")
             candidate.unlink(missing_ok=True)
-            if args.recipe == "static8":
-                quantize_static8(source, candidate, samples)
+            if args.recipe in ("static8", "static16_floatio", "static16_fc_floatio"):
+                activation_bits = 8 if args.recipe == "static8" else 16
+                quantize_static_floatio(
+                    source, candidate, samples, activation_bits,
+                    fully_connected_only=args.recipe == "static16_fc_floatio",
+                )
             else:
                 bp.to_quant(
                     str(source), str(candidate), bp.QUANT_VARIANTS["st16_all"],
@@ -311,8 +349,8 @@ def main() -> None:
     if not candidate.is_file():
         parser.error(f"missing candidate graph: {candidate}")
     check_interface(source, candidate, require_float_io=args.recipe != "static16")
-    if args.recipe == "static8":
-        inspect_internal_quantization(candidate)
+    if args.recipe in ("static8", "static16_floatio", "static16_fc_floatio"):
+        inspect_internal_quantization(candidate, 8 if args.recipe == "static8" else 16)
     if args.compare_dyn8 and not args.compare_dyn8.is_file():
         parser.error(f"missing CPU dyn8 baseline graph: {args.compare_dyn8}")
     check_short_rollout(candidate, args.steps,
