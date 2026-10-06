@@ -1,7 +1,7 @@
 FlowLM Pixel 10 option 6: host gate and device measurement plan
 Date: 2026-10-05
 Branch: codex/flowlm-option-6-cpu-retune
-Status: implementation and host validation complete; Pixel 10 measurements pending.
+Status: implementation, host validation, and paired Pixel 10 A/B/B/A measurements complete for the tested short and medium cases, plus long Alba. Long Marius is still running.
 
 Control
   Graph: pt_flowlm_fused_dyn8_all.tflite (shipped CPU dynamic int8)
@@ -55,7 +55,53 @@ Selective fp32 EOS candidate: stopped at host gate
 
 Host validation
   .\gradlew :app:compileDebugAndroidTestKotlin --offline --quiet : PASS.
-  No adb, installation, or Pixel instrumentation was run by this agent.
-  Device acceptance remains open for the thread-count candidate. A win requires
-  improved paired full-pipeline time or joules without truncation or audible
-  degradation, under the same decoder placement and workload.
+
+Pixel 10 paired measurements
+  Device: Pixel 10 / frankel, Android 17 API 37, LiteRT 2.2.0, fingerprint
+  google/frankel/frankel:17/CP3A.260905.009/16091614:user/release-keys.
+  Control and candidate both use the shipped graph SHA above and the same
+  placement (LM CPU, decoder transformer NPU, SEANet GPU), seed 42. The
+  harness runs A/B/B/A, n=2 per arm, with fresh models. All completed A/B and
+  B/A sample correlations were 1.000. First-audio percentiles are n=2 and are
+  descriptive only. Times below are inference medians from the paired summary;
+  energy values are the harness's audio-only-subtracted aggregate estimate.
+
+  | Voice / regime | Audio | Default inference | 6-thread inference | Default -> 6-thread first audio p50/p95 | Incremental energy default -> 6 threads | Result |
+  |---|---:|---:|---:|---:|---:|---|
+  | Alba / short | 1.84 s | 817.5 ms | 1,241.5 ms (+51.8%) | 818/836 -> 1,242/1,469 ms | 0.00 -> -17.83 J | Slower; energy window invalid |
+  | Marius / short | 1.52 s | 770.0 ms | 949.0 ms (+23.2%) | 771/782 -> 950/1,011 ms | 0.00 -> 14.41 J | Slower; energy window invalid |
+  | Alba / medium | 7.68 s | 3,348 ms | 3,635 ms (+8.6%) | 1,571/1,744 -> 1,405/1,424 ms | 0.00 -> 0.00 J | Slower inference; energy unavailable |
+  | Marius / medium | 6.72 s | 2,845.5 ms | 3,326 ms (+16.9%) | 1,445/1,500 -> 1,658/1,730 ms | -31.91 -> -30.18 J | Slower; energy subtraction invalid |
+  | Alba / long | 60.72 s | 25,374.5 ms | 27,866.5 ms (+9.8%) | 1,274/1,326 -> 1,267/1,344 ms | 59.29 -> 65.41 J (+10.3%) | Slower and higher estimated energy |
+
+  The long Alba run produced 759 frames and 1,457,280 PCM samples in every
+  arm, with correlation 1.000 and thermal status 0 -> 0. The longer-run energy
+  estimate is the only usable pair in this sample; PowerMonitor returned zero
+  or negative audio-subtracted energy for short and medium cases. The
+  aggregate rail estimate can include overlapping domains and is not a
+  whole-device energy total. Saved WAVs are on-device under
+  `files/power-benchmark/flowlm-cpu-variant-*.wav`; the run log is the ignored
+  `scripts/out/option6-power-all.log`.
+
+Prompt-only thread matrix
+  All 18 paired cases passed for both voices, prompt lengths 4, 33, and 385,
+  and thread settings 2, 4, and 6. Candidate outputs were byte-identical to
+  their LiteRT-default counterpart (max difference 0). Six threads improved
+  near-capacity prompt compute by about 19-23% in the repeated prompt harness,
+  but the full-pipeline short, medium, and long results above were slower.
+  This isolated prefill/prompt result does not justify changing the production
+  thread default.
+
+Selective EOS precision outcome
+  The EOS candidate was rejected before device testing: dynamic-int8
+  quantization folded it back into a graph with identical operator topology,
+  tensor metadata, and readable constant buffers to the shipped graph. The
+  option therefore has no distinct executable to benchmark.
+
+Acceptance
+  Do not promote six threads. The six-thread candidate failed the full-pipeline
+  latency gate in every completed voice/regime and increased the only usable
+  long-run energy estimate. The full acceptance matrix (all three audio
+  lengths for both voices, full sustained thermal checks, and listening review)
+  is incomplete; no production path changed. The long Marius A/B run was
+  already in progress when this report snapshot was written and is pending.
