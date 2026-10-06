@@ -1,7 +1,7 @@
 FlowLM option 2: bucketed CPU int8 prompt prefill
 Date: 2026-10-05
 Branch: codex/flowlm-option-2-int8-prefill
-Status: CPU int8 host parity passed for isolated buckets; Pixel 10 acceptance pending
+Status: host and Pixel 10 tensor parity passed; prefill was slower than sequential int8, so it remains disabled
 
 Implementation
   Static, headless prefill signatures: P=16 (index 0), P=1 (1), P=8 (2);
@@ -42,25 +42,35 @@ Host validation
   difference 4.72e-02. These are quantization deltas, not prefill deltas.
   Python syntax and Android instrumentation compilation: PASS.
 
-Pixel 10 acceptance still required
-  1. Install this branch's debug app and test APK, preserving pushed models:
-       .\gradlew :app:installDebug :app:installDebugAndroidTest
-  2. Push this branch's scripts/out/pt_flowlm_fused_dyn8_all.tflite into
-     /sdcard/Android/data/com.pockettts/files/ after host parity completes.
-  3. Run exactly one instrumentation method (CPU dynamic int8):
-       adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#compareBucketedInt8PrefillAgainstSequentialOracle com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
-     The default matrix is lengths 1,7,8,9,15,16,17,31,32,33,50 and near
-     capacity for alba and marius. Pull the report from the app's external
-     files/flowlm-harness/prefill-*/report.txt directory. Record graph hash,
-     device fingerprint, load time, peak RSS, per-case total/run time, and each
-     row's K/V difference plus the first post-prompt decode difference.
-  4. If all quantized parity cases pass, run the paired full-pipeline CPU int8
-     A/B protocol in flowlm-pixel10-optimization-research.md: 3 prompt and
-     3 audio regimes, 2 voices, identical seed, cold/warm, forward and reverse
-     order, Android power monitors with audio-only subtraction, same Mimi
-     placement, p50/p95 first audio, total synthesis, J and J/s speech, RTF,
-     peak RSS, temperature and sustained drift. Listen to WAVs and check text
-     completion, duration, speaker stability, and early EOS. Keep the path
-     opt-in until this gate shows a win over sequential CPU int8.
+Pixel 10 focused acceptance result
+  Instrumentation: FlowLmHarnessTest#compareBucketedInt8PrefillAgainstSequentialOracle
+  Device/build: Pixel 10 (frankel), Android 17, fingerprint
+    google/frankel/frankel:17/CP3A.260905.009/16091614:user/release-keys
+  Graph hash: d7ee9bc3e9ef13fe82776e4d3825a6555f20e42338e4fe79b778458d04e84b25
+  CompiledModel load: 2,589.53 ms. Peak app RSS: 2,384,056 KiB.
+  Bucket order: P16, P1, P8; chosen buckets never pad beyond remaining tokens.
+  Matrix: alba and marius; 1, 7, 8, 9, 15, 16, 17, 31, 32, 33, 50, and
+    near-capacity 385 tokens (voice prefix 126, final occupied position 511).
+  Every real K and V row matched the sequential int8 oracle with max absolute
+    difference 0.0. The first zero-noise BOS decode EOS, latent, K, and V also
+    matched exactly for every matrix case. Instrumentation result: PASS.
 
-No Pixel 10 timings, energy, or quality claims have been made for this branch.
+  Paired within-process case timings from the report (sequential total /
+  bucketed total, in ms):
+
+    alba 1: 25.505 / 43.664 (0.584x); 8: 110.455 / 161.206 (0.685x);
+    16: 218.474 / 262.407 (0.833x); 32: 433.815 / 469.242 (0.925x);
+    50: 659.278 / 747.394 (0.882x); 385: 5,256.528 / 5,777.421 (0.910x).
+    marius 1: 14.830 / 21.359 (0.694x); 8: 109.986 / 125.400 (0.877x);
+    16: 219.465 / 242.658 (0.904x); 32: 431.848 / 491.475 (0.879x);
+    50: 677.724 / 763.802 (0.887x); 385: 5,255.413 / 5,722.374 (0.918x).
+
+  The full matrix is saved on the device at
+  /storage/emulated/0/Android/data/com.pockettts/files/flowlm-harness/
+  prefill-20261005-204154-027/report.txt and copied to the ignored local file
+  scripts/out/option2-pixel-report.txt. These are single harness pass timings,
+  not medians or a reversed-order full-pipeline A/B. The new path was slower in
+  every case (0.531x-0.925x); even the 385-token case was 8-10% slower. No full
+  audio, first-audio p50/p95, PowerMonitor energy, or listening assessment was
+  run after this gate failed. PocketTtsConfig.usePrefill stays false. The path
+  is not a performance win and must not be enabled.
