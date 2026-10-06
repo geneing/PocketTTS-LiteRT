@@ -20,6 +20,7 @@ import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
 import dev.pockettts.Accel
+import dev.pockettts.G5PerformanceModel
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsConfig
 import dev.pockettts.PocketTtsEngine
@@ -519,6 +520,11 @@ class FlowLmHarnessTest {
         }
         val loadStart = System.nanoTime()
         val model = CompiledModel.create(path.absolutePath, options, if (backend == Accel.NPU) environment else null)
+        val highPerformance = if (backend == Accel.NPU &&
+            args.getString("g5HighPerformance")?.toBooleanStrictOrNull() == true
+        ) {
+            G5PerformanceModel.create(requireNotNull(environment), path.absolutePath)
+        } else null
         val loadMs = (System.nanoTime() - loadStart) / 1e6
         try {
             val stepInput = runCatching { model.createInputBuffers(1) }.getOrNull()
@@ -558,7 +564,9 @@ class FlowLmHarnessTest {
                     input[5].writeFloat(pv)
                     input[6].writeFloat(zeroNoise)
                     val started = System.nanoTime()
-                    if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
+                    if (highPerformance != null) {
+                        highPerformance.run(input, output, if (stepInput != null) 1 else 0)
+                    } else if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
                     elapsed += System.nanoTime() - started
                     val values = output.single().readFloat()
                     check(values.size == outputPerToken) {
@@ -583,6 +591,7 @@ class FlowLmHarnessTest {
                 output.forEach { it.close() }
             }
         } finally {
+            highPerformance?.close()
             model.close()
         }
     }
