@@ -1,7 +1,8 @@
 # FlowLM option 3 implementation status
 
-Date: 2026-10-05. Device: Pixel 10 / Tensor G5. Focused harness checks and
-capacity safety probes were run on-device; full speech acceptance remains
+Date: 2026-10-05. Device: Pixel 10 / Tensor G5. Focused harness checks,
+capacity safety probes, the named-buffer regression check, and short speech
+pairs on two voices were run on-device; medium/long and power acceptance remain
 pending.
 
 ## Implemented prototype
@@ -66,9 +67,9 @@ the app's model store raises `FileNotFoundException` naming the absent graph.
 | 128 graph export | Pending; no bundled voice fits its planned audio budget |
 | Exact prefix repack / bucket planner | Passed on Pixel 10 |
 | Android Kotlin compile | Passed: `:app:compileDebugAndroidTestKotlin` with Gradle 9.6 |
-| Pixel 10 parity, short/medium/near-capacity prompts | Short prompt matched 512 output bytes exactly; 46-token prompt was safely rejected at 256 and completed using 512 fallback; near-capacity speech not run |
-| End-to-end speech completion, two voices, long streaming chunks | Pending |
-| Paired CPU-int8 timing, energy, first audio, thermal/RSS review | Not run; short one-step timing only |
+| Pixel 10 parity, short/medium/near-capacity prompts | Short prompt matched 512 output bytes exactly; 46-token prompt was safely rejected at 256 and completed using 512; 256/512 named shape/write check passed |
+| End-to-end speech completion | Short streaming pair passed on Alba and Marius in both orders; medium/long speech and long streaming chunks pending |
+| Paired CPU-int8 timing, energy, first audio, thermal/RSS review | Short speech timing measured; no energy comparison; medium/long, sustained thermal, and listening review pending |
 | Real fp16/int8 KV graph I/O and quality assessment | Not implemented; harness simulation leaves float32 staging intact; fp16/int8 byte counts are analytical equivalents, not measured traffic |
 
 No capacity or KV-precision variant is a performance win until it passes the
@@ -122,26 +123,49 @@ square difference `0.000119100`. This matches the expected capacity policy;
 it does not establish a 256-token speed win for medium or long speech.
 
 The 360-token near-capacity control remains a prompt-cache diagnostic and
-cannot safely produce full speech in the 256 bucket. The focused device checks
-did not capture speech audio or power measurements.
+cannot safely produce full speech in the 256 bucket. Four short streaming
+speech A/B runs are now recorded below; they do not include power measurements
+or medium/long speech.
 
 The first full `shortSpeechCapacityPair` attempt failed before audio with a
 LiteRT host buffer error (`2052` bytes available, `32832` bytes supplied)
-while writing the step mask. The graph files advertise the expected named step
-mask and KV shapes, but `PocketTtsEngine` used positional signature selection
-while the focused harness created its buffers directly. The engine now binds
-and runs `serving_default` by name and checks mask/KV dimensions against
-`lmCapacity` before synthesis. A focused instrumentation method checks both
-candidate and reference graph shapes through the engine's model store. The
-full speech fix still needs a Pixel rerun; the failed run has no performance
-or quality result.
+while writing the step mask. The graph files advertised the expected named
+step mask and KV shapes, but `PocketTtsEngine` selected buffers positionally.
+The engine now binds and runs `serving_default` by name and checks mask/KV
+dimensions against `lmCapacity` before synthesis. After rebuilding and
+installing the option 3 APKs, `capacityGraphNamedStepShapesMatchHostBuffers`
+passed on Pixel in 4.227 s and exercised the 256- and 512-position mask writes.
+The failure was a real app buffer-binding bug and is covered by the regression
+test; it was not a capacity-planning rejection.
 
 Host inspection of the actual artifacts found `serving_default` at signature
 index 1 in both files, with mask shapes `[1,16,1,257]` and `[1,16,1,513]` and
-K/V shapes `[1,96,256,64]` and `[1,96,512,64]`. The Android test compile passed
-after the named binding and shape checks were added.
+K/V shapes `[1,96,256,64]` and `[1,96,512,64]`. The Android test compile and
+on-device named-binding shape/write regression check passed.
 
-## Exact device follow-up
+The corrected full short-speech pair passed in both run orders for Alba and
+Marius. Each pair used the same text (`Hello there, how are you?`), seed 42,
+streaming mode, and production decoder placement (LM CPU, decoder transformer
+NPU, SEANet GPU). The candidate graph SHA-256 was
+`a9a7147c06f7f474346805b66a756b64d19f5e0eb49468c253eb78f12e060b8a`; the
+512-position control was
+`895cd59e4c8256000e9bd3855e6b6f87f00e3ad9a2b093cbe70df018370a10f9`.
+
+| Voice | 256 candidate synthesis / first audio | 512 control synthesis / first audio | Output | Two-run median synthesis |
+|---|---:|---:|---|---:|
+| Alba | 637 / 637 ms, 605 / 605 ms | 771 / 771 ms, 919 / 919 ms | 18 frames / 1.44 s for both; waveform corr 0.999999999999998 | 621 vs 845 ms; 1.36x faster |
+| Marius | 626 / 626 ms, 544 / 544 ms | 578 / 578 ms, 825 / 825 ms | 11 frames / 0.88 s for both; waveform corr 0.999999999999987 | 585 vs 701.5 ms; 1.20x faster |
+
+Each comma-separated measurement is one order: candidate-first, then
+reference-first. These are two runs per graph, not a p50/p95 distribution.
+Candidate engine-load times varied from 2.27 to 3.21 s; control loads varied
+from 2.26 to 2.89 s, so the short synthesis gain does not establish a cold
+start improvement. No speech was truncated in these four runs. Listening,
+transcription, energy, and sustained thermal review have not been performed.
+Reports and WAVs are retained under
+`scripts/out/option3-speech-device/speech-*/` in this worktree.
+
+## Reproduction commands
 
 Build the 256 variant with the pinned WSL reference checkout and conversion
 environment, then push `pt_flowlm_fused_dyn8_all_pmax256.tflite` beside the
@@ -157,11 +181,11 @@ adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#shortSpeechC
 adb pull /sdcard/Android/data/com.pockettts/files/flowlm-harness
 ```
 
-Repeat with a second bundled voice, 1-5 and 25-50 token prompts, and a
-near-capacity prompt that still fits the planned frames. Use matched 512 runs
-and reverse A/B order. Inspect every prompt row and the first decode row;
-`first_step_over_1e-3` is diagnostic, not an acceptance gate. Full short,
-medium, and long speech, one-shot and streaming, paired Android power monitors
-with audio-only subtraction, RSS, temperatures, listening, and the graph,
-runtime, dispatch, and AOT details still need separate acceptance runs under
-the research protocol.
+The short-speech command above was completed for both Alba and Marius in both
+orders. Remaining acceptance is medium/long speech when the full planned frame
+budget fits the chosen bucket, one-shot comparison, paired Android power
+monitor runs with audio-only subtraction, RSS/temperature checks, and listening
+review. The 256 bucket cannot cover the 46-token Mary case with its 217-frame
+budget, so that case must use 512 or a separately proven fallback. Near-capacity
+prompt parity remains a prompt-cache diagnostic, not a speech test. No
+production capacity policy change is claimed from the short pairs alone.
