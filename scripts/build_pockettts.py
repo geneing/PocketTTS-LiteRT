@@ -353,6 +353,17 @@ def int8_step_oracle(path, step_idx, pre_args, real, off0):
     return np.stack(nk_rows)[None], np.stack(nv_rows)[None]
 
 
+def first_kv_group_mismatch(candidate, reference, tolerance=1e-5):
+    """Locate the first layer/head with a real K/V row above tolerance."""
+    delta = np.abs(np.asarray(candidate) - np.asarray(reference))
+    by_group = delta.reshape(N_LAYERS, N_HEADS, HD).max(axis=-1)
+    bad = np.argwhere(by_group > tolerance)
+    if not len(bad):
+        return "none"
+    layer, head = bad[0]
+    return f"layer={layer} head={head} max|d|={by_group[layer, head]:.2e}"
+
+
 def opcheck(path, label):
     import collections
     from ai_edge_litert.interpreter import Interpreter
@@ -694,8 +705,17 @@ def stage_fused(model):
             name = "prefill" if P == 16 else f"prefill_{P}"
             extra.append((name, pre, args))
             prefill_cases[P] = (args, real, nk_ref, nv_ref, pk_ref, pv_ref)
+            with torch.no_grad():
+                eager = pre(*args).numpy().reshape(-1)
+            eager_k = eager[:P * G_KV].reshape(P, G_KV)[:real]
+            eager_v = eager[P * G_KV:].reshape(P, G_KV)[:real]
+            eager_k_diff = maxd(eager_k, nk_ref.numpy()[0])
+            eager_v_diff = maxd(eager_v, nv_ref.numpy()[0])
             print(f"prefill signature {name}: P={P}, index={PREFILL_SIGNATURE_INDEX[P]}, "
-                  f"real rows={real}, output floats={2 * P * G_KV}")
+                  f"real rows={real}, output floats={2 * P * G_KV}, "
+                  f"eager K/V max|d|={eager_k_diff:.2e}/{eager_v_diff:.2e}")
+            assert eager_k_diff <= 1e-5 and eager_v_diff <= 1e-5, (
+                f"eager prefill P={P} diverged from token oracle")
 
     p = convert_multi(fused, example, extra, os.path.join(OUT, "pt_flowlm_fused.tflite"))
     opcheck(p, "flowlm_fused")
@@ -730,7 +750,9 @@ def stage_fused(model):
             for i in range(real):
                 print(f"  {label} prefill P={P} position={i} "
                       f"K max|d| {maxd(nk_p[0, i], nk_ref[0, i].numpy()):.2e} "
-                      f"V max|d| {maxd(nv_p[0, i], nv_ref[0, i].numpy()):.2e}")
+                      f"V max|d| {maxd(nv_p[0, i], nv_ref[0, i].numpy()):.2e} "
+                      f"first K group {first_kv_group_mismatch(nk_p[0, i], nk_ref[0, i].numpy())} "
+                      f"first V group {first_kv_group_mismatch(nv_p[0, i], nv_ref[0, i].numpy())}")
 
 
 G_KV = N_LAYERS * N_HEADS * HD
@@ -1830,7 +1852,9 @@ def stage_quant(model):
                 for i in range(real):
                     print(f"  int8 prefill P={P} position={i} "
                           f"K max|d| {maxd(nk_batch[0, i], nk_ref[0, i]):.2e} "
-                          f"V max|d| {maxd(nv_batch[0, i], nv_ref[0, i]):.2e}")
+                          f"V max|d| {maxd(nv_batch[0, i], nv_ref[0, i]):.2e} "
+                          f"first K group {first_kv_group_mismatch(nk_batch[0, i], nk_ref[0, i])} "
+                          f"first V group {first_kv_group_mismatch(nv_batch[0, i], nv_ref[0, i])}")
 
 
 def main():

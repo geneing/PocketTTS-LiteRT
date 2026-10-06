@@ -17,6 +17,7 @@ import org.junit.runner.RunWith
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -193,7 +194,8 @@ class FlowLmHarnessTest {
         val lines = arrayListOf(
             "CPU int8 bucketed prefill acceptance probe",
             "device=${android.os.Build.MODEL} (${android.os.Build.DEVICE}) Android ${android.os.Build.VERSION.RELEASE}",
-            "graph=$graph load_ms=${String.format(Locale.US, "%.2f", loadMs)} step_signature=${stepBuffers.signatureIndex}",
+            "build_fingerprint=${android.os.Build.FINGERPRINT}",
+            "graph=$graph sha256=${sha256(graphFile)} load_ms=${String.format(Locale.US, "%.2f", loadMs)} step_signature=${stepBuffers.signatureIndex}",
             "prefill_signature_order=${PocketTts.PREFILL_BUCKETS.joinToString()}",
             "buckets choose largest <= remaining tokens; no padding rows",
             "voices=${voiceNames.joinToString()} text=$sourceText",
@@ -318,10 +320,10 @@ class FlowLmHarnessTest {
                         Locale.US,
                         "%s buckets=%s reference_total_ms=%.3f reference_run_ms=%.3f " +
                             "prefill_total_ms=%.3f prefill_ms_per_token=%.4f " +
-                            "prefill_run_ms=%.3f prefill_calls=%d speedup=%.3fx",
+                            "prefill_run_ms=%.3f prefill_calls=%d speedup=%.3fx peak_rss_kb=%s",
                         case, bucketPlan.joinToString("+"), referenceTotalNs / 1e6, referenceRunNs / 1e6,
                         prefillTotalNs / 1e6, prefillMsPerToken, prefillRunNs / 1e6, prefillCalls,
-                        referenceTotalNs.toDouble() / prefillTotalNs,
+                        referenceTotalNs.toDouble() / prefillTotalNs, peakRssKb() ?: "unavailable",
                     )
                     lines += summaryLine
                     Log.i(TAG, summaryLine)
@@ -762,6 +764,27 @@ class FlowLmHarnessTest {
         val input = ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN)
         return FloatArray(bytes.size / Float.SIZE_BYTES) { input.float }
     }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val chunk = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(chunk)
+                if (count < 0) break
+                digest.update(chunk, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
+    /** VmHWM is the process high water RSS in KiB, including this test's earlier cases. */
+    private fun peakRssKb(): String? = runCatching {
+        File("/proc/self/status").useLines { lines ->
+            lines.firstOrNull { it.startsWith("VmHWM:") }
+                ?.substringAfter(':')?.trim()?.substringBefore(' ')
+        }
+    }.getOrNull()
 
     private fun maxDiff(a: FloatArray, b: FloatArray): Double {
         require(a.size == b.size) { "diff size mismatch: ${a.size} vs ${b.size}" }
