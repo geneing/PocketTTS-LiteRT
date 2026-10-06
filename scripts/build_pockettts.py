@@ -702,12 +702,17 @@ def stage_fused(model):
                 pv_r[0, :, off0 + i] = nv[0, :, 0]
 
     suffix = flowlm_capacity_suffix()
-    p = convert_multi(
-        fused, example, extra, os.path.join(OUT, f"pt_flowlm_fused{suffix}.tflite")
-    )
-    opcheck(p, "flowlm_fused")
-    fp16 = to_fp16(p, os.path.join(OUT, f"pt_flowlm_fused_fp16{suffix}.tflite"))
-    opcheck(fp16, "flowlm_fused_fp16")
+    p = os.path.join(OUT, f"pt_flowlm_fused{suffix}.tflite")
+    fp16 = os.path.join(OUT, f"pt_flowlm_fused_fp16{suffix}.tflite")
+    if os.environ.get("PT_REUSE_FUSED") == "1":
+        if not os.path.isfile(p) or not os.path.isfile(fp16):
+            raise FileNotFoundError("PT_REUSE_FUSED=1 requires both fused artifacts in PT_OUT")
+        print(f"reusing fused artifacts for parity: {p} and {fp16}")
+    else:
+        p = convert_multi(fused, example, extra, p)
+        opcheck(p, "flowlm_fused")
+        fp16 = to_fp16(p, fp16)
+        opcheck(fp16, "flowlm_fused_fp16")
 
     # The step signature, on the fp16 file that actually ships.
     c, s = rope_cos_sin_deint(off0)
@@ -716,7 +721,7 @@ def stage_fused(model):
                     torch.from_numpy(s).view(1, 1, 1, HD),
                     torch.from_numpy(make_mask(off0)), pk, pv, noises[0])
     outs = run_signature(
-        fp16, None,
+        fp16, 1 if P > 0 else 0,
         (bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
          s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
          noises[0].numpy()),

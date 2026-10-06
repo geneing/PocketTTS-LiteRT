@@ -57,7 +57,8 @@ the app's model store raises `FileNotFoundException` naming the absent graph.
 | Check | Status |
 |---|---|
 | Exporter syntax | Passed with bundled Python AST parse |
-| Capacity graph export and tensor parity | Pending; export environment/model weights not exercised here |
+| 256 graph export and tensor parity | Passed WSL export and one-step eager parity; device comparison pending |
+| 128 graph export | Pending; no bundled voice fits its planned audio budget |
 | Exact prefix repack / bucket planner | Added as focused `FlowLmHarnessTest` instrumentation method; not run on device |
 | Android Kotlin compile | Passed: `:app:compileDebugAndroidTestKotlin` with Gradle 9.6 |
 | Pixel 10 parity, short/medium/near-capacity prompts | Pending |
@@ -71,9 +72,26 @@ versions, device fingerprint, workload, power method, and listening review
 recorded. The precision path needs a real lower-precision graph input and
 supported Android tensor-buffer writes before transfer savings can be claimed.
 
-The documented reference clone and conversion virtual environment were absent
-at the repository paths in WSL, so no reduced-capacity `.tflite` was generated
-in this checkpoint. The 128/256/512 graph parity and Pixel 10 rows are pending.
+The pinned reference clone (`001cf6e`) was placed in the ignored
+`references/pocket-tts` directory, and the 256 graph was exported with the
+existing WSL conversion environment. Its first conversion finished, but the
+parity check revealed that the exporter used signature 0 (prefill) for the
+fused one-step check; the correct step signature is 1. The exporter now selects
+the right index and supports `PT_REUSE_FUSED=1` to repeat parity on the exact
+existing artifacts without paying for conversion again.
+
+| 256 artifact | Bytes | SHA-256 |
+|---|---:|---|
+| `pt_flowlm_fused_dyn8_all_pmax256.tflite` | 87,504,288 | `a9a7147c06f7f474346805b66a756b64d19f5e0eb49468c253eb78f12e060b8a` |
+
+The 256 fp16 one-step output matched eager with correlation 1.000000 and
+max absolute difference `1.02e-5`. Its prefill signature's new K/V differed
+from sequential eager by at most `1.19e-5`/`3.81e-6`. The dynamic-int8 graph
+versus eager reported latent/K/V correlations `0.999813`/`0.999912`/`0.999164`
+and EOS max absolute difference `0.656`; this is a quantized one-step probe,
+not a speech-quality result. Logs are in the ignored `build/option3-fused-256-parity.log`
+and `build/option3-quant-256.log` in this worktree. The Pixel 10 comparison
+against the shipped 512 dynamic-int8 graph is pending.
 
 ## Exact device follow-up
 
@@ -83,6 +101,7 @@ shipped 512 graph. Run one instrumentation method at a time:
 
 ```powershell
 .\gradlew.bat :app:installDebug :app:installDebugAndroidTest
+adb push build\option3-graphs\256\pt_flowlm_fused_dyn8_all_pmax256.tflite /sdcard/Android/data/com.pockettts/files/
 adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#capacityPlannerAndVoicePrefixRepackingAreExact com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
 adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#runTextPromptHarness -e lmGraph pt_flowlm_fused_dyn8_all.tflite -e lmCapacity 256 -e backends CPU -e voice alba -e text 'Hello.' -e kvPrecision fp32 com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
 adb pull /sdcard/Android/data/com.pockettts/files/flowlm-harness
