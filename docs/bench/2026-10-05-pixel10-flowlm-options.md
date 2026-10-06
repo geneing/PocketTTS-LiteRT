@@ -80,16 +80,18 @@ audio correlation 1.000. First-audio p50/p95 values are descriptive at n=2.
 | Alba / medium | 7.68 s | 3,348 ms | 3,635 ms | 1,571/1,744 -> 1,405/1,424 ms | 0.00 -> 0.00 J (unavailable) |
 | Marius / medium | 6.72 s | 2,845.5 ms | 3,326 ms | 1,445/1,500 -> 1,658/1,730 ms | -31.91 -> -30.18 J (invalid) |
 | Alba / long | 60.72 s | 25,374.5 ms | 27,866.5 ms | 1,274/1,326 -> 1,267/1,344 ms | 59.29 -> 65.41 J (+10.3%) |
+| Marius / long | 55.12 s | 23,244.5 ms | 27,719 ms | 1,190/1,207 -> 1,635/1,710 ms | 56.62 -> 63.28 J (+11.8%) |
 
-Long Alba produced all 759 frames and 1,457,280 samples per arm; thermal
-status remained 0. PowerMonitor returned zero or negative audio-subtracted
-energy for short and medium runs, so those energy readings cannot rank the
-candidate. The long-run aggregate is an estimate and may include overlapping
-rail domains. The device WAVs remain under the app's `power-benchmark` files
-directory; the full console/logcat record is in ignored `scripts/out`.
+Both long runs produced complete output in every arm (Alba: 759 frames / 60.72 s;
+Marius: 689 frames / 55.12 s), with PCM correlation 1.000 and thermal status
+0 -> 0. PowerMonitor returned zero or negative audio-subtracted energy for
+short and medium runs, so those readings cannot rank the candidate. Both long
+energy estimates were higher at six threads; the aggregate may include
+overlapping rail domains. Device WAVs remain under the app's `power-benchmark`
+files directory; the full console/logcat record is in ignored `scripts/out`.
 
 ## Acceptance coverage
 
-The baseline paragraph test is one long utterance on alba and a same-configuration repeat; it is a control repeatability check, not an A/B against an optimization. Option 2 completed its bucketed prompt/first-decode parity matrix but failed its prefill speed gate, so it was not promoted to full speech testing. Option 3 completed focused short-capacity and safe-fallback probes but has no full-speech audio or power comparison. Option 1 stopped at the tiny cache-chain gate because actual device-side cache copy volume is unknown. Options 4 and 5 stopped before a Pixel candidate artifact/model was available. Option 6 completed short and medium full-pipeline pairs on both voices and a long Alba pair; every completed case was slower at six threads, and the long pair used 10.3% more estimated energy. Its long Marius run is still in progress.
+The baseline paragraph test is one long utterance on alba and a same-configuration repeat; it is a control repeatability check, not an A/B against an optimization. Option 2 completed its bucketed prompt/first-decode parity matrix but failed its prefill speed gate, so it was not promoted to full speech testing. Option 3 completed focused short-capacity and safe-fallback probes but has no full-speech audio or power comparison. Option 1 stopped at the tiny cache-chain gate because actual device-side cache copy volume is unknown. Options 4 and 5 stopped before a Pixel candidate artifact/model was available. Option 6 completed short, medium, and long full-pipeline pairs on both voices; every case was slower at six threads, and long energy estimates were 10-12% higher. Full-pipeline tests for 2/4 threads and listening review remain incomplete.
 
 No option has completed the full acceptance matrix of three prompt lengths, three audio lengths, two voices, reversed paired runs against CPU int8, first-audio percentiles, audio-subtracted PowerMonitor energy, sustained thermal checks, and listening review. No performance win or production-path change is claimed. The exact requirements are in [`flowlm-pixel10-optimization-research.md`](../flowlm-pixel10-optimization-research.md).
