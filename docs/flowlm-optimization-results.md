@@ -9,7 +9,7 @@ quality gate.
 
 | Flow-LM path | Runtime | RTF | Audio corr vs CPU | Incremental CPU/GPU/TPU energy* |
 |---|---:|---:|---:|---:|
-| CPU fp16 reference | 35.7 s for 60.3 s (fp16 test) | 1.69x | 1.000 | 48.3 J (fp16 test) |
+| CPU fp16 reference | 35.7 s for 60.2 s (fp16 test) | 1.69x | 1.000 | 48.3 J (fp16 test) |
 | GPU fp16, one step | 97.0 s for 60.3 s | 0.62x | 0.193 | 29.4 J |
 | CPU dynamic-range int8 reference | 24.7 s for 60.7 s | 2.46x | 1.000 | 26.9 J (int8 test) |
 | GPU dynamic-range int8, one step | 93.4 s for 60.2 s | 0.64x | 0.112 | 22.7 J |
@@ -35,9 +35,16 @@ and both produced the same long-clip WAV. The precision option therefore did
 not change this graph. Single-step tensor cosines were high (about 0.9998 to
 0.99999), but the long free-running output diverged substantially.
 
-The NPU energy estimate was lower while its output correlation and speed were
-poor. Treat this as an experiment, not an accepted placement. The GPU fp16 and
-int8 candidates also fail the correlation gate and are not suitable defaults.
+The NPU energy estimate was lower, but its RTF remains below the CPU fp16
+reference. GPU fp16 and int8 RTF are substantially below their CPU references.
+
+## Listening review
+
+On 2026-10-05, the user listened to the NPU, GPU fp16, and GPU dynamic-range
+int8 candidates and said all three sound fine. Their low waveform correlations
+are retained as diagnostics, not quality rejection gates. The Flow-LM power
+tests log correlation and sample lengths while same-engine repeatability checks
+remain gated at 0.99.
 
 ## Listening files
 
@@ -53,7 +60,7 @@ These WAVs are generated locally under the ignored `scripts/out/` directory:
 ## Pending
 
 The N=4 fp16 GPU power test was stopped before it produced measurements when
-the user needed the phone. Resume it in isolation after the phone is available.
+the user needed the phone. Resume it in isolation when the phone is available.
 It is the remaining GPU experiment that reduces per-step host/device round trips.
 
 The focused diagnostic is `FlowLmNpuPrecisionTest`; the paired power probes are

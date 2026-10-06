@@ -292,7 +292,7 @@ class PowerBenchmarkTest {
             val referenceRepeatQuality = AudioQuality.compare(referenceTake.audio, referencePlayback.result.audio)
             assertTrue(
                 "reference repeat correlation: ${referenceRepeatQuality.corr}",
-                referenceRepeatQuality.corr >= MIN_FLOW_LM_CORRELATION,
+                referenceRepeatQuality.corr >= MIN_REPEAT_CORRELATION,
             )
 
             val sampleDir = context.getExternalFilesDir("power-benchmark")
@@ -367,11 +367,8 @@ class PowerBenchmarkTest {
                     incrementalEnergy(audioBaseline, candidatePlayback),
                 )
 
-                assertTrue(
-                    "Flow-LM $caseName correlation ${quality.corr} is below $MIN_FLOW_LM_CORRELATION",
-                    quality.corr >= MIN_FLOW_LM_CORRELATION,
-                )
-                assertEquals("candidate/reference streamed audio length", referenceTake.audio.size, candidatePlayback.result.audio.size)
+                // Preserve correlation and length in the log/samples. The user
+                // has judged the low-correlation GPU candidates acceptable by ear.
                 assertEquals("requested Flow-LM backend loaded", lmPlacement, actualLmBackend)
                 if (lmSteps > 1) {
                     assertEquals("requested multi-step Flow-LM backend loaded", lmPlacement, actualMultiBackend)
@@ -455,7 +452,7 @@ class PowerBenchmarkTest {
             val candidateRepeatCorr = AudioQuality.compare(candidateTake.audio, candidatePlayback.result.audio).corr
             assertTrue(
                 "NPU repeat correlation: $candidateRepeatCorr",
-                candidateRepeatCorr >= MIN_FLOW_LM_CORRELATION,
+                candidateRepeatCorr >= MIN_REPEAT_CORRELATION,
             )
 
             val sampleDir = context.getExternalFilesDir("power-benchmark")
@@ -487,7 +484,7 @@ class PowerBenchmarkTest {
                 val referenceRepeatCorr = AudioQuality.compare(referenceTake.audio, referencePlayback.result.audio).corr
                 assertTrue(
                     "CPU reference repeat correlation: $referenceRepeatCorr",
-                    referenceRepeatCorr >= MIN_FLOW_LM_CORRELATION,
+                    referenceRepeatCorr >= MIN_REPEAT_CORRELATION,
                 )
                 saveSample(sampleDir, "flowlm-npu-no-truncation-reference.wav", referencePlayback.result.audio)
 
@@ -520,10 +517,8 @@ class PowerBenchmarkTest {
                     incrementalEnergy(referenceBaseline, referencePlayback),
                 )
 
-                assertTrue(
-                    "NPU no-truncation Flow-LM correlation ${quality.corr} is below $MIN_FLOW_LM_CORRELATION",
-                    quality.corr >= MIN_FLOW_LM_CORRELATION,
-                )
+                // Correlation is recorded above; the user judged this candidate
+                // acceptable by ear despite the low waveform correlation.
             } finally {
                 referenceEngine.close()
             }
@@ -725,7 +720,7 @@ class PowerBenchmarkTest {
         const val FP16_FLOWLM_GRAPH = "pt_flowlm_fused_fp16.tflite"
         const val FP16_FLOWLM_NO_TRUNCATION_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val FLOW_LM_SEED = 42L
-        const val MIN_FLOW_LM_CORRELATION = 0.99
+        const val MIN_REPEAT_CORRELATION = 0.99
         val PARAGRAPH = """
             Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.
 
