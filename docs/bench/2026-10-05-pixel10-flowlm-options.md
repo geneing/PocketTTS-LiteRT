@@ -71,7 +71,8 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 9. G5 static INT8 | `codex/flowlm-g5-static-int8` | Calibrated W8/A8 NPU recipe with float external tensors | Host quality failed at step 0 (latent corr 0.0105, EOS delta 6.465); 32-step minimum corr -0.1744. Stopped before AOT or Pixel test; see [candidate report](2026-10-06-flow-g5-static-int8-candidate.md) |
 | 10. G5 `HIGH_PERFORMANCE` runtime mode | `codex/flowlm-g5-high-performance` | Native LiteRT C opaque `google_tensor` option, `performance_mode=3`; harness-only opt-in | Two long Alba pairs averaged 29.827 / 25.052 s NPU/CPU (`1.191x`), all 759 frames; mean first audio 1.524 / 1.137 s. Improves NPU time 8.7% over option 7 position-major FP16, but still misses parity; see [candidate report](2026-10-06-g5-high-performance.md) |
 | 11. G5 FP16 `half` truncation | `codex/flowlm-g5-half-truncation` | Existing position-major FP16 graph compiled with AOT `--truncation half` | Host/AOT only: 717/717 ops in one G5 partition; 33.3 s compile, same 172.4 MB size as no-truncation but different SHA. Pixel latency/quality pending |
-| 12. G5 static W8/A16 | `codex/flowlm-g5-static-w8a16` | Calibrated AEQ W8/A16; all-op and FC-only variants preserve float32 I/O | Host parity failed: all-op first-step latent corr -0.074; FC-only 0.950 at step 0 but minimum 0.011 by step 32. Stopped before AOT/Pixel; see [candidate report](2026-10-06-flow-g5-static-w8a16-candidate.md) |
+| 12. G5 static W8/A16 | `codex/flowlm-g5-static-w8a16` | Calibrated AEQ W8/A16; all-op, FC-only, and selective FFN variants preserve float32 I/O | All-op/FC-only variants failed host parity. Selective FFN12 reached first-step corr 0.9998 and 32-step min 0.670; G5 AOT compiled 694/694 ops in one partition. Pixel speed/speech acceptance pending; see [initial report](2026-10-06-flow-g5-static-w8a16-candidate.md) and [selective/AOT report](2026-10-06-flow-g5-selective-w8a16-candidate.md) |
+| 13. G5 dynamic INT8 + `HIGH_PERFORMANCE` | `codex/flowlm-g5-high-performance` | Existing position-major W8/float AOT artifact with native `performance_mode=3` | Two long Alba pairs averaged 51.919 / 24.793 s NPU/CPU (`2.094x`), 753/759 frames. About 2% faster than default-mode INT8, still fails speed and completion; details in [runtime report](2026-10-06-g5-high-performance.md) |
 
 ### Option 6: CPU thread tuning
 
@@ -199,6 +200,9 @@ first audio averaged 1.524 s versus 1.137 s. The reversed order confirms the
 result, but CPU parity is still not reached. Code and harness changes are
 isolated on `codex/flowlm-g5-high-performance`; exact run data are in the
 [high-performance candidate report](2026-10-06-g5-high-performance.md).
+Applying the same setting to the position-major dynamic INT8 graph averaged
+51.919 s NPU versus 24.793 s CPU (2.094x), with the NPU again stopping at 753
+of 759 frames; this improved the default INT8 NPU timing by only about 2%.
 
 ### Option 11: FP16 AOT half truncation
 
@@ -212,14 +216,16 @@ the source and artifact checksums and AOT limits.
 
 ### Option 12: calibrated static W8/A16
 
-Two AEQ 0.8.0 candidates preserved the Android float32 tensor interface: one
-quantized all supported operations, and the other quantized fully connected
-operations only. The all-op graph failed on step zero (latent correlation
--0.0736, EOS delta 6.485); FC-only began at 0.9497 correlation but drifted to a
-32-step minimum of 0.0106, with EOS delta up to 5.98. Neither passed host
-parity, so neither was AOT compiled or run on the Pixel. The exact tensor counts,
-calibration setup, checksums, and step traces are in the [W8/A16 candidate
-report](2026-10-06-flow-g5-static-w8a16-candidate.md).
+AEQ 0.8.0 all-op W8/A16 failed on step zero (latent correlation -0.0736,
+EOS delta 6.485); FC-only began at 0.9497 but drifted to a 32-step minimum of
+0.0106. A selective variant quantized only 12 of 47 fully connected matrices
+(59.6% of dense weights), leaving Q/K/V, attention, EOS, and flow head in
+FP32. It reached first-step correlation 0.9998 and a 32-step minimum of
+0.6699, versus -0.1247 for the CPU dynamic INT8 host rollout on the same seed.
+The G5 compiler placed all 694/694 ops in one partition, but compiled-device
+numerics, speed and long speech completion remain untested. Initial all-op and
+FC-only details are in the [W8/A16 report](2026-10-06-flow-g5-static-w8a16-candidate.md);
+selective coverage, drift and AOT details are in the [FFN report](2026-10-06-flow-g5-selective-w8a16-candidate.md).
 
 ### How other runtimes manage KV state
 

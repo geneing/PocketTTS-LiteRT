@@ -32,6 +32,58 @@ These two pairs support a narrower latency gap, not a production switch or a
 causal claim that the vendor changed NPU clocks. LiteRT accepts the option
 and inference works; there is no direct vendor acknowledgement in logcat.
 
+## Dynamic INT8 G5 with HIGH_PERFORMANCE
+
+The existing `pt_flowlm_fused_dyn8_all_contiguous_half_g5.tflite` AOT graph
+was run with the same native `performance_mode = 3` option and position-major
+persistent AHWB cache. Its SHA-256 is
+`bc8bd5c19495958dfc5b77915dea314c38a9127b839fd357e076d9038cb56acd`.
+Both orderings used the fixed long Alba utterance, seed 42, one energy repeat,
+and the CPU dynamic INT8 reference. No graph was recompiled for this probe.
+
+| Order | NPU | CPU | NPU / CPU | Frames NPU / CPU | First audio NPU / CPU | LM graph run NPU / CPU | Thermal |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| NPU then CPU | 51.653 s | 24.917 s | 2.073x | 753 / 759 | 2.836 / 1.113 s | 35.807 / 14.922 s | 0 |
+| CPU then NPU | 52.184 s | 24.668 s | 2.115x | 753 / 759 | 2.802 / 1.125 s | 36.041 / 14.795 s | 0 |
+| Mean | 51.919 s | 24.793 s | 2.094x | 753 / 759 | 2.819 / 1.119 s | 35.924 / 14.859 s | 0 |
+
+The NPU produced 60.24 s of audio, six frames or 0.48 s short of the CPU's
+60.72 s. The LM input/run/read stages averaged 1.290 / 35.924 / 2.490 s on
+NPU and 2.323 / 14.859 / 0.125 s on CPU. The native cache
+output-map/cache-map/row-copy/unmap components averaged
+0.115 / 0.106 / 1.907 / 0.119 s; the persistent input and packed output
+buffers reported AHWB type 2. Candidate Mimi decoder transformer and SEANet
+averaged 3.416 / 4.571 s, versus 1.793 / 4.504 s on the CPU-LM arm.
+Thus cache row patch cost cannot explain the roughly 21.1 s LM graph-run gap.
+
+The paired WAV comparison returned correlation 0.0807276, lag 0,
+SNR 0.0284 dB, high-band error 0.0882 dB, reference HNR 0.7958 dB,
+and candidate HNR 0.9283 dB in both orders. These are diagnostics, not an
+intelligibility assessment. The incomplete output and 2.094x mean latency
+reject this combination. HIGH_PERFORMANCE did not change the dynamic INT8
+graph's viability; the default-mode position-major INT8 run was also about
+2.13x CPU and six frames short. The native opt-in remains off by default.
+
+The direct instrumentation arguments were:
+
+```text
+-e class com.pockettts.FlowLmHarnessTest#npuResidentCacheSpeechPair
+-e workload long -e voice alba -e seed 42 -e energyRepeats 1
+-e order npu-cpu   # repeat with cpu-npu
+-e npuResidentCache false -e npuSliceCache true
+-e npuPositionMajorCache true -e verifyNpuSliceRows false
+-e g5HighPerformance true
+-e npuGraph pt_flowlm_fused_dyn8_all_contiguous_half.tflite
+```
+
+Reports and WAVs were pulled locally to ignored
+`build/int8-highperf/speech-20261006-162459-489/` and
+`build/int8-highperf/speech-20261006-163012-588/` in this worktree.
+Each directory contains `report.txt`, `npu.wav`, and `cpu.wav`; the reports
+include the raw stage, energy, PSS, quality, and output-file records. The
+corresponding device directories are under
+`/sdcard/Android/data/com.pockettts/files/flowlm-npu-slice-position-major/`.
+
 ## Native API and opt-in path
 
 The pinned `litert-2.2.0.aar` exports `LiteRtCreateOpaqueOptions`,

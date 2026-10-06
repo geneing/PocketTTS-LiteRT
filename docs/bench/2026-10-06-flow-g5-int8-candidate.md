@@ -81,6 +81,13 @@ CPU-first pair; these are diagnostics, not standalone speech-quality verdicts.
 The WAVs for the reversed position-major pair are preserved under ignored
 `build/flowlm-g5-int8/dyn8-reversed-position-major-device/`.
 
+The same position-major INT8 artifact was also run with native Tensor G5
+`HIGH_PERFORMANCE` mode enabled. Across both orders it averaged 51.919 s NPU
+versus 24.793 s CPU (2.094×), with 753/759 frames; this is only about 2.2%
+faster than its default-mode 53.074 s NPU mean and still fails speed and
+completion. See the [runtime-mode report](2026-10-06-g5-high-performance.md)
+for stage timings and paired reports/WAVs.
+
 The stage timings identify where the measured gap occurs: each NPU LM
 `CompiledModel.run()` total was 36.3-37.1 s, versus about 15.0 s for the CPU
 int8 graph. In the two group-major orders, NPU host input transfer averaged
