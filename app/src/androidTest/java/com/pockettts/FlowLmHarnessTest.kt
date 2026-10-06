@@ -200,6 +200,8 @@ class FlowLmHarnessTest {
             ?.toBooleanStrictOrNull() ?: false
         val verifyNpuSliceRows = args.getString("verifyNpuSliceRows")
             ?.toBooleanStrictOrNull() ?: false
+        val g5HighPerformance = args.getString("g5HighPerformance")
+            ?.toBooleanStrictOrNull() ?: false
         require(!(npuResidentCache && npuSliceCache)) {
             "select either npuResidentCache or npuSliceCache"
         }
@@ -270,6 +272,7 @@ class FlowLmHarnessTest {
                     npuSliceCache = isNpu && npuSliceCache,
                     npuPositionMajorCache = isNpu && npuPositionMajorCache,
                     verifyNpuSliceRows = isNpu && verifyNpuSliceRows,
+                    g5HighPerformance = isNpu && g5HighPerformance,
                 ),
             )
             try {
@@ -331,7 +334,7 @@ class FlowLmHarnessTest {
             "fingerprint=${android.os.Build.FINGERPRINT}",
             "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
             "powerMonitors=${relevantMonitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
-            "candidateGraph=$npuGraph cacheMode=$cacheMode npuPositionMajorCache=$npuPositionMajorCache verifyNpuSliceRows=$verifyNpuSliceRows sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
+            "candidateGraph=$npuGraph cacheMode=$cacheMode npuPositionMajorCache=$npuPositionMajorCache verifyNpuSliceRows=$verifyNpuSliceRows g5HighPerformance=$g5HighPerformance sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
             "referenceGraph=$referenceGraph placement=lm:CPU dectx:NPU dec:GPU",
             "candidatePlacement=${candidate.backends} loadMs=${candidate.loadMs} pssKb=${candidate.pssBeforeRunKb}->${candidate.pssAfterRunKb}",
             "referencePlacement=${reference.backends} loadMs=${reference.loadMs} pssKb=${reference.pssBeforeRunKb}->${reference.pssAfterRunKb}",

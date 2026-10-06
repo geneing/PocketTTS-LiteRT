@@ -111,6 +111,25 @@ Handle c_handle(JNIEnv* env, jobject object) {
   return result;
 }
 
+// Unlike TensorBuffer, litert::Environment does not derive from BaseHandle.
+// In v2.2.0 it stores runtime_ first, then handle_ (both unique_ptr objects
+// with std::function deleters). Read the first word of handle_, not runtime_.
+Handle environment_handle(JNIEnv* env, jobject object) {
+  if (!object) { fail(env, "null LiteRT Environment"); return nullptr; }
+  jclass cls = env->FindClass("com/google/ai/edge/litert/JniHandle");
+  if (!cls) return nullptr;
+  jfieldID field = env->GetFieldID(cls, "handle", "J");
+  if (!field) return nullptr;
+  const jlong wrapper = env->GetLongField(object, field);
+  if (!wrapper) { fail(env, "closed LiteRT Environment"); return nullptr; }
+  using Pointer = std::unique_ptr<void, std::function<void(void*)>>;
+  Handle result = nullptr;
+  std::memcpy(&result, reinterpret_cast<const char*>(static_cast<intptr_t>(wrapper)) +
+                           sizeof(Pointer), sizeof(result));
+  if (!result) fail(env, "null LiteRT C environment handle");
+  return result;
+}
+
 struct NativeModel { Handle model = nullptr; Handle compiled = nullptr; };
 }  // namespace
 
@@ -120,7 +139,7 @@ Java_dev_pockettts_G5PerformanceModel_00024Companion_nativeCreate(
   const auto& a = api();
   if (!a.valid()) { fail(env, "LiteRT 2.2.0 C model API unavailable"); return 0; }
   if (!path) { fail(env, "null model path"); return 0; }
-  Handle c_env = c_handle(env, environment);
+  Handle c_env = environment_handle(env, environment);
   if (env->ExceptionCheck()) return 0;
   const char* file = env->GetStringUTFChars(path, nullptr);
   if (!file) return 0;

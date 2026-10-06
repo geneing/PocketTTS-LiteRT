@@ -126,6 +126,12 @@ class PocketTtsEngine(
     val lmGraphName: String = config.lmGraph ?: PocketTts.LM
 
     internal val lm: CompiledModel = load(lmGraphName, "lm", placement.lm)
+    private val highPerformanceLm: G5PerformanceModel? = if (config.g5HighPerformance) {
+        val graph = PocketTts.g5Variant(lmGraphName)
+        G5PerformanceModel.create(npuEnv(), models.store.file(graph).absolutePath).also {
+            android.util.Log.i("PocketTTS", "experimental G5 HIGH_PERFORMANCE active for $graph")
+        }
+    } else null
     internal val lmMs: CompiledModel? =
         if (lmSteps > 1) load(PocketTts.msGraph(lmSteps), "lm_ms", placement.lm) else null
     internal val dectx: CompiledModel = load(PocketTts.DEC_TX, "dectx", placement.dectx)
@@ -229,7 +235,9 @@ class PocketTtsEngine(
 
     /** Run the fused step on buffers created above (last signature when named). */
     internal fun runLm(ins: List<TensorBuffer>, outs: List<TensorBuffer>) {
-        if (lmStepIn != null) lm.run(ins, outs, 1) else lm.run(ins, outs)
+        if (highPerformanceLm != null) {
+            highPerformanceLm.run(ins, outs, if (lmStepIn != null) 1 else 0)
+        } else if (lmStepIn != null) lm.run(ins, outs, 1) else lm.run(ins, outs)
     }
 
     /** Seed one cache bank from the selected voice and restore A -> B roles. */
@@ -518,6 +526,7 @@ class PocketTtsEngine(
             lmIn, lmOut, lmResidentIn, lmResidentOut, lmMsIn, lmMsOut, dectxIn, dectxOut, deconlyIn, deconlyOut,
             deconlyWIn, deconlyWOut, prefillIn, prefillOut,
         ).forEach { l -> l?.forEach { it.close() } }
+        highPerformanceLm?.close()
         lm.close(); lmMs?.close(); dectx.close(); deconly.close(); deconlyW?.close()
         embChannel.close()
         npuEnvironment?.close()
