@@ -55,7 +55,7 @@ class PocketTtsSession internal constructor(
     val voices: List<Voice> get() = engine.voices
 
     private val G = PocketTts.G
-    private val PMAX = PocketTts.PMAX
+    private val PMAX = engine.lmCapacity
     private val HD = PocketTts.HD
     private val NH = PocketTts.NH
     private val LDIM = PocketTts.LDIM
@@ -109,6 +109,10 @@ class PocketTtsSession internal constructor(
     fun loadVoice(name: String) {
         if (name == voiceName) return
         val state = engine.voiceState(name)
+        require(state.len < PMAX) {
+            "voice '$name' prefix (${state.len} frames) leaves no prompt position in " +
+                "the selected FlowLM capacity $PMAX"
+        }
         voiceK = state.k
         voiceV = state.v
         voiceLen = state.len
@@ -471,12 +475,17 @@ class PocketTtsSession internal constructor(
 
     /** LM-only micro-benchmark: [steps] frames with no Mimi decode. */
     fun microBenchLm(steps: Int): TtsProfile = synchronized(engine.lock) {
+        require(steps >= 0) { "LM benchmark step count cannot be negative" }
         engine.noiseSeed?.let { rnd.setSeed(it) }
         val oldFrames = sFrames
         resetProfile()
         loadVoice(voice)
         resetToVoice()
-        val n = minOf(steps, PMAX - pos - 1).coerceAtLeast(0)
+        val available = (PMAX - pos - 1).coerceAtLeast(0)
+        require(steps <= available) {
+            "LM benchmark requested $steps frames but capacity $PMAX permits only $available after voice=$voiceLen"
+        }
+        val n = steps
         var emb = engine.bosInput
         var g = 0
         while (g < n) {
@@ -593,8 +602,17 @@ class PocketTtsSession internal constructor(
         sink: ((FloatArray) -> Unit)? = null,
     ): List<FloatArray> {
         resetToVoice()
-        prefill(ids)
         val estimate = ceil((ids.size / PocketTts.TOKENS_PER_SECOND + PocketTts.GEN_SECONDS_PADDING) * PocketTts.FRAME_RATE)
+        // Fixed buckets may only run when the existing planned generation
+        // budget fits. This prevents the old min(..., remaining) clamp from
+        // silently shortening speech at a bucket boundary, including fallback.
+        val minimumCapacity = PocketTts.smallestFlowLmCapacity(voiceLen, ids.size, estimate.toInt())
+        check(minimumCapacity != null && PMAX >= minimumCapacity) {
+            "FlowLM capacity $PMAX cannot fit voice=$voiceLen + prompt=${ids.size} + " +
+                "plannedFrames=${estimate.toInt()} (plus one safety slot); " +
+                "minimum supported bucket=$minimumCapacity"
+        }
+        prefill(ids)
         val frameLimit = minOf(estimate.toInt(), PMAX - pos - 1)
         val latents = ArrayList<FloatArray>(frameLimit)
         var emb = engine.bosInput

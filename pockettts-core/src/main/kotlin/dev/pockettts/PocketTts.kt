@@ -17,6 +17,7 @@ object PocketTts {
     const val LAYERS = 6
     const val G = LAYERS * NH        // packed KV groups
     const val PMAX = 512             // KV capacity: voice + text + audio frames
+    val FLOWLM_CAPACITIES = listOf(128, 256, PMAX)
     const val LDIM = 32              // Mimi latent dim
     const val THETA = 10000.0
 
@@ -82,6 +83,31 @@ object PocketTts {
 
     /** AOT-compiled Tensor G5 variant of a stock graph (NPU placement). */
     fun g5Variant(name: String) = name.replace(".tflite", "_g5.tflite")
+
+    /** Fixed-capacity FlowLM artifact name; 512 keeps the established filename. */
+    fun flowLmCapacityGraph(baseName: String, capacity: Int): String {
+        require(capacity in FLOWLM_CAPACITIES) {
+            "unsupported FlowLM capacity $capacity; expected one of $FLOWLM_CAPACITIES"
+        }
+        require(baseName.endsWith(".tflite")) { "FlowLM graph must end in .tflite: $baseName" }
+        val rawStem = baseName.removeSuffix(".tflite")
+        val encodedCapacity = Regex("_pmax(\\d+)$").find(rawStem)?.groupValues?.get(1)?.toInt()
+        require(encodedCapacity == null || encodedCapacity == capacity) {
+            "FlowLM graph $baseName encodes capacity $encodedCapacity but config selects $capacity"
+        }
+        val stem = rawStem.replace(Regex("_pmax(?:128|256|512)$"), "")
+        val suffix = if (capacity == PMAX) "" else "_pmax$capacity"
+        return "$stem$suffix.tflite"
+    }
+
+    /** Smallest static cache bucket that fits live prefix, prompt, and frame budget. */
+    fun smallestFlowLmCapacity(voiceFrames: Int, promptTokens: Int, plannedFrames: Int): Int? {
+        require(voiceFrames >= 0 && promptTokens >= 0 && plannedFrames >= 0) {
+            "FlowLM context lengths cannot be negative"
+        }
+        val requiredWithSafety = voiceFrames.toLong() + promptTokens + plannedFrames + 1L
+        return FLOWLM_CAPACITIES.firstOrNull { requiredWithSafety <= it }
+    }
 
     /** One-shot SEANet decoder. */
     const val DECONLY = "pt_mimi_deconly_fp16.tflite"

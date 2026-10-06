@@ -60,7 +60,12 @@ N_HEADS = 16
 HD = 64
 FFN = 4096
 LDIM = 32
-PMAX = 512            # flow-LM KV capacity: voice (~142) + text (~55) + gen (~235)
+FLOWLM_CAPACITIES = (128, 256, 512)
+PMAX = int(os.environ.get("PT_FLOWLM_PMAX", "512"))
+if PMAX not in FLOWLM_CAPACITIES:
+    raise ValueError(
+        f"PT_FLOWLM_PMAX must be one of {FLOWLM_CAPACITIES}, got {PMAX}"
+    )
 # Text tokens the fused graph's head-less `prefill` signature consumes per
 # invocation (`PT_PREFILL_TOKENS`). The signature shares the backbone's weight
 # buffers, so it costs almost no storage, and the app batches the prompt through
@@ -106,6 +111,11 @@ def maxd(a, b):
     a = np.asarray(a).ravel().astype(np.float64)
     b = np.asarray(b).ravel().astype(np.float64)
     return float(np.abs(a - b).max())
+
+
+def flowlm_capacity_suffix():
+    """Filename suffix for opt-in fixed-capacity FlowLM graph variants."""
+    return "" if PMAX == 512 else f"_pmax{PMAX}"
 
 
 def quant_to(a, dtype, q):
@@ -585,20 +595,30 @@ def stage_fused(model):
     head = fused.head
 
     ks, vs, off0 = load_voice_state("alba")
+    # Alba's bundled prefix is longer than the 128-position experiment. Keep
+    # the graph export useful for short-prefix voices while never slicing a
+    # real voice silently: this export-only parity seed is empty, and the
+    # Android harness separately checks full, exact voice-prefix repacking.
+    if off0 >= PMAX:
+        print(f"alba prefix ({off0}) exceeds PMAX={PMAX}; using empty export parity prefix")
+        off0 = 0
+    test_steps = min(12, PMAX - off0)
+    if test_steps < 1:
+        raise ValueError(f"PMAX={PMAX} leaves no room for a fused-step parity check")
     pk, pv = pack_voice(ks, vs, off0)
     emb_w = flm.conditioner.embed.weight.detach()
     in_w = flm.input_linear.weight.detach()
     bos_in = (flm.bos_emb.detach() @ in_w.T)
 
-    # teacher-forced 12-step free-run vs the separate modules
+    # Short free-run parity against the separate modules, bounded by PMAX.
     torch.manual_seed(3)
-    noises = [torch.randn(1, LDIM) * math.sqrt(0.3) for _ in range(12)]
+    noises = [torch.randn(1, LDIM) * math.sqrt(0.3) for _ in range(test_steps)]
     off_a = off0
     pk_a, pv_a = pk.clone(), pv.clone()
     lat_sep = []
     x_in = bos_in.view(1, 1, -1)
     with torch.no_grad():
-        for i in range(12):
+        for i in range(test_steps):
             c, s = rope_cos_sin_deint(off_a)
             cond, eos, nk, nv = step(x_in, torch.from_numpy(c).view(1, 1, 1, HD),
                                      torch.from_numpy(s).view(1, 1, 1, HD),
@@ -614,7 +634,7 @@ def stage_fused(model):
     lat_fused = []
     x_in = bos_in.view(1, 1, -1)
     with torch.no_grad():
-        for i in range(12):
+        for i in range(test_steps):
             c, s = rope_cos_sin_deint(off_b)
             out = fused(x_in, torch.from_numpy(c).view(1, 1, 1, HD),
                         torch.from_numpy(s).view(1, 1, 1, HD),
@@ -628,7 +648,7 @@ def stage_fused(model):
             lat_fused.append(lat)
             x_in = (lat[0] @ in_w.T).view(1, 1, -1)
     d = max(maxd(a.numpy(), b.numpy()) for a, b in zip(lat_sep, lat_fused))
-    print(f"fused vs separate modules over 12 free-run steps: max|d| {d:.2e}")
+    print(f"fused vs separate modules over {test_steps} free-run steps: max|d| {d:.2e}")
 
     example = (torch.zeros(1, 1, D_MODEL), torch.zeros(1, 1, 1, HD),
                torch.zeros(1, 1, 1, HD), torch.zeros(1, N_HEADS, 1, PMAX + 1),
@@ -676,9 +696,12 @@ def stage_fused(model):
                 pk_r[0, :, off0 + i] = nk[0, :, 0]
                 pv_r[0, :, off0 + i] = nv[0, :, 0]
 
-    p = convert_multi(fused, example, extra, os.path.join(OUT, "pt_flowlm_fused.tflite"))
+    suffix = flowlm_capacity_suffix()
+    p = convert_multi(
+        fused, example, extra, os.path.join(OUT, f"pt_flowlm_fused{suffix}.tflite")
+    )
     opcheck(p, "flowlm_fused")
-    fp16 = to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
+    fp16 = to_fp16(p, os.path.join(OUT, f"pt_flowlm_fused_fp16{suffix}.tflite"))
     opcheck(fp16, "flowlm_fused_fp16")
 
     # The step signature, on the fp16 file that actually ships.
@@ -1684,7 +1707,8 @@ def compose_dectx_np(cm, lat, neutral):
 
 def stage_quant(model):
     print("\n=== int8 flow-LM (CPU) ===")
-    src = os.path.join(OUT, "pt_flowlm_fused.tflite")
+    suffix = flowlm_capacity_suffix()
+    src = os.path.join(OUT, f"pt_flowlm_fused{suffix}.tflite")
     if not os.path.exists(src):
         raise SystemExit(f"missing {src}; run the `fused` stage first")
     tags = os.environ.get("PT_QUANT", ",".join(QUANT_VARIANTS)).split(",")
@@ -1692,6 +1716,9 @@ def stage_quant(model):
     flm = model.flow_lm
     fused = FusedStep(flm).eval()
     ks, vs, off0 = load_voice_state("alba")
+    if off0 >= PMAX:
+        print(f"alba prefix ({off0}) exceeds PMAX={PMAX}; using empty quantization parity prefix")
+        off0 = 0
     pk, pv = pack_voice(ks, vs, off0)
     in_w = flm.input_linear.weight.detach()
     bos_in = (flm.bos_emb.detach() @ in_w.T).view(1, 1, -1)
@@ -1706,7 +1733,7 @@ def stage_quant(model):
 
     for tag in tags:
         spec = QUANT_VARIANTS[tag]
-        dst = os.path.join(OUT, f"pt_flowlm_fused_{tag}.tflite")
+        dst = os.path.join(OUT, f"pt_flowlm_fused_{tag}{suffix}.tflite")
         cal = None
         if spec["kind"] == "static":
             cal = {"serving_default": quant_calibration(
@@ -1746,6 +1773,11 @@ def stage_quant(model):
 
 def main():
     stage = sys.argv[1] if len(sys.argv) > 1 else "all"
+    if PMAX != 512 and stage not in ("fused", "quant"):
+        raise SystemExit(
+            "PT_FLOWLM_PMAX variants only support the `fused` and `quant` stages; "
+            "run other exporters at the default PMAX=512"
+        )
     model = load_eager()
     if stage in ("flowlm", "all"):
         stage_flowlm(model)

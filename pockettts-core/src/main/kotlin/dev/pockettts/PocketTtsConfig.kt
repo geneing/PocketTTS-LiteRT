@@ -16,6 +16,14 @@ class PocketTtsConfig(
     val placement: Placement,
     /** Override the flow-LM graph filename (e.g. another quantized variant). null = [PocketTts.LM]. */
     val lmGraph: String? = null,
+    /**
+     * Fixed FlowLM cache capacity. Values below 512 are experimental static
+     * graph buckets; [PocketTtsEngine] selects the matching `_pmaxN` artifact
+     * and sizes every host cache/mask buffer to N. Keep the 512 fallback for
+     * general use. A short bucket fails before generation if its planned frame
+     * budget cannot fit the exact voice prefix and prompt.
+     */
+    val lmCapacity: Int = PocketTts.PMAX,
     /** Frames per LM invocation; >1 needs the matching `pt_flowlm_ms{N}` graph. */
     val lmSteps: Int = 1,
     /**
@@ -63,6 +71,15 @@ class PocketTtsConfig(
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }
+        require(lmCapacity in PocketTts.FLOWLM_CAPACITIES) {
+            "unsupported FlowLM capacity $lmCapacity; expected one of ${PocketTts.FLOWLM_CAPACITIES}"
+        }
+        require(lmCapacity == PocketTts.PMAX || placement.lm != Accel.NPU) {
+            "reduced-capacity FlowLM graphs have not passed the Tensor G5 AOT gate"
+        }
+        require(lmCapacity == PocketTts.PMAX || lmSteps == 1) {
+            "reduced-capacity FlowLM graphs currently support single-step decode only"
+        }
     }
 
     companion object {

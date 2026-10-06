@@ -34,6 +34,7 @@ class PocketTtsEngine(
     private val models: PocketTtsModels = config.models
     val placement: Placement = config.placement
     val lmSteps: Int = config.lmSteps
+    val lmCapacity: Int = config.lmCapacity
     val streamW: Int = config.streamW
     val codecContinuity: Boolean = config.codecContinuity
     val noiseSeed: Long? = config.noiseSeed
@@ -111,7 +112,10 @@ class PocketTtsEngine(
     }
 
     // ---- graphs -----------------------------------------------------------
-    val lmGraphName: String = config.lmGraph ?: PocketTts.LM
+    val lmGraphName: String = PocketTts.flowLmCapacityGraph(
+        config.lmGraph ?: PocketTts.LM,
+        lmCapacity,
+    )
 
     internal val lm: CompiledModel = load(lmGraphName, "lm", placement.lm)
     internal val lmMs: CompiledModel? =
@@ -187,15 +191,15 @@ class PocketTtsEngine(
     // Every entry point runs under [lock] (or on the single worker), so one set
     // of buffers serves all sessions. Allocating per session cost ~25 MB and a
     // GC per utterance; the decoder arrays were re-allocated per text chunk.
-    internal val pk = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
-    internal val pv = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
-    internal val mask = FloatArray(PocketTts.NH * (PocketTts.PMAX + 1))
+    internal val pk = FloatArray(PocketTts.G * lmCapacity * PocketTts.HD)
+    internal val pv = FloatArray(PocketTts.G * lmCapacity * PocketTts.HD)
+    internal val mask = FloatArray(PocketTts.NH * (lmCapacity + 1))
     // Batched prompt prefill scratch (see PocketTtsSession.prefill).
     internal val prefillEmb = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.H)
     internal val prefillCos = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.HD)
     internal val prefillSin = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.HD)
-    internal val prefillMask = FloatArray(PocketTts.PREFILL_TOKENS * (PocketTts.PMAX + 1))
-    internal val prefillWrite = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.PMAX)
+    internal val prefillMask = FloatArray(PocketTts.PREFILL_TOKENS * (lmCapacity + 1))
+    internal val prefillWrite = FloatArray(PocketTts.PREFILL_TOKENS * lmCapacity)
     internal val decFeat = FloatArray(PocketTts.MIMI_D * PocketTts.S_DEC)
     internal val decBlk = FloatArray((1 + PocketTts.F_BLK) * PocketTts.LDIM)
     internal val streamWin = FloatArray(PocketTts.MIMI_D * streamW)
@@ -267,7 +271,7 @@ class PocketTtsEngine(
     init {
         android.util.Log.i(
             "PocketTTS",
-            "engine ${placement.label} @ ${Placement.renderer()} (${lmGraphName}) " +
+            "engine ${placement.label} capacity=$lmCapacity @ ${Placement.renderer()} (${lmGraphName}) " +
                 "lmSig=${if (lmStepIn != null) 1 else 0} " +
                 "prefill=${if (prefillIn != null) "${PocketTts.PREFILL_SIGNATURE}/${prefillIn.size}" else "none"} " +
                 "heap=${Runtime.getRuntime().totalMemory() shr 20}MiB " +
@@ -322,7 +326,7 @@ class PocketTtsEngine(
         /** Every model file a config needs, for `ensure()` and packaging. */
         fun requiredFiles(config: PocketTtsConfig): List<String> {
             val f = LinkedHashSet<String>()
-            f += config.lmGraph ?: PocketTts.LM
+            f += PocketTts.flowLmCapacityGraph(config.lmGraph ?: PocketTts.LM, config.lmCapacity)
             if (config.lmSteps > 1) f += PocketTts.msGraph(config.lmSteps)
             if (config.placement.dectx == Accel.NPU) {
                 f += PocketTts.g5Variant(PocketTts.DEC_TX)
