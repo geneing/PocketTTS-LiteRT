@@ -65,10 +65,10 @@ PMAX = 512            # flow-LM KV capacity: voice (~142) + text (~55) + gen (~2
 # still omits prompt signatures. Keep P=16 first so the old `prefill` signature
 # remains signature index 0; additional signatures follow it, then `serving_default`.
 PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "16"))
-PREFILL_BUCKETS = (16, 1, 8, 32) if PREFILL_TOKENS > 0 else ()
+PREFILL_BUCKETS = (16, 1, 8) if PREFILL_TOKENS > 0 else ()
 PREFILL_SIGNATURE_INDEX = {p: i for i, p in enumerate(PREFILL_BUCKETS)}
 PREFILL_ORACLE_TEXT = (
-    "Pocket TTS reads a longer prompt on a phone to check that all thirty two "
+    "Pocket TTS reads a longer prompt on a phone to check that all sixteen "
     "causal text rows preserve the voice and match the sequential flow model. "
     "The following sentence adds more words for a complete fixed bucket."
 )
@@ -368,7 +368,9 @@ def opcheck(path, label):
     import collections
     from ai_edge_litert.interpreter import Interpreter
     it = Interpreter(model_path=path)
-    it.allocate_tensors()
+    # Metadata inspection needs no tensor allocation. Allocating every buffer
+    # in the P32 multi-signature graph exceeded 13 GB on the host before any
+    # invocation, even though each Android invocation uses one signature.
     ops = collections.Counter(d.get("op_name", "?") for d in it._get_ops_details())
     bad = {k: v for k, v in ops.items() if k.upper() in BANNED}
     over = sum(1 for d in it.get_tensor_details() if len(d.get("shape", [])) > 4)

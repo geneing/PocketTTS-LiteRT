@@ -1,0 +1,51 @@
+FlowLM option 2: bucketed CPU int8 prompt prefill
+Date: 2026-10-05
+Branch: codex/flowlm-option-2-int8-prefill
+Status: host validation in progress; Pixel 10 acceptance pending
+
+Implementation
+  Static, headless prefill signatures: P=16 (index 0), P=1 (1), P=8 (2);
+  the fused one-step decode is index 3. The Android session chooses
+  the largest bucket no larger than the real remaining token count. It copies
+  only real K/V rows and preserves the voice prefix and absolute RoPE offsets.
+  PocketTtsConfig.usePrefill remains false by default.
+  FlowLmHarnessTest compares every prompt K/V row to sequential CPU int8,
+  locates the first divergent layer/head, checks voice-prefix preservation and
+  the first subsequent BOS/decode result, then saves a report even on failure.
+
+Host validation
+  Linux: WSL2, pinned pocket-tts clone 001cf6e, torch 2.12.1+cpu,
+  litert-torch 0.9.3. Android LiteRT runtime: 2.2.0 (CPU prefill, no dispatch).
+  A four-bucket P32 attempt emitted a 342,816,144-byte fp32 graph, then the
+  old opcheck() allocated >13 GB while inspecting it. Metadata inspection
+  without allocation succeeds, but a CompiledModel load of that graph peaked
+  at 6,956,792 KiB RSS under an 8 GB process cap and printed XNNPACK runtime
+  creation errors. The legacy P16 graph loaded at 708,156 KiB by the same
+  method. P32 was removed from the shipped bucket set before phone testing;
+  larger prompts use multiple P16 invocations.
+  Three-bucket graph generation and eager/fp32/int8 parity results:
+  PENDING. Python syntax and Android instrumentation compilation: PASS.
+  Graph SHA-256 and file size: PENDING.
+
+Pixel 10 acceptance still required
+  1. Install this branch's debug app and test APK, preserving pushed models:
+       .\gradlew :app:installDebug :app:installDebugAndroidTest
+  2. Push the new scripts/out/pt_flowlm_fused_dyn8_all.tflite into
+     /sdcard/Android/data/com.pockettts/files/ after host parity completes.
+  3. Run exactly one instrumentation method (CPU dynamic int8):
+       adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#compareBucketedInt8PrefillAgainstSequentialOracle com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+     The default matrix is lengths 1,7,8,9,15,16,17,31,32,33,50 and near
+     capacity for alba and marius. Pull the report from the app's external
+     files/flowlm-harness/prefill-*/report.txt directory. Record graph hash,
+     device fingerprint, load time, peak RSS, per-case total/run time, and each
+     row's K/V difference plus the first post-prompt decode difference.
+  4. If all quantized parity cases pass, run the paired full-pipeline CPU int8
+     A/B protocol in flowlm-pixel10-optimization-research.md: 3 prompt and
+     3 audio regimes, 2 voices, identical seed, cold/warm, forward and reverse
+     order, Android power monitors with audio-only subtraction, same Mimi
+     placement, p50/p95 first audio, total synthesis, J and J/s speech, RTF,
+     peak RSS, temperature and sustained drift. Listen to WAVs and check text
+     completion, duration, speaker stability, and early EOS. Keep the path
+     opt-in until this gate shows a win over sequential CPU int8.
+
+No Pixel 10 timings, energy, or quality claims have been made for this branch.

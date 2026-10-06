@@ -146,7 +146,7 @@ class PocketTtsEngine(
     }
 
     /**
-     * Export order is P16, P1, P8, P32, then the default fused step. Older
+     * Export order is P16, P1, P8, then the default fused step. Older
      * two-signature model drops still put their fused step at index 1; a
      * single-signature drop uses the no-index overload.
      */

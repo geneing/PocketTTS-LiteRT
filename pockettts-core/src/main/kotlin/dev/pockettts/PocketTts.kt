@@ -59,12 +59,12 @@ object PocketTts {
 
     /**
      * Static head-less prefill signatures in export order. P=16 remains index
-     * 0 for compatibility; the default fused step follows all four signatures.
+     * 0 for compatibility; the default fused step follows all three signatures.
      * Selection uses the largest bucket no bigger than the remaining real token
      * count, so a padding row never advances the joint position.
      */
-    val PREFILL_BUCKETS = intArrayOf(16, 1, 8, 32)
-    const val PREFILL_TOKENS = 32
+    val PREFILL_BUCKETS = intArrayOf(16, 1, 8)
+    const val PREFILL_TOKENS = 16
 
     fun prefillSignatureIndex(tokens: Int): Int = PREFILL_BUCKETS.indexOf(tokens)
 
