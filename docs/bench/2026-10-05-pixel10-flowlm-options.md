@@ -68,7 +68,8 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread counts 2/4/6 plus selective fp32 EOS gate | 18 prompt-only pairs were exact; 6 threads sped 385-token prompt compute 19-23%, but full-pipeline runs were slower in every completed short/medium/long case. Selective EOS export quantized to the baseline graph |
 | 7. G5 NPU slice cache | `codex/flowlm-kv-slice` | Full FlowLM graph on NPU; persistent AHWB K/V inputs with native per-position updates | Group-major: two long pairs, mean 1.30x vs CPU. Position-major: two more long pairs, mean 1.31x; host input traffic fell about 104x, row patch fell to 1.78 s. Still slower than CPU |
 | 8. G5 dynamic INT8 | `codex/flowlm-g5-int8` | W8/float-activation candidates; group-major `no_truncation` and position-major `half` | Long Alba runs: 52.38/24.76 s (2.11x) and 53.008/24.933 s (2.13x) NPU/CPU; both emitted 753/759 frames. Rejected on speed and completion gates; see [candidate report](2026-10-06-flow-g5-int8-candidate.md) |
-| 9. G5 static INT8 | `codex/flowlm-g5-static-int8` | Calibrated W8/A8 NPU recipe with float external tensors; host rollout/AOT work in progress | Pixel result pending. The earlier W8/A16 recipe quantized external I/O and failed its host quality check; this candidate keeps float graph boundaries |
+| 9. G5 static INT8 | `codex/flowlm-g5-static-int8` | Calibrated W8/A8 NPU recipe with float external tensors | Host quality failed at step 0 (latent corr 0.0105, EOS delta 6.465); 32-step minimum corr -0.1744. Stopped before AOT or Pixel test; see [candidate report](2026-10-06-flow-g5-static-int8-candidate.md) |
+| 10. G5 `HIGH_PERFORMANCE` runtime mode | `codex/flowlm-g5-high-performance` | Native LiteRT C opaque `google_tensor` option, `performance_mode=3`; harness-only opt-in | One-token Pixel smoke passed (NPU/CPU latent corr 0.999989). Long paired runs are in progress; performance result pending |
 
 ### Option 6: CPU thread tuning
 
@@ -163,11 +164,25 @@ quantization for CPU/GPU and calibrated static W8/A8 or W8/A16 for NPU
 deployment. The dynamic candidate above was still worth measuring because it
 preserved the existing float interface, but it is not the recommended NPU
 quantization scheme. Option 9 is testing static W8/A8 with float INPUT/OUTPUT
-boundaries; its Pixel result remains pending host validation and AOT compilation.
-The prior static W8/A16 check is recorded in the candidate report and failed
-with int16 external tensors and poor short-rollout agreement. ([AEQ migration
+boundaries. It failed the host quality gate before AOT compilation or Pixel
+testing. The prior static W8/A16 check is also recorded in the dynamic
+candidate report and failed with int16 external tensors and poor short-rollout
+agreement. ([AEQ migration
 guide](https://developers.google.com/edge/litert/quantization/tflq_to_aeq_migration),
 [quantization guidance](https://developers.google.com/edge/litert/quantization/model_optimization))
+
+### Option 9: calibrated static W8/A8
+
+This candidate followed AEQ's NPU-oriented `static_wi8_ai8` recipe, disabling
+quantization on INPUT/OUTPUT operations to preserve the existing float32
+Android interface. Calibration used Alba's position-major cache, 8 samples
+across 96 free-running steps. The 32-step host rollout failed on the very first
+step: latent correlation 0.0105, EOS absolute delta 6.465, and K/V max delta
+4.769, versus CPU dynamic INT8 latent correlation 0.9998 on that step. It was
+not AOT compiled and did not reach the Pixel test gate. Full details and the
+opt-in quantization script are on branch `codex/flowlm-g5-static-int8`; the
+[host report](2026-10-06-flow-g5-static-int8-candidate.md) records the checksums
+and 32-step drift.
 
 ### How other runtimes manage KV state
 
