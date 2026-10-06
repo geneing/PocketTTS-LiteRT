@@ -195,10 +195,15 @@ class FlowLmHarnessTest {
             ?.toBooleanStrictOrNull() ?: false
         val npuResidentCache = args.getString("npuResidentCache")
             ?.toBooleanStrictOrNull() ?: !npuSliceCache
+        val npuPositionMajorCache = args.getString("npuPositionMajorCache")
+            ?.toBooleanStrictOrNull() ?: false
         val verifyNpuSliceRows = args.getString("verifyNpuSliceRows")
             ?.toBooleanStrictOrNull() ?: false
         require(!(npuResidentCache && npuSliceCache)) {
             "select either npuResidentCache or npuSliceCache"
+        }
+        require(!npuPositionMajorCache || npuSliceCache) {
+            "npuPositionMajorCache requires npuSliceCache"
         }
         require(!verifyNpuSliceRows || npuSliceCache) {
             "verifyNpuSliceRows requires npuSliceCache"
@@ -234,6 +239,7 @@ class FlowLmHarnessTest {
         assertTrue("missing CPU reference graph ${File(modelDir, referenceGraph)}", models.store.exists(referenceGraph))
 
         val cacheMode = when {
+            npuPositionMajorCache -> "slice-position-major"
             npuSliceCache -> "slice"
             npuResidentCache -> "resident"
             else -> "nonresident"
@@ -261,6 +267,7 @@ class FlowLmHarnessTest {
                     noiseSeed = seed,
                     npuResidentCache = isNpu && npuResidentCache,
                     npuSliceCache = isNpu && npuSliceCache,
+                    npuPositionMajorCache = isNpu && npuPositionMajorCache,
                     verifyNpuSliceRows = isNpu && verifyNpuSliceRows,
                 ),
             )
@@ -323,7 +330,7 @@ class FlowLmHarnessTest {
             "fingerprint=${android.os.Build.FINGERPRINT}",
             "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
             "powerMonitors=${relevantMonitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
-            "candidateGraph=$npuGraph cacheMode=$cacheMode verifyNpuSliceRows=$verifyNpuSliceRows sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
+            "candidateGraph=$npuGraph cacheMode=$cacheMode npuPositionMajorCache=$npuPositionMajorCache verifyNpuSliceRows=$verifyNpuSliceRows sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
             "referenceGraph=$referenceGraph placement=lm:CPU dectx:NPU dec:GPU",
             "candidatePlacement=${candidate.backends} loadMs=${candidate.loadMs} pssKb=${candidate.pssBeforeRunKb}->${candidate.pssAfterRunKb}",
             "referencePlacement=${reference.backends} loadMs=${reference.loadMs} pssKb=${reference.pssBeforeRunKb}->${reference.pssAfterRunKb}",
