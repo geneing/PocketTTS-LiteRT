@@ -491,8 +491,9 @@ class PowerBenchmarkTest {
                 val firstAudioMs = (firstChunkAtNs - started) / 1e6
 
                 val audioOnly = measurePlayback(health, relevant, speedTake.audio)
-                val full = measureSynthesisPlayback(health, relevant, engine)
+                val full = measureSynthesisPlayback(health, relevant, engine, text, voice)
                 val repeatCorr = AudioQuality.compare(speedTake.audio, full.result.audio).corr
+                assertEquals("$label repeat audio length", speedTake.audio.size, full.result.audio.size)
                 assertTrue(
                     "$label same-config repeat correlation: $repeatCorr",
                     repeatCorr >= MIN_REPEAT_CORRELATION,
@@ -526,7 +527,8 @@ class PowerBenchmarkTest {
             val incremental = incrementalEnergy(sample.audioOnly, sample.full)
             val joules = incremental.values.sum()
             val audioSeconds = sample.full.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE
-            val rtf = audioSeconds / (sample.speedTake.ms.coerceAtLeast(1) / 1000.0)
+            val speedAudioSeconds = sample.speedTake.audio.size.toDouble() / PocketTts.SAMPLE_RATE
+            val rtf = speedAudioSeconds / (sample.speedTake.ms.coerceAtLeast(1) / 1000.0)
             Log.i(
                 TAG,
                 "threadSample=${sample.label} requestedThreads=${sample.cpuThreads ?: "LiteRT-default"} " +
@@ -534,7 +536,8 @@ class PowerBenchmarkTest {
                     "promptTokens=$tokenCount graphBytes=${sample.graphBytes} lmLoadMs=${sample.loadMs} " +
                     "allGraphLoadMs=${sample.allGraphLoadMs} warmupMs=${sample.warmupMs} " +
                     "firstAudioMs=${fmt(sample.firstAudioMs)} inferenceMs=${sample.speedTake.ms} " +
-                    "audioSeconds=${fmt(audioSeconds)} rtf=${fmt(rtf)} frames=${sample.full.result.frames} " +
+                    "audioSeconds=${fmt(audioSeconds)} speedAudioSeconds=${fmt(speedAudioSeconds)} " +
+                    "rtf=${fmt(rtf)} frames=${sample.full.result.frames} " +
                     "repeatCorr=${fmt(sample.repeatCorr)} pssKb=${sample.pssBeforeKb}/${sample.pssLoadedKb}/${sample.pssAfterKb} " +
                     "thermalStatus=${sample.thermalStart}->${sample.thermalEnd}",
             )
@@ -765,14 +768,16 @@ class PowerBenchmarkTest {
         health: SystemHealthManager,
         monitors: List<PowerMonitor>,
         engine: PocketTtsEngine,
+        text: String = PARAGRAPH,
+        voice: String = "alba",
     ): MeasurementWithResult {
         val track = newTrack()
         return try {
             val before = powerSnapshot(health, monitors)
             val startMs = SystemClock.elapsedRealtime()
             track.play()
-            val result = engine.newSession("alba").use { session ->
-                session.stream(PARAGRAPH) { chunk -> writeAudio(track, chunk) }
+            val result = engine.newSession(voice).use { session ->
+                session.stream(text) { chunk -> writeAudio(track, chunk) }
             }
             drain(track, result.audio.size)
             val elapsedMs = SystemClock.elapsedRealtime() - startMs

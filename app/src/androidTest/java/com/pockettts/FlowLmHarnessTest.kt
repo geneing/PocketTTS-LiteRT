@@ -16,6 +16,7 @@ import org.junit.runner.RunWith
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -37,6 +38,7 @@ class FlowLmHarnessTest {
         val inputMs: Double,
         val runMs: Double,
         val readMs: Double,
+        val firstRunMs: Double,
         val cpuThreads: Int?,
     )
 
@@ -151,6 +153,83 @@ class FlowLmHarnessTest {
         }
     }
 
+    /**
+     * Paired prompt-only CPU thread probe on the shipped int8 graph. Fresh
+     * CompiledModel instances run A/B then B/A; the report keeps load, packed
+     * KV input copy, compute, and readback separate. Full speech and energy
+     * acceptance belongs to PowerBenchmarkTest.flowLmCpuThreadsPower.
+     */
+    @Test
+    fun compareCpuThreadsPromptPaired() {
+        val count = args.getString("cpuThreads")?.toIntOrNull()
+        require(count != null && count > 0) { "pass -e cpuThreads=<positive count>" }
+        val graph = args.getString("lmGraph")?.trim()?.takeIf { it.isNotEmpty() } ?: PocketTts.LM
+        require(graph == PocketTts.LM) { "CPU thread probe requires shipped int8 graph ${PocketTts.LM}" }
+        val text = args.getString("text")?.trim()?.takeIf { it.isNotEmpty() } ?: DEFAULT_TEXT
+        val voiceName = args.getString("voice")?.trim()?.takeIf { it.isNotEmpty() } ?: "alba"
+        val voice = readVoice(File(modelDir, PocketTts.voiceFile(voiceName)))
+        val sourceIds = SpTokenizer(File(modelDir, PocketTts.TOKENIZER)).encode(text)
+        require(sourceIds.isNotEmpty()) { "text encoded to no tokens" }
+        val wantedTokens = args.getString("promptTokens")?.toIntOrNull() ?: sourceIds.size
+        require(wantedTokens > 0 && voice.length + wantedTokens < PocketTts.PMAX) {
+            "promptTokens=$wantedTokens exceeds capacity after voice length ${voice.length}"
+        }
+        val tokenIds = IntArray(wantedTokens) { sourceIds[it % sourceIds.size] }
+        val embeddings = File(modelDir, PocketTts.EMBED).readBytes()
+        val graphFile = File(modelDir, graph)
+        require(graphFile.isFile) { "missing graph: $graphFile" }
+        val plan = listOf(
+            "ab-default" to null,
+            "ab-threads-$count" to count,
+            "ba-threads-$count" to count,
+            "ba-default" to null,
+        )
+        val runs = plan.map { (label, threads) ->
+            label to runPrompt(Accel.CPU, graph, tokenIds, embeddings, voice, null, threads)
+        }
+        val report = arrayListOf(
+            "FlowLM CPU thread paired prompt probe",
+            "device=${android.os.Build.MODEL}/${android.os.Build.DEVICE} fingerprint=${android.os.Build.FINGERPRINT}",
+            "graph=$graph sha256=${sha256(graphFile)} bytes=${graphFile.length()} LiteRT=2.2.0 dispatch=unused(CPU)",
+            "voice=$voiceName seed=none(prompt only) promptTokens=$wantedTokens sourceText=$text",
+            "order=default,threads-$count,threads-$count,default; one new model per sample",
+            "times include token embeddings and cache updates only where stated; no audio, energy, or RTF measured",
+        )
+        for ((label, result) in runs) {
+            report += String.format(
+                Locale.US,
+                "%s load_ms=%.3f input_ms=%.3f run_ms=%.3f read_ms=%.3f " +
+                    "first_run_ms=%.3f warm_run_ms_per_token=%.4f total_prompt_ms=%.3f",
+                label, result.loadMs, result.inputMs, result.runMs, result.readMs,
+                result.firstRunMs,
+                (result.runMs - result.firstRunMs) / (result.tokenCount - 1).coerceAtLeast(1),
+                result.inputMs + result.runMs + result.readMs,
+            )
+        }
+        for ((defaultIndex, threadedIndex) in listOf(0 to 1, 3 to 2)) {
+            val default = runs[defaultIndex].second
+            val threaded = runs[threadedIndex].second
+            val m = metrics(default.output, threaded.output)
+            report += String.format(
+                Locale.US,
+                "pair=%s/%s output_corr=%.8f output_mean_abs_diff=%.8g " +
+                    "output_max_abs_diff=%.8g run_speedup=%.4fx prompt_speedup=%.4fx",
+                runs[defaultIndex].first, runs[threadedIndex].first, m.corr, m.mad,
+                maxDiff(default.output, threaded.output), default.runMs / threaded.runMs,
+                (default.inputMs + default.runMs + default.readMs) /
+                    (threaded.inputMs + threaded.runMs + threaded.readMs),
+            )
+        }
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-harness") ?: File(context.filesDir, "flowlm-harness"),
+            "cpu-threads-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+        File(runDir, "report.txt").writeText(report.joinToString("\n", postfix = "\n"))
+        report.forEach { Log.i(TAG, it) }
+        Log.i(TAG, "saved CPU thread prompt report to ${File(runDir, "report.txt").absolutePath}")
+        assertTrue("CPU thread paired probe produced no prompt output", runs.all { it.second.output.isNotEmpty() })
+    }
+
     private fun runPrompt(
         backend: Accel,
         graph: String,
@@ -202,6 +281,7 @@ class FlowLmHarnessTest {
                 var inputElapsed = 0L
                 var elapsed = 0L
                 var readElapsed = 0L
+                var firstRun = 0L
                 for (id in tokenIds) {
                     val embedding = FloatArray(PocketTts.H)
                     var offset = id * PocketTts.H * Short.SIZE_BYTES
@@ -221,7 +301,9 @@ class FlowLmHarnessTest {
                     inputElapsed += System.nanoTime() - inputStarted
                     val started = System.nanoTime()
                     if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
-                    elapsed += System.nanoTime() - started
+                    val runElapsed = System.nanoTime() - started
+                    if (outputOffset == 0) firstRun = runElapsed
+                    elapsed += runElapsed
                     val readStarted = System.nanoTime()
                     val values = output.single().readFloat()
                     readElapsed += System.nanoTime() - readStarted
@@ -243,7 +325,8 @@ class FlowLmHarnessTest {
                 }
                 return Run(
                     backend, graph, all, tokenIds.size, loadMs,
-                    inputElapsed / 1e6, elapsed / 1e6, readElapsed / 1e6, cpuThreads,
+                    inputElapsed / 1e6, elapsed / 1e6, readElapsed / 1e6,
+                    firstRun / 1e6, cpuThreads,
                 )
             } finally {
                 input.forEach { it.close() }
@@ -327,6 +410,31 @@ class FlowLmHarnessTest {
         val bytes = ByteBuffer.allocate(values.size * Float.SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         for (value in values) bytes.putFloat(value)
         file.writeBytes(bytes.array())
+    }
+
+    private fun maxDiff(reference: FloatArray, candidate: FloatArray): Double {
+        require(reference.size == candidate.size)
+        var max = 0.0
+        for (i in reference.indices) {
+            val a = reference[i].toDouble()
+            val b = candidate[i].toDouble()
+            check(a.isFinite() && b.isFinite()) { "non-finite prompt output at $i" }
+            max = maxOf(max, kotlin.math.abs(a - b))
+        }
+        return max
+    }
+
+    private fun sha256(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val chunk = ByteArray(64 * 1024)
+            while (true) {
+                val count = input.read(chunk)
+                if (count < 0) break
+                digest.update(chunk, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
     }
 
     private companion object {

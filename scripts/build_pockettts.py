@@ -66,6 +66,9 @@ PMAX = 512            # flow-LM KV capacity: voice (~142) + text (~55) + gen (~2
 # buffers, so it costs almost no storage, and the app batches the prompt through
 # it. Set 0 to export the fused graph without it.
 PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "16"))
+# Diagnostic CPU variant: express the tiny EOS projection as fp32 MUL+SUM so
+# dynamic-range weight quantization cannot turn its 1x1024 FC into int8.
+EOS_FP32 = os.environ.get("PT_EOS_FP32", "0") == "1"
 FLOW_DIM = 512
 FLOW_DEPTH = 6
 
@@ -320,7 +323,8 @@ def opcheck(path, label):
     import collections
     from ai_edge_litert.interpreter import Interpreter
     it = Interpreter(model_path=path)
-    it.allocate_tensors()
+    # Operator and shape metadata are available without allocating every
+    # intermediate tensor in a multi-signature model.
     ops = collections.Counter(d.get("op_name", "?") for d in it._get_ops_details())
     bad = {k: v for k, v in ops.items() if k.upper() in BANNED}
     over = sum(1 for d in it.get_tensor_details() if len(d.get("shape", [])) > 4)
@@ -514,7 +518,10 @@ class FlowLMStep(nn.Module):
             nk.append(kh)
             nv.append(vh)
         cond = self.ln(x, self.on_w, self.on_b)[:, 0]               # [1,1024]
-        eos = F.linear(cond, self.eos_w, self.eos_b)                # [1,1]
+        if EOS_FP32:
+            eos = (cond * self.eos_w).sum(-1, keepdim=True) + self.eos_b
+        else:
+            eos = F.linear(cond, self.eos_w, self.eos_b)            # [1,1]
         return cond, eos, torch.cat(nk, dim=1), torch.cat(nv, dim=1)
 
 
@@ -676,40 +683,49 @@ def stage_fused(model):
                 pk_r[0, :, off0 + i] = nk[0, :, 0]
                 pv_r[0, :, off0 + i] = nv[0, :, 0]
 
-    p = convert_multi(fused, example, extra, os.path.join(OUT, "pt_flowlm_fused.tflite"))
+    suffix = "_eosfp32" if EOS_FP32 else ""
+    p = convert_multi(fused, example, extra,
+                      os.path.join(OUT, f"pt_flowlm_fused{suffix}.tflite"))
     opcheck(p, "flowlm_fused")
-    fp16 = to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
-    opcheck(fp16, "flowlm_fused_fp16")
+    graphs = [("fp32", p)]
+    if os.environ.get("PT_FUSED_FP16", "1") != "0":
+        fp16 = to_fp16(p, os.path.join(OUT, f"pt_flowlm_fused{suffix}_fp16.tflite"))
+        opcheck(fp16, "flowlm_fused_fp16")
+        graphs.append(("fp16", fp16))
 
-    # The step signature, on the fp16 file that actually ships.
+    # The named prefill is index 0, so the fused step is index 1.
     c, s = rope_cos_sin_deint(off0)
     with torch.no_grad():
         ref = fused(bos_in.view(1, 1, -1), torch.from_numpy(c).view(1, 1, 1, HD),
                     torch.from_numpy(s).view(1, 1, 1, HD),
                     torch.from_numpy(make_mask(off0)), pk, pv, noises[0])
-    outs = run_signature(
-        fp16, None,
-        (bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
-         s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
-         noises[0].numpy()),
-        [1 + LDIM + 2 * G_KV])
-    print(f"fp16 fused one-step corr {corr(outs[0], ref.numpy()):.6f} "
-          f"max|d| {maxd(outs[0], ref.numpy()):.2e}")
+    step_index = 1 if P > 0 else 0
+    for label, graph in graphs:
+        outs = run_signature(
+            graph, step_index,
+            (bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
+             s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
+             noises[0].numpy()),
+            [1 + LDIM + 2 * G_KV])
+        print(f"{label} fused one-step signature-index={step_index} "
+              f"corr {corr(outs[0], ref.numpy()):.6f} "
+              f"max|d| {maxd(outs[0], ref.numpy()):.2e}")
 
     if P > 0:
         # A named signature is laid out *before* the default, so the step is
         # index 1 and the prefill is index 0. (This read 1 for a while, which
         # ran the *step* with the prefill's inputs and made the number below
         # meaningless -- the prefill signature went unverified.)
-        got = run_signature(fp16, 0, tuple(a.numpy() for a in pre_args),
-                            [2 * P * G_KV])[0]
-        nk_p = got[:P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
-        nv_p = got[P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)
         nk_ref = pk_r[0, :, off0:off0 + P].permute(1, 0, 2).unsqueeze(0)
         nv_ref = pv_r[0, :, off0:off0 + P].permute(1, 0, 2).unsqueeze(0)
-        print(f"fp16 prefill signature vs per-token step  new-k max|d| "
-              f"{maxd(nk_p, nk_ref.numpy()):.2e}  new-v max|d| "
-              f"{maxd(nv_p, nv_ref.numpy()):.2e}")
+        for label, graph in graphs:
+            got = run_signature(graph, 0, tuple(a.numpy() for a in pre_args),
+                                [2 * P * G_KV])[0]
+            nk_p = got[:P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
+            nv_p = got[P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)
+            print(f"{label} prefill signature vs per-token step  new-k max|d| "
+                  f"{maxd(nk_p, nk_ref.numpy()):.2e}  new-v max|d| "
+                  f"{maxd(nv_p, nv_ref.numpy()):.2e}")
 
 
 G_KV = N_LAYERS * N_HEADS * HD
@@ -1684,7 +1700,8 @@ def compose_dectx_np(cm, lat, neutral):
 
 def stage_quant(model):
     print("\n=== int8 flow-LM (CPU) ===")
-    src = os.path.join(OUT, "pt_flowlm_fused.tflite")
+    suffix = "_eosfp32" if EOS_FP32 else ""
+    src = os.path.join(OUT, f"pt_flowlm_fused{suffix}.tflite")
     if not os.path.exists(src):
         raise SystemExit(f"missing {src}; run the `fused` stage first")
     tags = os.environ.get("PT_QUANT", ",".join(QUANT_VARIANTS)).split(",")
@@ -1706,7 +1723,7 @@ def stage_quant(model):
 
     for tag in tags:
         spec = QUANT_VARIANTS[tag]
-        dst = os.path.join(OUT, f"pt_flowlm_fused_{tag}.tflite")
+        dst = os.path.join(OUT, f"pt_flowlm_fused_{tag}{suffix}.tflite")
         cal = None
         if spec["kind"] == "static":
             cal = {"serving_default": quant_calibration(
