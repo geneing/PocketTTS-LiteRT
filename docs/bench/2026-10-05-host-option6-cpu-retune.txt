@@ -1,7 +1,7 @@
 FlowLM Pixel 10 option 6: host gate and device measurement plan
 Date: 2026-10-05
 Branch: codex/flowlm-option-6-cpu-retune
-Status: implementation, host validation, and paired Pixel 10 A/B/B/A measurements complete for the tested short and medium cases, plus long Alba. Long Marius is still running.
+Status: implementation, host validation, and paired Pixel 10 A/B/B/A measurements complete for short, medium, and long speech on both voices with the six-thread candidate.
 
 Control
   Graph: pt_flowlm_fused_dyn8_all.tflite (shipped CPU dynamic int8)
@@ -73,13 +73,15 @@ Pixel 10 paired measurements
   | Alba / medium | 7.68 s | 3,348 ms | 3,635 ms (+8.6%) | 1,571/1,744 -> 1,405/1,424 ms | 0.00 -> 0.00 J | Slower inference; energy unavailable |
   | Marius / medium | 6.72 s | 2,845.5 ms | 3,326 ms (+16.9%) | 1,445/1,500 -> 1,658/1,730 ms | -31.91 -> -30.18 J | Slower; energy subtraction invalid |
   | Alba / long | 60.72 s | 25,374.5 ms | 27,866.5 ms (+9.8%) | 1,274/1,326 -> 1,267/1,344 ms | 59.29 -> 65.41 J (+10.3%) | Slower and higher estimated energy |
+  | Marius / long | 55.12 s | 23,244.5 ms | 27,719 ms (+19.2%) | 1,190/1,207 -> 1,635/1,710 ms | 56.62 -> 63.28 J (+11.8%) | Slower and higher estimated energy |
 
-  The long Alba run produced 759 frames and 1,457,280 PCM samples in every
-  arm, with correlation 1.000 and thermal status 0 -> 0. The longer-run energy
-  estimate is the only usable pair in this sample; PowerMonitor returned zero
-  or negative audio-subtracted energy for short and medium cases. The
-  aggregate rail estimate can include overlapping domains and is not a
-  whole-device energy total. Saved WAVs are on-device under
+  Long Alba produced 759 frames / 1,457,280 PCM samples and long Marius
+  produced 689 frames / 1,322,880 samples in every arm; both had correlation
+  1.000 and thermal status 0 -> 0. Long-run estimates were the only usable
+  energy pairs in this sample; PowerMonitor returned zero or negative
+  audio-subtracted energy for short and medium cases. The aggregate rail
+  estimate can include overlapping domains and is not a whole-device energy
+  total. Saved WAVs are on-device under
   `files/power-benchmark/flowlm-cpu-variant-*.wav`; the run log is the ignored
   `scripts/out/option6-power-all.log`.
 
@@ -100,8 +102,8 @@ Selective EOS precision outcome
 
 Acceptance
   Do not promote six threads. The six-thread candidate failed the full-pipeline
-  latency gate in every completed voice/regime and increased the only usable
-  long-run energy estimate. The full acceptance matrix (all three audio
-  lengths for both voices, full sustained thermal checks, and listening review)
-  is incomplete; no production path changed. The long Marius A/B run was
-  already in progress when this report snapshot was written and is pending.
+  latency gate in all six voice/regime pairs and increased both usable long-run
+  energy estimates. The prompt-only matrix also found that 2/4-thread candidates
+  do not help short prompts consistently, despite some near-capacity gains.
+  Full-pipeline runs for 2 and 4 threads, full sustained thermal checks, and
+  listening review remain incomplete; no production path changed.
