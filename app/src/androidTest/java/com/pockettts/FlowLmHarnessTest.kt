@@ -523,11 +523,16 @@ class FlowLmHarnessTest {
         }
         val loadStart = System.nanoTime()
         val model = CompiledModel.create(path.absolutePath, options, if (backend == Accel.NPU) environment else null)
-        val highPerformance = if (backend == Accel.NPU &&
-            args.getString("g5HighPerformance")?.toBooleanStrictOrNull() == true
-        ) {
-            G5PerformanceModel.create(requireNotNull(environment), path.absolutePath)
-        } else null
+        val highPerformance = try {
+            if (backend == Accel.NPU &&
+                args.getString("g5HighPerformance")?.toBooleanStrictOrNull() == true
+            ) {
+                G5PerformanceModel.create(requireNotNull(environment), path.absolutePath)
+            } else null
+        } catch (t: Throwable) {
+            model.close()
+            throw t
+        }
         val loadMs = (System.nanoTime() - loadStart) / 1e6
         try {
             val stepInput = runCatching { model.createInputBuffers(1) }.getOrNull()
