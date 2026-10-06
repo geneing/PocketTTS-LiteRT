@@ -66,7 +66,8 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 4. GPU resident KV cache | `codex/flowlm-option-4-gpu-cache` | Export/API feasibility gate | Stopped before artifact/device run: export service timed out; required GPU buffer interop remains unproven |
 | 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment requiring trained model changes | Stopped: no training corpus, pipeline, checkpoint, or held-out quality suite available; no model or device performance result |
 | 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread counts 2/4/6 plus selective fp32 EOS gate | 18 prompt-only pairs were exact; 6 threads sped 385-token prompt compute 19-23%, but full-pipeline runs were slower in every completed short/medium/long case. Selective EOS export quantized to the baseline graph |
-| 7. G5 NPU slice cache | `codex/flowlm-kv-slice` | Full FlowLM graph on NPU; persistent AHWB K/V inputs with native per-position updates | Two long pairs: 32.906/25.165 s NPU-first and 31.453/24.451 s CPU-first (mean 1.30x); input traffic fell about 104x. Cache row patch costs 2.03-2.38 s |
+| 7. G5 NPU slice cache | `codex/flowlm-kv-slice` | Full FlowLM graph on NPU; persistent AHWB K/V inputs with native per-position updates | Group-major: two long pairs, mean 1.30x vs CPU. Position-major: two more long pairs, mean 1.31x; host input traffic fell about 104x, row patch fell to 1.78 s. Still slower than CPU |
+| 8. G5 dynamic INT8 | `codex/flowlm-g5-int8` | W8/float-activation candidates; group-major `no_truncation` and position-major `half` | Long Alba runs: 52.38/24.76 s (2.11x) and 53.008/24.933 s (2.13x) NPU/CPU; both emitted 753/759 frames. Rejected on speed and completion gates; see [candidate report](2026-10-06-flow-g5-int8-candidate.md) |
 
 ### Option 6: CPU thread tuning
 
@@ -114,9 +115,43 @@ Both long paired runs used the harness's fixed 201-word paragraph, Alba, seed 42
 
 In both orders the candidate used 268,080,192 host input bytes versus 27,900,154,944 B for CPU's explicit-cache path (about 104x less). First-audio latency was 1.634 / 1.542 s for NPU and 1.127 / 1.304 s for CPU. Both emitted 759 frames / 60.72 s. The NPU single-G5 partition report was 715/715 ops, and actual buffer types were `[2,2,2]` (AHWB) in both runs.
 
-The native bridge row-copy cost was 2.381 s NPU-first and 2.025 s CPU-first, across 1,107 decode/prompt steps. It writes 96 small, 256-byte rows into group-major cache banks at a 32,768-float stride. LM graph execution remained 1.20-1.28 s slower than CPU; LM output/cache handling remained 2.41-2.81 s slower. A position-major buffer layout could turn the scatter into one contiguous 24-KB write per K or V cache; this is the next opt-in experiment.
+The native bridge row-copy cost was 2.381 s NPU-first and 2.025 s CPU-first, across 1,107 decode/prompt steps. It writes 96 small, 256-byte rows into group-major cache banks at a 32,768-float stride. LM graph execution remained 1.20-1.28 s slower than CPU; LM output/cache handling remained 2.41-2.81 s slower.
 
 The long free-running waveform correlation was 0.0915 (lag 0) in both pairs. Per the acceptance protocol, this is diagnostic only: listening, intelligibility, completion, speaker stability, and several-seed checks decide speech quality. Short-probe exact row verification checks cache-write integrity, not long-run speech equivalence. PowerMonitor values from each one-repeat pair are recorded in the device reports but are not sufficient to claim an energy result. Thermal status was 0. WAVs and full reports are under ignored `build/flowlm-kv-slice/2026-10-06-{npu-cpu,cpu-npu}/`; device report sources are under `/sdcard/Android/data/com.pockettts/files/flowlm-npu-slice/speech-20261006-082717-444/` and `speech-20261006-084229-847/`.
+
+#### Option 7 position-major cache follow-up
+
+The position-major variant stores each cache as `[1,512,96,64]`, so the bridge
+copies the selected position in one contiguous region. It retained the same
+full utterance (759 frames / 60.72 s) in both paired orders. The candidate graph
+is 172,399,184 bytes, SHA-256
+`1e3142667b944172d1216728bec52bfabe3529ac6606394dee2878c0945b8d08`, with
+717/717 ops in one G5 partition.
+
+| Pair order | NPU inference | CPU int8 inference | NPU / CPU | NPU first audio | CPU first audio | Native cache patch |
+|---|---:|---:|---:|---:|---:|---:|
+| NPU first | 33.080 s | 24.827 s | 1.332x | 1.742 s | 1.118 s | 1.778 s |
+| CPU first | 32.284 s | 25.157 s | 1.283x | 1.642 s | 1.124 s | 1.783 s |
+| Mean | 32.682 s | 24.992 s | 1.308x | 1.692 s | 1.121 s | 1.781 s |
+
+Both runs used the fixed long Alba prompt, seed 42, position-major cache, and
+AHWB buffers `[2,2,2]`. Candidate input traffic was 268,080,192 bytes versus
+27,900,154,944 bytes for CPU's explicit-cache path (about 104x less). Thermal
+status was 0 in both. The cache update fell from 2.03-2.38 s in the group-major
+layout to about 1.78 s, but total NPU inference remained 1.31x slower than CPU.
+Free-running correlation was 0.09148 and is diagnostic only; no listening or
+intelligibility acceptance was completed.
+
+## Option 8: dynamic INT8 G5 conversion
+
+Two dynamic-range W8/float-activation graphs were compiled for Tensor G5 and
+run on the same long Alba workload. The group-major graph used `no_truncation`;
+the position-major graph used `half` truncation. Both completed in one G5
+partition but took about 2.1x as long as CPU int8 and stopped six frames short
+of the CPU output. The position-major INT8 graph did not preserve the FP16
+position-major speed result. See the [candidate report](2026-10-06-flow-g5-int8-candidate.md)
+for host quality checks, exact artifact hashes, and AOT details. Neither
+candidate is enabled by the production path.
 
 ### How other runtimes manage KV state
 
@@ -125,4 +160,4 @@ The long free-running waveform correlation was 0.0915 (lag 0) in both pairs. Per
 - **OpenVINO GPU** represents state with `ReadValue` / `Assign`, then fuses cache concatenation and state assignment into a `KVCache` operation to avoid update overhead. **OpenVINO Intel NPU** documents the opposite constraint: its driver/runtime does not support state variables, so the compiler lowers them to additional inputs/outputs and copies through an intermediate state buffer. A stateful graph is therefore not by itself proof of zero-copy execution. ([GPU KV cache fusion](https://github.com/openvinotoolkit/openvino/blob/master/src/plugins/intel_gpu/docs/dynamic_shape/kv_cache.md), [Intel NPU stateful models](https://github.com/openvinotoolkit/openvino/blob/master/src/plugins/intel_npu/README.md#stateful-models))
 - **LiteRT Kotlin `CompiledModel`** exposes preallocated input/output buffers and runs each invocation against those buffers. The pinned 2.2.0 Kotlin surface has no public output-to-input binding method; our current prototype instead maps and patches the actual AHWB buffers through a version-pinned native bridge. ([NPU buffer flow](https://developers.google.com/edge/litert/next/npu), [pinned Kotlin API](https://raw.githubusercontent.com/google-ai-edge/LiteRT/v2.2.0/litert/kotlin/src/main/kotlin/com/google/ai/edge/litert/Model.kt))
 
-For this model, the best next fit is the LiteRT-LM style separation between a one-step inference graph and a hardware/runtime cache commit, while testing whether a model-owned position-major cache can make the commit contiguous. The current direct native patch cuts host traffic substantially, but its 96 scattered writes still take 2.0-2.4 s per long utterance.
+For this model, the next useful runtime experiment is the LiteRT-LM style separation between a one-step inference graph and a hardware/runtime cache commit. The position-major layout already made the cache commit contiguous and reduced it to about 1.78 s per long utterance; end-to-end NPU time remains 1.31x slower than CPU.
