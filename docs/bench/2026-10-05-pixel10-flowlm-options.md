@@ -65,10 +65,31 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 3. KV capacity buckets | `codex/flowlm-option-3-kv-capacity` | Smaller static capacities with 512 fallback and capacity checks | 256 short-prompt probe: 19.72 ms run vs 26.51 ms at 512, same latent bytes; 46-token prompt safely rejected at 256 and completed at 512. No full-speech win established |
 | 4. GPU resident KV cache | `codex/flowlm-option-4-gpu-cache` | Export/API feasibility gate | Stopped before artifact/device run: export service timed out; required GPU buffer interop remains unproven |
 | 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment requiring trained model changes | Stopped: no training corpus, pipeline, checkpoint, or held-out quality suite available; no model or device performance result |
-| 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread/precision choices with int8 control | Pending paired full-pipeline timing and quality |
+| 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread counts 2/4/6 plus selective fp32 EOS gate | 18 prompt-only pairs were exact; 6 threads sped 385-token prompt compute 19-23%, but full-pipeline runs were slower in every completed short/medium/long case. Selective EOS export quantized to the baseline graph |
+
+### Option 6: CPU thread tuning
+
+The six-thread full-pipeline harness used the production graph and placement,
+seed 42, A/B/B/A order, and two samples per arm. Every completed pair had
+audio correlation 1.000. First-audio p50/p95 values are descriptive at n=2.
+
+| Voice / regime | Audio | Default inference | 6-thread inference | First audio default -> 6 threads, p50/p95 | Incremental energy default -> 6 threads |
+|---|---:|---:|---:|---:|---:|
+| Alba / short | 1.84 s | 817.5 ms | 1,241.5 ms | 818/836 -> 1,242/1,469 ms | 0.00 -> -17.83 J (invalid) |
+| Marius / short | 1.52 s | 770 ms | 949 ms | 771/782 -> 950/1,011 ms | 0.00 -> 14.41 J (invalid) |
+| Alba / medium | 7.68 s | 3,348 ms | 3,635 ms | 1,571/1,744 -> 1,405/1,424 ms | 0.00 -> 0.00 J (unavailable) |
+| Marius / medium | 6.72 s | 2,845.5 ms | 3,326 ms | 1,445/1,500 -> 1,658/1,730 ms | -31.91 -> -30.18 J (invalid) |
+| Alba / long | 60.72 s | 25,374.5 ms | 27,866.5 ms | 1,274/1,326 -> 1,267/1,344 ms | 59.29 -> 65.41 J (+10.3%) |
+
+Long Alba produced all 759 frames and 1,457,280 samples per arm; thermal
+status remained 0. PowerMonitor returned zero or negative audio-subtracted
+energy for short and medium runs, so those energy readings cannot rank the
+candidate. The long-run aggregate is an estimate and may include overlapping
+rail domains. The device WAVs remain under the app's `power-benchmark` files
+directory; the full console/logcat record is in ignored `scripts/out`.
 
 ## Acceptance coverage
 
-The baseline paragraph test is one long utterance on alba and a same-configuration repeat; it is a control repeatability check, not an A/B against an optimization. Option 2 completed its bucketed prompt/first-decode parity matrix but failed its prefill speed gate, so it was not promoted to full speech testing. Option 3 completed focused short-capacity and safe-fallback probes but has no full-speech audio or power comparison. Option 1 stopped at the tiny cache-chain gate because actual device-side cache copy volume is unknown. Options 4 and 5 stopped before a Pixel candidate artifact/model was available. Option 6 is pending.
+The baseline paragraph test is one long utterance on alba and a same-configuration repeat; it is a control repeatability check, not an A/B against an optimization. Option 2 completed its bucketed prompt/first-decode parity matrix but failed its prefill speed gate, so it was not promoted to full speech testing. Option 3 completed focused short-capacity and safe-fallback probes but has no full-speech audio or power comparison. Option 1 stopped at the tiny cache-chain gate because actual device-side cache copy volume is unknown. Options 4 and 5 stopped before a Pixel candidate artifact/model was available. Option 6 completed short and medium full-pipeline pairs on both voices and a long Alba pair; every completed case was slower at six threads, and the long pair used 10.3% more estimated energy. Its long Marius run is still in progress.
 
 No option has completed the full acceptance matrix of three prompt lengths, three audio lengths, two voices, reversed paired runs against CPU int8, first-audio percentiles, audio-subtracted PowerMonitor energy, sustained thermal checks, and listening review. No performance win or production-path change is claimed. The exact requirements are in [`flowlm-pixel10-optimization-research.md`](../flowlm-pixel10-optimization-research.md).
