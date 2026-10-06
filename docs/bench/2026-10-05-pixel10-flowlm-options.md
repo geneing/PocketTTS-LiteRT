@@ -50,7 +50,7 @@ The tiny fixed-shape graph `pt_npu_cache_chain_g5.tflite` (SHA-256 `a5fb30d0c684
 | Full-host-write control | 25,214,976 B | 11.816 ms | 0.137 ms | 9.416 ms | 0.164 ms |
 | Same-buffer-alias probe | 49,152 B | 0 ms | 0.129 ms | 9.610 ms | 0.169 ms |
 
-The graph uses a 25,165,824-byte FP32 cache and 49,152-byte update rows; the one-time initial cache write was 4.933 ms in the chain run. LiteRT reported compatible input/output buffer requirements `[Ahwb, DmaBuf]`, but its Kotlin `TensorBuffer` API did not expose the actual allocated type. The dispatch log confirms one NPU partition but does not reveal whether the runtime copies the full cache inside device memory. Device-side copy volume, NPU energy, and full FlowLM timing remain unverified, so this is a successful host-transfer prototype and an incomplete deployment gate, not a speed/energy win.
+The graph uses a 25,165,824-byte FP32 cache and 49,152-byte update rows; the one-time initial cache write was 4.933 ms in the chain run. LiteRT reported compatible input/output buffer requirements `[Ahwb, DmaBuf]`, but its Kotlin `TensorBuffer` API did not expose the actual allocated type. The dispatch log confirms one NPU partition but does not reveal whether the runtime copies the full cache inside device memory; it also logged contradictory requirements for the scalar output (a 4-byte tensor versus a reported 64-byte requirement). Device-side copy volume, NPU energy, and full FlowLM timing remain unverified, so this is a successful host-transfer prototype and an incomplete deployment gate, not a speed/energy win.
 
 The three device reports are under `/sdcard/Android/data/com.pockettts/files/flowlm-harness/cache-*/report.txt`; the installed graph and option 1 instrumentation are isolated to that branch's test harness.
 
@@ -67,4 +67,8 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment requiring trained model changes | Stopped: no training corpus, pipeline, checkpoint, or held-out quality suite available; no model or device performance result |
 | 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread/precision choices with int8 control | Pending paired full-pipeline timing and quality |
 
-No option is labeled a win until correctness, complete speech, and paired device performance pass the acceptance protocol in [`flowlm-pixel10-optimization-research.md`](../flowlm-pixel10-optimization-research.md).
+## Acceptance coverage
+
+The baseline paragraph test is one long utterance on alba and a same-configuration repeat; it is a control repeatability check, not an A/B against an optimization. Option 2 completed its bucketed prompt/first-decode parity matrix but failed its prefill speed gate, so it was not promoted to full speech testing. Option 3 completed focused short-capacity and safe-fallback probes but has no full-speech audio or power comparison. Option 1 stopped at the tiny cache-chain gate because actual device-side cache copy volume is unknown. Options 4 and 5 stopped before a Pixel candidate artifact/model was available. Option 6 is pending.
+
+No option has completed the full acceptance matrix of three prompt lengths, three audio lengths, two voices, reversed paired runs against CPU int8, first-audio percentiles, audio-subtracted PowerMonitor energy, sustained thermal checks, and listening review. No performance win or production-path change is claimed. The exact requirements are in [`flowlm-pixel10-optimization-research.md`](../flowlm-pixel10-optimization-research.md).
