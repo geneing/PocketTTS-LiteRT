@@ -6,8 +6,8 @@ This follow-up quantizes only large FlowLM feed-forward network (FFN) dense
 matrices. It retains float32 attention projections, K/V handling, EOS and
 flow head, and all Android-facing tensors. Both selective candidates passed
 the first-step host screen and completed a 32-step Alba free-run comparison.
-This is a **host-only** result: no Tensor G5 AOT/offload, Pixel timing, energy,
-speech completion, or listening result is available yet.
+The FFN12 variant was also AOT compiled for Tensor G5 on the host. There is
+still no Pixel timing, energy, speech completion, or listening result.
 
 ## Selection and reproduction
 
@@ -111,9 +111,31 @@ retains more INT8 weight coverage and had the stronger 32-step result here.
 | `pt_flowlm_fused_fp32_contiguous.tflite` source | 338,170,404 | `908a5c9f9487d5ba44b6fe4e0d79f8921a626781fdf222a5c5e08ee5267326fa` |
 | `pt_flowlm_fused_st16_ffn12_contiguous.tflite` | 187,545,872 | `3f045abcf256ff1716cc497c26abd2f49a4c880d2ca9c6c990a3306a3e5336f0` |
 | `pt_flowlm_fused_st16_ffn6_contiguous.tflite` | 262,745,632 | `ad2ebba4147cea2253ba7c371de3c013c360aea54ae89fe3cc3cc715e3d10211` |
+| `pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite` | 178,697,824 | `183a71a2475e6fb68ab626788f8f2189a85d9fb661bcca8c8637e19ce2906d12` |
 
-FFN12 is the more useful of these two host candidates for a subsequent
-Tensor G5 compiler feasibility check. Its 12 quantized FC islands may still
-create mixed precision partitions or conversion overhead, so neither G5
-offload nor speed is implied by the host result. Full speech completion,
-listening and paired Pixel timing are still required by the benchmark protocol.
+## Tensor G5 AOT result for FFN12
+
+The separate pinned AOT environment has `ai-edge-litert==2.2.0` and
+`ai-edge-litert-sdk-google-tensor==2.2.0`. Only FFN12 was compiled, using:
+
+```bash
+PT_OUT=/path/to/scripts/out .venv-aot/bin/python scripts/aot_tensor_g5.py \
+  pt_flowlm_fused_st16_ffn12_contiguous --truncation no_truncation
+```
+
+The compiler completed in **34.0 s** and reported `Subgraph 0 fully
+compiled: 694 / 694 ops offloaded to 1 partitions`. The exported file above
+contains one `serving_default` signature and one public `DISPATCH_OP`.
+Interpreter inspection found the same seven float32 inputs and one float32
+`[1,12321]` output, including position-major K/V inputs `[1,512,96,64]`.
+The compiled program is opaque, so the host cannot establish which internal
+weight precision the vendor program ultimately uses or execute its numerical
+path without Tensor G5.
+
+The compiled artifact is at
+`build/flowlm-worktrees/option12-static-w8a16/scripts/out/pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite`.
+Its logical Android `npuGraph` name is
+`pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite` with
+`npuPositionMajorCache=true`. Full speech completion, listening and paired
+Pixel timing are still required by the benchmark protocol. No device work was
+performed in this branch.
