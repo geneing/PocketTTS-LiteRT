@@ -61,10 +61,10 @@ Each option has its own branch and bench report. Device tests are run serially b
 | Option | Branch | Current implementation / gate | Pixel 10 result |
 |---|---|---|---|
 | 1. Persistent NPU KV cache | `codex/flowlm-option-1-npu-cache` | Tiny fixed-shape two-bank cache-chain proof | 32-step gate passed; host transfer 49 KB vs 25.2 MB, device-side copies and energy unverified |
-| 2. CPU int8 prompt prefill buckets | `codex/flowlm-option-2-int8-prefill` | Repair per-row quantized prefill parity; fixed prompt buckets | Pending quantized row parity and device timing |
-| 3. KV capacity buckets | `codex/flowlm-option-3-kv-capacity` | Smaller static capacities with 512 fallback and capacity checks | Pending safe-boundary, memory, and device timing |
-| 4. GPU resident KV cache | `codex/flowlm-option-4-gpu-cache` | Tiny GPU buffer-chain feasibility gate | Pending device transfer and latency measurements |
-| 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment; requires trained model changes | Pending agent report; no replacement model may be inferred from shape-only edits |
+| 2. CPU int8 prompt prefill buckets | `codex/flowlm-option-2-int8-prefill` | Quantized fixed-bucket prefill graph | Int8 P1/P8/P16 host export/parity passed; Pixel load, runtime, and memory checks pending |
+| 3. KV capacity buckets | `codex/flowlm-option-3-kv-capacity` | Smaller static capacities with 512 fallback and capacity checks | 256 short-prompt probe: 19.72 ms run vs 26.51 ms at 512, same latent bytes; 46-token prompt safely rejected at 256 and completed at 512. No full-speech win established |
+| 4. GPU resident KV cache | `codex/flowlm-option-4-gpu-cache` | Export/API feasibility gate | Stopped before artifact/device run: export service timed out; required GPU buffer interop remains unproven |
+| 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment requiring trained model changes | Stopped: no training corpus, pipeline, checkpoint, or held-out quality suite available; no model or device performance result |
 | 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread/precision choices with int8 control | Pending paired full-pipeline timing and quality |
 
 No option is labeled a win until correctness, complete speech, and paired device performance pass the acceptance protocol in [`flowlm-pixel10-optimization-research.md`](../flowlm-pixel10-optimization-research.md).
