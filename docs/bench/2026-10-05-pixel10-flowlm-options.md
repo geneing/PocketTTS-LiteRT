@@ -38,6 +38,8 @@ The control text probes passed. All three int8 outputs are highly correlated wit
 
 The PowerMonitor domains overlap; do not add these rail values into a single device-energy total. The device was charging at 80%, screen interactive, and thermal status 0 after the run; `soc_therm` was 36.8 C. Energy is an estimate from paired audio-only subtraction. This control is a repeatability check, not an optimized-vs-control A/B.
 
+The played reference and repeat WAVs are available locally at `scripts/out/flowlm-pixel10-control-reference.wav` and `scripts/out/flowlm-pixel10-control-repeat.wav` (ignored build artifacts).
+
 ## Optimization attempts
 
 Each option has its own branch and bench report. Device tests are run serially because they share this Pixel 10. “Pending” means no performance claim is made.
