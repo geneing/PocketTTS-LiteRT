@@ -19,22 +19,20 @@ class PocketTtsConfig(
     /** Frames per LM invocation; >1 needs the matching `pt_flowlm_ms{N}` graph. */
     val lmSteps: Int = 1,
     /**
-     * Prefill the text prompt in batches through the fused graph's head-less
-     * `prefill` signature instead of one fused step per token. It shares the
-     * graph's weight buffers, so it costs almost no storage.
+     * Prefill the text prompt through the fused graph's head-less static bucket
+     * signatures instead of one fused step per token. They share the graph's
+     * backbone weights. The app selects a bucket no larger than the remaining
+     * real prompt length and never writes padding rows into the cache.
      *
      * Note the voice prefix is *not* part of this: it is a precomputed KV cache
      * (`pt_voice_*.bin`) that [PocketTtsSession] copies in, never a prompt the LM
      * has to re-process. What batching would remove is the flow head a prompt
      * token discards and the per-token packed-KV upload.
      *
-     * Off, for two independent reasons. The batch is a fixed
-     * [PocketTts.PREFILL_TOKENS] and padded, so it is *slower* than the
-     * per-token path on the int8 LM (7 tokens: ~140 ms per-token vs ~280 ms
-     * batched; break-even near 28). And the batched take does not currently
-     * reproduce the per-token latents on the shipped graph: with the same text
-     * and seed the two paths produce uncorrelated audio, the batched one
-     * truncating short prompts. See `LatencyProbeTest.prefillPaths`.
+     * Off by default pending CPU int8 device checks. Earlier fixed-P=16 batching
+     * was slower for short prompts and did not reproduce sequential results.
+     * The bucketed path is an experiment until per-position K/V, first-decode,
+     * full-speech, and speed checks pass. See `FlowLmHarnessTest`.
      */
     val usePrefill: Boolean = false,
     /**

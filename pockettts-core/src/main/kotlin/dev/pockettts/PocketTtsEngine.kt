@@ -124,39 +124,72 @@ class PocketTtsEngine(
         null
     }
 
+    private data class SignatureBuffers(
+        val signatureIndex: Int,
+        val inputs: List<TensorBuffer>,
+        val outputs: List<TensorBuffer>,
+    )
+
+    private fun buffersAt(index: Int): SignatureBuffers? {
+        val ins = try {
+            lm.createInputBuffers(index)
+        } catch (_: Exception) {
+            return null
+        }
+        val outs = try {
+            lm.createOutputBuffers(index)
+        } catch (error: Throwable) {
+            ins.forEach { it.close() }
+            throw error
+        }
+        return SignatureBuffers(index, ins, outs)
+    }
+
     /**
-     * `litert_torch` lays named signatures before the default one, so in a file
-     * that carries the prefill the fused step is index 1 and the prefill is
-     * index 0. Buffers belong to a signature, so the step's must be created
-     * explicitly; a single-signature file (older drops) has only index 0.
-     * Created once and kept -- probing with a throwaway set would transiently
-     * double the ~25 MB packed-KV inputs.
+     * Export order is P16, P1, P8, P32, then the default fused step. Older
+     * two-signature model drops still put their fused step at index 1; a
+     * single-signature drop uses the no-index overload.
      */
-    private val lmStepIn: List<TensorBuffer>? =
-        runCatching { lm.createInputBuffers(1) }.getOrNull()
+    private val lmStepBuffers: SignatureBuffers? =
+        buffersAt(PocketTts.PREFILL_BUCKETS.size) ?: buffersAt(1)
+    private val lmStepSignatureIndex: Int? = lmStepBuffers?.signatureIndex
+    internal val lmIn: List<TensorBuffer> = lmStepBuffers?.inputs ?: lm.createInputBuffers()
+    internal val lmOut: List<TensorBuffer> = lmStepBuffers?.outputs ?: lm.createOutputBuffers()
 
-    internal val lmIn: List<TensorBuffer> = lmStepIn ?: lm.createInputBuffers()
-    internal val lmOut: List<TensorBuffer> =
-        if (lmStepIn != null) lm.createOutputBuffers(1) else lm.createOutputBuffers()
+    /** A single temporary bucket set avoids retaining one extra 25 MB KV pair per signature. */
+    internal class PrefillBuffers(
+        val signatureIndex: Int,
+        val inputs: List<TensorBuffer>,
+        val outputs: List<TensorBuffer>,
+    ) : Closeable {
+        override fun close() {
+            inputs.forEach { it.close() }
+            outputs.forEach { it.close() }
+        }
+    }
 
-    /**
-     * Prompt prefill is a second signature of [lm], not a separate graph: it
-     * shares the backbone's weight buffers, so it costs no extra storage. Null
-     * on model drops that predate it, in which case the prompt falls back to a
-     * fused step per token.
-     */
-    internal val prefillIn: List<TensorBuffer>? =
-        if (config.usePrefill && lmStepIn != null) {
-            runCatching { lm.createInputBuffers(0) }.getOrNull()
-        } else null
-    internal val prefillOut: List<TensorBuffer>? =
-        if (config.usePrefill && lmStepIn != null) {
-            runCatching { lm.createOutputBuffers(0) }.getOrNull()
-        } else null
+    internal fun createPrefillBuffers(bucket: Int): PrefillBuffers? {
+        if (!config.usePrefill) return null
+        val stepIndex = lmStepSignatureIndex ?: return null
+        val index = when (stepIndex) {
+            PocketTts.PREFILL_BUCKETS.size -> PocketTts.prefillSignatureIndex(bucket)
+                .takeIf { it >= 0 }
+            // Compatibility with the original graph, which only had P=16.
+            1 -> if (bucket == 16) 0 else null
+            else -> null
+        } ?: return null
+        val buffers = buffersAt(index) ?: return null
+        return PrefillBuffers(buffers.signatureIndex, buffers.inputs, buffers.outputs)
+    }
 
-    /** Run the fused step on buffers created above (last signature when named). */
+    internal fun runPrefill(buffers: PrefillBuffers) {
+        lm.run(buffers.inputs, buffers.outputs, buffers.signatureIndex)
+    }
+
+    /** Run the fused step on the buffers created above. */
     internal fun runLm(ins: List<TensorBuffer>, outs: List<TensorBuffer>) {
-        if (lmStepIn != null) lm.run(ins, outs, 1) else lm.run(ins, outs)
+        val index = lmStepSignatureIndex
+        if (index != null) lm.run(ins, outs, index) else lm.run(ins, outs)
     }
     internal val lmMsIn = lmMs?.createInputBuffers()
     internal val lmMsOut = lmMs?.createOutputBuffers()
@@ -190,12 +223,6 @@ class PocketTtsEngine(
     internal val pk = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
     internal val pv = FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
     internal val mask = FloatArray(PocketTts.NH * (PocketTts.PMAX + 1))
-    // Batched prompt prefill scratch (see PocketTtsSession.prefill).
-    internal val prefillEmb = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.H)
-    internal val prefillCos = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.HD)
-    internal val prefillSin = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.HD)
-    internal val prefillMask = FloatArray(PocketTts.PREFILL_TOKENS * (PocketTts.PMAX + 1))
-    internal val prefillWrite = FloatArray(PocketTts.PREFILL_TOKENS * PocketTts.PMAX)
     internal val decFeat = FloatArray(PocketTts.MIMI_D * PocketTts.S_DEC)
     internal val decBlk = FloatArray((1 + PocketTts.F_BLK) * PocketTts.LDIM)
     internal val streamWin = FloatArray(PocketTts.MIMI_D * streamW)
@@ -268,8 +295,11 @@ class PocketTtsEngine(
         android.util.Log.i(
             "PocketTTS",
             "engine ${placement.label} @ ${Placement.renderer()} (${lmGraphName}) " +
-                "lmSig=${if (lmStepIn != null) 1 else 0} " +
-                "prefill=${if (prefillIn != null) "${PocketTts.PREFILL_SIGNATURE}/${prefillIn.size}" else "none"} " +
+                "lmSig=${lmStepSignatureIndex ?: 0} " +
+                "prefill=${if (config.usePrefill && lmStepSignatureIndex != null) {
+                    if (lmStepSignatureIndex == PocketTts.PREFILL_BUCKETS.size) "buckets=${PocketTts.PREFILL_BUCKETS.joinToString()}"
+                    else "legacy-P16"
+                } else "off"} " +
                 "heap=${Runtime.getRuntime().totalMemory() shr 20}MiB " +
                 "native=${android.os.Debug.getNativeHeapAllocatedSize() shr 20}MiB",
         )
@@ -302,7 +332,7 @@ class PocketTtsEngine(
         executor.shutdownNow()
         listOf(
             lmIn, lmOut, lmMsIn, lmMsOut, dectxIn, dectxOut, deconlyIn, deconlyOut,
-            deconlyWIn, deconlyWOut, prefillIn, prefillOut,
+            deconlyWIn, deconlyWOut,
         ).forEach { l -> l?.forEach { it.close() } }
         lm.close(); lmMs?.close(); dectx.close(); deconly.close(); deconlyW?.close()
         embChannel.close()

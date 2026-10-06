@@ -163,83 +163,104 @@ class PocketTtsSession internal constructor(
         (rnd.nextGaussian() * sqrt(PocketTts.TEMP.toDouble())).toFloat()
     }
 
-    /**
-     * Append the prompt tokens to the packed KV. With the fused graph's
-     * head-less `prefill` signature this is one invocation per
-     * [PocketTts.PREFILL_TOKENS] tokens instead of one fused step (flow head
-     * included) per token -- the latent a prompt step computes is discarded --
-     * and the host never uploads the ~25 MB packed KV per token. Falls back to
-     * the per-token fused step on model drops that predate the signature.
-     */
+    /** Append prompt tokens in the largest exact static bucket available. */
     private fun prefill(ids: IntArray) {
-        val ins = engine.prefillIn
-        val outs = engine.prefillOut
-        if (ins == null || outs == null) {
-            for (id in ids) step(embRow(id), zeroNoise)
-            return
-        }
         check(pos + ids.size <= PMAX) { "KV cache overflow at $pos + ${ids.size}" }
-        val p = PocketTts.PREFILL_TOKENS
-        val emb = engine.prefillEmb
-        val cos = engine.prefillCos
-        val sin = engine.prefillSin
-        val msk = engine.prefillMask
-        val wr = engine.prefillWrite
-        val t0 = System.nanoTime()
-        var runNs = 0L
+        var batchInNs = 0L
+        var batchRunNs = 0L
+        var batchReadNs = 0L
+        var batchSteps = 0
+        var batchInvocations = 0
         var i = 0
         while (i < ids.size && !cancelled) {
-            val n = minOf(p, ids.size - i)
-            java.util.Arrays.fill(emb, 0f)
-            java.util.Arrays.fill(msk, PocketTts.MASK_NEG)
-            java.util.Arrays.fill(wr, 0f)
-            for (j in 0 until n) {
-                var b = ids[i + j] * PocketTts.H * 2
-                val eb = j * PocketTts.H
-                for (h in 0 until PocketTts.H) {
-                    emb[eb + h] = android.util.Half.toFloat(engine.embMap.getShort(b)); b += 2
+            val remaining = ids.size - i
+            val bucket = PocketTts.PREFILL_BUCKETS.filter { it <= remaining }.maxOrNull()
+            if (bucket == null) {
+                step(embRow(ids[i]), zeroNoise)
+                i++
+                continue
+            }
+            val chunkStart = System.nanoTime()
+            val buffers = engine.createPrefillBuffers(bucket)
+            if (buffers == null) {
+                step(embRow(ids[i]), zeroNoise)
+                i++
+                continue
+            }
+            val runBefore = batchRunNs
+            val readBefore = batchReadNs
+            try {
+                val emb = FloatArray(bucket * PocketTts.H)
+                val cos = FloatArray(bucket * HD)
+                val sin = FloatArray(bucket * HD)
+                val msk = FloatArray(bucket * (PMAX + 1)) { PocketTts.MASK_NEG }
+                val wr = FloatArray(bucket * PMAX)
+                for (j in 0 until bucket) {
+                    var b = ids[i + j] * PocketTts.H * 2
+                    val eb = j * PocketTts.H
+                    for (h in 0 until PocketTts.H) {
+                        emb[eb + h] = android.util.Half.toFloat(engine.embMap.getShort(b)); b += 2
+                    }
+                    ropeFill(pos + j)
+                    System.arraycopy(cosArr, 0, cos, j * HD, HD)
+                    System.arraycopy(sinArr, 0, sin, j * HD, HD)
+                    val mb = j * (PMAX + 1)
+                    for (q in 0 until pos + j) msk[mb + q] = 0f
+                    msk[mb + PMAX] = 0f
+                    wr[j * PMAX + pos + j] = 1f
                 }
-                ropeFill(pos + j)
-                System.arraycopy(cosArr, 0, cos, j * HD, HD)
-                System.arraycopy(sinArr, 0, sin, j * HD, HD)
-                val mb = j * (PMAX + 1)
-                for (q in 0 until pos + j) msk[mb + q] = 0f
-                msk[mb + PMAX] = 0f
-                wr[j * PMAX + pos + j] = 1f
-            }
-            ins[0].writeFloat(emb)
-            ins[1].writeFloat(cos)
-            ins[2].writeFloat(sin)
-            ins[3].writeFloat(msk)
-            ins[4].writeFloat(wr)
-            ins[5].writeFloat(pk)
-            ins[6].writeFloat(pv)
-            val rt = System.nanoTime()
-            engine.lm.run(ins, outs, 0)
-            runNs += System.nanoTime() - rt
-            val out = outs[0].readFloat()
-            var o = 0
-            for (j in 0 until n) {
-                for (g in 0 until G) {
-                    System.arraycopy(out, o, pk, g * PMAX * HD + (pos + j) * HD, HD); o += HD
+                val ins = buffers.inputs
+                val outs = buffers.outputs
+                check(ins.size == 7 && outs.size == 1) {
+                    "prefill signature ${buffers.signatureIndex} has ${ins.size} inputs/${outs.size} outputs"
                 }
-            }
-            for (j in 0 until n) {
-                for (g in 0 until G) {
-                    System.arraycopy(out, o, pv, g * PMAX * HD + (pos + j) * HD, HD); o += HD
+                ins[0].writeFloat(emb)
+                ins[1].writeFloat(cos)
+                ins[2].writeFloat(sin)
+                ins[3].writeFloat(msk)
+                ins[4].writeFloat(wr)
+                ins[5].writeFloat(pk)
+                ins[6].writeFloat(pv)
+                val runStart = System.nanoTime()
+                engine.runPrefill(buffers)
+                batchRunNs += System.nanoTime() - runStart
+                val readStart = System.nanoTime()
+                val out = outs[0].readFloat()
+                batchReadNs += System.nanoTime() - readStart
+                check(out.size == 2 * bucket * G * HD) {
+                    "prefill P=$bucket output width ${out.size}, expected ${2 * bucket * G * HD}"
                 }
+                var o = 0
+                for (j in 0 until bucket) {
+                    for (g in 0 until G) {
+                        System.arraycopy(out, o, pk, g * PMAX * HD + (pos + j) * HD, HD)
+                        o += HD
+                    }
+                }
+                for (j in 0 until bucket) {
+                    for (g in 0 until G) {
+                        System.arraycopy(out, o, pv, g * PMAX * HD + (pos + j) * HD, HD)
+                        o += HD
+                    }
+                }
+                for (j in 0 until bucket) {
+                    for (h in 0 until NH) mask[h * (PMAX + 1) + pos + j] = 0f
+                }
+                pos += bucket
+                i += bucket
+                batchSteps += bucket
+                batchInvocations++
+            } finally {
+                buffers.close()
+                val elapsed = System.nanoTime() - chunkStart
+                batchInNs += elapsed - (batchRunNs - runBefore) - (batchReadNs - readBefore)
             }
-            for (j in 0 until n) {
-                for (h in 0 until NH) mask[h * (PMAX + 1) + pos + j] = 0f
-            }
-            pos += n
-            i += n
         }
-        val t1 = System.nanoTime()
-        sLmIn += (t1 - t0) - runNs
-        sLmRun += runNs
-        sLmSteps += ids.size
-        sLmInv += (ids.size + p - 1) / p
+        sLmIn += batchInNs
+        sLmRun += batchRunNs
+        sLmRead += batchReadNs
+        sLmSteps += batchSteps
+        sLmInv += batchInvocations
     }
 
     /**

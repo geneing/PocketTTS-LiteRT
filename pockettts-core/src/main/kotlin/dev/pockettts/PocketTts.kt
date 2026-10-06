@@ -45,36 +45,33 @@ object PocketTts {
     /**
      * The flow-LM: step + flow head fused, dynamic-range int8 -- int8 weights
      * with fp32 activations, so the host protocol is unchanged. ~2.3x faster per
-     * frame than the fp16 graph on XNNPACK and 3.9x smaller. It also carries the
-     * head-less `prefill` signature ([PREFILL_SIGNATURE]) in the same file,
-     * sharing the backbone's weight buffers. This is the only LM shipped.
+     * frame than the fp16 graph on XNNPACK and 3.9x smaller. It can also carry
+     * head-less prefill bucket signatures sharing the backbone weights. This
+     * is the only LM shipped; prefill remains opt-in pending device gates.
      */
     const val LM = "pt_flowlm_fused_dyn8_all.tflite"
 
-    /**
-     * Name `litert_torch` gives the fused graph's default signature. The
-     * head-less prompt batch is a second signature ([PREFILL_SIGNATURE]) in the
-     * same file; named signatures are laid out before the default one, so the
-     * step is addressed by index 1 and the prefill by index 0.
-     */
+    /** Name `litert_torch` gives the fused graph's default signature. */
     const val LM_SIGNATURE = "serving_default"
 
     /** N-step fused decode graph: N frames per invocation. */
     fun msGraph(n: Int) = "pt_flowlm_ms${n}_fp16.tflite"
 
     /**
-     * Prompt tokens the `prefill` signature consumes per invocation. A chunk's
-     * prompt is capped at [MAX_TOKENS_PER_CHUNK], so 16 covers it in a few
-     * invocations with little padding waste.
+     * Static head-less prefill signatures in export order. P=16 remains index
+     * 0 for compatibility; the default fused step follows all four signatures.
+     * Selection uses the largest bucket no bigger than the remaining real token
+     * count, so a padding row never advances the joint position.
      */
-    const val PREFILL_TOKENS = 16
+    val PREFILL_BUCKETS = intArrayOf(16, 1, 8, 32)
+    const val PREFILL_TOKENS = 32
+
+    fun prefillSignatureIndex(tokens: Int): Int = PREFILL_BUCKETS.indexOf(tokens)
 
     /**
-     * Named signature of the fused flow-LM graph that appends the text prompt to
-     * the packed KV in batches, without the flow head a prompt token discards.
-     * It shares the graph's weight buffers, so it costs no extra storage or
-     * accelerator memory; model drops that predate it fall back to a fused step
-     * per prompt token.
+     * Original P=16 head-less signature name. The other buckets are named
+     * `prefill_<bucket>`. Production stays opt-in until device correctness and
+     * speed gates pass on the dynamic-range int8 graph.
      */
     const val PREFILL_SIGNATURE = "prefill"
 

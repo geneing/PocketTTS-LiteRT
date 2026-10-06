@@ -61,11 +61,12 @@ HD = 64
 FFN = 4096
 LDIM = 32
 PMAX = 512            # flow-LM KV capacity: voice (~142) + text (~55) + gen (~235)
-# Text tokens the fused graph's head-less `prefill` signature consumes per
-# invocation (`PT_PREFILL_TOKENS`). The signature shares the backbone's weight
-# buffers, so it costs almost no storage, and the app batches the prompt through
-# it. Set 0 to export the fused graph without it.
+# Fixed head-less prompt-prefill buckets. The legacy PT_PREFILL_TOKENS=0 switch
+# still omits prompt signatures. Keep P=16 first so the old `prefill` signature
+# remains signature index 0; additional signatures follow it, then `serving_default`.
 PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "16"))
+PREFILL_BUCKETS = (16, 1, 8, 32) if PREFILL_TOKENS > 0 else ()
+PREFILL_SIGNATURE_INDEX = {p: i for i, p in enumerate(PREFILL_BUCKETS)}
 FLOW_DIM = 512
 FLOW_DEPTH = 6
 
@@ -314,6 +315,37 @@ def quant_calibration(model, voice="alba", n=32, run=128, seed=11):
     print(f"calibration: {len(samples)} samples over {run} free-run steps "
           f"(offsets {off0}..{off})")
     return samples
+
+
+def int8_step_oracle(path, step_idx, pre_args, real, off0):
+    """Run the shipped quantized fused step sequentially and collect each K/V row."""
+    from ai_edge_litert.compiled_model import CompiledModel
+    cm = CompiledModel.from_file(path)
+    ins = cm.create_input_buffers(step_idx)
+    outs = cm.create_output_buffers(step_idx)
+    emb, cos, sin = (a.numpy() for a in pre_args[:3])
+    pk = pre_args[5].numpy().copy()
+    pv = pre_args[6].numpy().copy()
+    zeros = np.zeros((1, LDIM), np.float32)
+    nk_rows, nv_rows = [], []
+    nout = 1 + LDIM + 2 * G_KV
+    for i in range(real):
+        pos = off0 + i
+        args = (emb[:, i:i + 1], cos[:, i:i + 1], sin[:, i:i + 1],
+                make_mask(pos), pk, pv, zeros)
+        for buf, a in zip(ins, args):
+            buf.write(np.ascontiguousarray(a, dtype=np.float32).ravel())
+        cm.run_by_index(step_idx, ins, outs)
+        values = np.asarray(outs[0].read(nout, np.float32), dtype=np.float32)
+        k0 = 1 + LDIM
+        v0 = k0 + G_KV
+        nk = values[k0:k0 + G_KV].reshape(N_LAYERS * N_HEADS, HD)
+        nv = values[v0:v0 + G_KV].reshape(N_LAYERS * N_HEADS, HD)
+        nk_rows.append(nk.copy().reshape(-1))
+        nv_rows.append(nv.copy().reshape(-1))
+        pk[0, :, pos, :] = nk
+        pv[0, :, pos, :] = nv
+    return np.stack(nk_rows)[None], np.stack(nv_rows)[None]
 
 
 def opcheck(path, label):
@@ -636,45 +668,27 @@ def stage_fused(model):
                torch.zeros(1, N_LAYERS * N_HEADS, PMAX, HD),
                torch.zeros(1, LDIM))
 
-    # Opt-in second signature: the head-less batched prompt prefill. It shares
-    # the backbone's weight buffers, so the file grows by ~1 MB, not by a second
-    # copy of the weights (170.5 MB vs 169.2 MB + 133.5 MB as two files). It is
-    # off by default because the extra subgraph still costs *runtime* memory at
-    # load, and a 3 GB app memory limit does not always have that to spare.
-    P = PREFILL_TOKENS
+    # Several static head-less prompt buckets share the fused step's backbone
+    # weights. P=16 remains signature index 0 for existing tooling; the default
+    # fused step follows all named prefill signatures.
     extra = []
-    if P > 0:
-        pre = PrefillStep(flm, P).eval()
-        # FlowLMStep clones the backbone weights, so hand the prefill the *same*
-        # step instance: both signatures then reference one parameter set and the
-        # converter stores its buffers once.
-        pre.step = fused.step
-        pids = [(i * 7 + 3) % emb_w.shape[0] for i in range(P)]
-        pre_emb = torch.stack([emb_w[t] for t in pids], dim=0).view(1, P, -1)
-        pre_cos = torch.zeros(1, P, 1, HD)
-        pre_sin = torch.zeros(1, P, 1, HD)
-        pre_mask = torch.zeros(1, P, PMAX + 1)
-        pre_write = torch.zeros(1, P, PMAX, 1)
-        for i in range(P):
-            c, s = rope_cos_sin_deint(off0 + i)
-            pre_cos[0, i, 0] = torch.from_numpy(c)
-            pre_sin[0, i, 0] = torch.from_numpy(s)
-            pre_mask[0, i] = torch.from_numpy(make_mask(off0 + i)[0, 0, 0])
-            pre_write[0, i, off0 + i, 0] = 1.0
-        pre_args = (pre_emb, pre_cos, pre_sin, pre_mask, pre_write, pk, pv)
-        extra.append(("prefill", pre, pre_args))
-
-        # eager reference for the prefill rows: the per-token step it replaces
-        pk_r, pv_r = pk.clone(), pv.clone()
-        with torch.no_grad():
-            for i in range(P):
-                c, s = rope_cos_sin_deint(off0 + i)
-                _, _, nk, nv = step(emb_w[pids[i]].view(1, 1, -1),
-                                    torch.from_numpy(c).view(1, 1, 1, HD),
-                                    torch.from_numpy(s).view(1, 1, 1, HD),
-                                    torch.from_numpy(make_mask(off0 + i)), pk_r, pv_r)
-                pk_r[0, :, off0 + i] = nk[0, :, 0]
-                pv_r[0, :, off0 + i] = nv[0, :, 0]
+    prefill_cases = {}
+    if PREFILL_TOKENS > 0:
+        rec, _ = record_reference(
+            model, "alba", "Hello world. I am Pocket TTS running on a phone.")
+        prompt_ids = rec["tokens"][0].tolist()
+        for P in PREFILL_BUCKETS:
+            pre = PrefillStep(flm, P).eval()
+            # The module constructor clones weights. Share the exact step module
+            # so signatures do not duplicate the backbone constants.
+            pre.step = fused.step
+            args, real, nk_ref, nv_ref, pk_ref, pv_ref = prefill_case(
+                step, emb_w, prompt_ids, P, pk, pv, off0)
+            name = "prefill" if P == 16 else f"prefill_{P}"
+            extra.append((name, pre, args))
+            prefill_cases[P] = (args, real, nk_ref, nv_ref, pk_ref, pv_ref)
+            print(f"prefill signature {name}: P={P}, index={PREFILL_SIGNATURE_INDEX[P]}, "
+                  f"real rows={real}, output floats={2 * P * G_KV}")
 
     p = convert_multi(fused, example, extra, os.path.join(OUT, "pt_flowlm_fused.tflite"))
     opcheck(p, "flowlm_fused")
@@ -696,20 +710,20 @@ def stage_fused(model):
     print(f"fp16 fused one-step corr {corr(outs[0], ref.numpy()):.6f} "
           f"max|d| {maxd(outs[0], ref.numpy()):.2e}")
 
-    if P > 0:
-        # A named signature is laid out *before* the default, so the step is
-        # index 1 and the prefill is index 0. (This read 1 for a while, which
-        # ran the *step* with the prefill's inputs and made the number below
-        # meaningless -- the prefill signature went unverified.)
-        got = run_signature(fp16, 0, tuple(a.numpy() for a in pre_args),
-                            [2 * P * G_KV])[0]
-        nk_p = got[:P * G_KV].reshape(1, P, N_LAYERS * N_HEADS, HD)
-        nv_p = got[P * G_KV:].reshape(1, P, N_LAYERS * N_HEADS, HD)
-        nk_ref = pk_r[0, :, off0:off0 + P].permute(1, 0, 2).unsqueeze(0)
-        nv_ref = pv_r[0, :, off0:off0 + P].permute(1, 0, 2).unsqueeze(0)
-        print(f"fp16 prefill signature vs per-token step  new-k max|d| "
-              f"{maxd(nk_p, nk_ref.numpy()):.2e}  new-v max|d| "
-              f"{maxd(nv_p, nv_ref.numpy()):.2e}")
+    for P, (pre_args, real, nk_ref, nv_ref, _, _) in prefill_cases.items():
+        sig = PREFILL_SIGNATURE_INDEX[P]
+        for label, graph in (("fp32", p), ("fp16", fp16)):
+            got = run_signature(graph, sig, tuple(a.numpy() for a in pre_args),
+                                [2 * P * G_KV])[0]
+            nk_p = got[:P * G_KV].reshape(1, P, G_KV)
+            nv_p = got[P * G_KV:].reshape(1, P, G_KV)
+            print(f"{label} prefill P={P} signature-index={sig} vs eager step "
+                  f"K max|d| {maxd(nk_p[:, :real], nk_ref.numpy()):.2e} "
+                  f"V max|d| {maxd(nv_p[:, :real], nv_ref.numpy()):.2e}")
+            for i in range(real):
+                print(f"  {label} prefill P={P} position={i} "
+                      f"K max|d| {maxd(nk_p[0, i], nk_ref[0, i].numpy()):.2e} "
+                      f"V max|d| {maxd(nv_p[0, i], nv_ref[0, i].numpy()):.2e}")
 
 
 G_KV = N_LAYERS * N_HEADS * HD
@@ -892,9 +906,50 @@ class PrefillStep(nn.Module):
             pvv = pvv * (1.0 - wi) + nv * wi
             nks.append(nk)
             nvs.append(nv)
-        nk_all = torch.cat(nks, dim=1).permute(0, 2, 1, 3)  # [1,P,96,64]
-        nv_all = torch.cat(nvs, dim=1).permute(0, 2, 1, 3)
+        # Each per-token K/V is [1,96,1,64]. Concatenate along the sequence
+        # axis, then move that axis before the packed group axis. This makes the
+        # wire format explicitly position-major: row 0's 96 groups, row 1's
+        # 96 groups, and so on. The app unpacks in this same order.
+        nk_all = torch.cat(nks, dim=2).permute(0, 2, 1, 3)  # [1,P,96,64]
+        nv_all = torch.cat(nvs, dim=2).permute(0, 2, 1, 3)
         return torch.cat([nk_all.reshape(1, -1), nv_all.reshape(1, -1)], dim=-1)
+
+
+def prefill_case(step, emb_w, prompt_ids, P, pk0, pv0, off0):
+    """Build one fixed-bucket input and its eager per-token K/V oracle."""
+    real = min(P, len(prompt_ids))
+    emb = torch.zeros(1, P, D_MODEL)
+    if real:
+        emb[0, :real] = torch.stack([emb_w[t] for t in prompt_ids[:real]])
+    cos = torch.zeros(1, P, 1, HD)
+    sin = torch.zeros(1, P, 1, HD)
+    mask = torch.full((1, P, PMAX + 1), MASK_NEG)
+    write = torch.zeros(1, P, PMAX, 1)
+    for i in range(P):
+        c, s = rope_cos_sin_deint(off0 + i)
+        cos[0, i, 0] = torch.from_numpy(c)
+        sin[0, i, 0] = torch.from_numpy(s)
+        mask[0, i] = torch.from_numpy(make_mask(off0 + i)[0, 0, 0])
+        if i < real:
+            write[0, i, off0 + i, 0] = 1.0
+
+    pk, pv = pk0.clone(), pv0.clone()
+    nk_rows, nv_rows = [], []
+    with torch.no_grad():
+        for i in range(real):
+            _, _, nk, nv = step(
+                emb[:, i:i + 1], cos[:, i:i + 1], sin[:, i:i + 1],
+                torch.from_numpy(make_mask(off0 + i)), pk, pv,
+            )
+            nk_row, nv_row = nk[0, :, 0].clone(), nv[0, :, 0].clone()
+            nk_rows.append(nk_row)
+            nv_rows.append(nv_row)
+            pk[0, :, off0 + i] = nk[0, :, 0]
+            pv[0, :, off0 + i] = nv[0, :, 0]
+
+    nk_ref = torch.stack(nk_rows).unsqueeze(0) if real else torch.empty(1, 0, G_KV)
+    nv_ref = torch.stack(nv_rows).unsqueeze(0) if real else torch.empty(1, 0, G_KV)
+    return (emb, cos, sin, mask, write, pk0, pv0), real, nk_ref, nv_ref, pk, pv
 
 
 def stage_prefill(model, tokens_list):
@@ -1703,6 +1758,13 @@ def stage_quant(model):
         ref = fused(bos_in, torch.from_numpy(c).view(1, 1, 1, HD),
                     torch.from_numpy(s).view(1, 1, 1, HD),
                     torch.from_numpy(mask), pk, pv, noise).numpy()
+    emb_w = flm.conditioner.embed.weight.detach()
+    if PREFILL_BUCKETS:
+        prefill_rec, _ = record_reference(
+            model, "alba", "Hello world. I am Pocket TTS running on a phone.")
+        prefill_ids = prefill_rec["tokens"][0].tolist()
+    else:
+        prefill_ids = []
 
     for tag in tags:
         spec = QUANT_VARIANTS[tag]
@@ -1723,9 +1785,9 @@ def stage_quant(model):
                   f"parity skipped")
             continue
         print(f"[{tag}] io {sorted(dts)}")
-        # A fused graph that carries the prefill signature lays it out first, so
-        # the step is index 1; a plain graph has only index 0.
-        step_idx = 1 if PREFILL_TOKENS > 0 else 0
+        # Named prefill signatures are emitted in PREFILL_BUCKETS order, before
+        # the default serving_default fused step.
+        step_idx = len(PREFILL_BUCKETS)
         try:
             o = run_signature(
                 dst, step_idx,
@@ -1742,6 +1804,24 @@ def stage_quant(model):
             f"{n} " + (f"corr {corr(o[s], r[s]):.6f} " if o[s].size > 1 else "")
             + f"max|d| {maxd(o[s], r[s]):.2e}"
             for n, s in slices))
+
+        if tag == "dyn8_all" and PREFILL_BUCKETS:
+            for P in PREFILL_BUCKETS:
+                pre_args, real, _, _, _, _ = prefill_case(
+                    fused.step, emb_w, prefill_ids, P, pk, pv, off0)
+                sig = PREFILL_SIGNATURE_INDEX[P]
+                got = run_signature(
+                    dst, sig, tuple(a.numpy() for a in pre_args), [2 * P * G_KV])[0]
+                nk_batch = got[:P * G_KV].reshape(1, P, G_KV)[:, :real]
+                nv_batch = got[P * G_KV:].reshape(1, P, G_KV)[:, :real]
+                nk_ref, nv_ref = int8_step_oracle(dst, step_idx, pre_args, real, off0)
+                print(f"[dyn8_all] prefill P={P} signature-index={sig} vs sequential int8 "
+                      f"K max|d| {maxd(nk_batch, nk_ref):.2e} "
+                      f"V max|d| {maxd(nv_batch, nv_ref):.2e}")
+                for i in range(real):
+                    print(f"  int8 prefill P={P} position={i} "
+                          f"K max|d| {maxd(nk_batch[0, i], nk_ref[0, i]):.2e} "
+                          f"V max|d| {maxd(nv_batch[0, i], nv_ref[0, i]):.2e}")
 
 
 def main():
