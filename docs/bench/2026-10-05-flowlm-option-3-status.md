@@ -19,18 +19,24 @@ the serialized acceptance runs.
   fails before prefill/generation if no bucket fits, instead of clamping away
   generated frames. Reduced-capacity NPU and multi-step paths remain gated.
 - `FlowLmHarnessTest` reports graph load, input staging, run, output read, KV
-  transfer bytes, tensor differences, and a deterministic zero-noise first
-  decode step. Its `fp16` and `int8_per_head` cache modes are host-side
+  transfer bytes, graph SHA-256, device fingerprint, per-step EOS/latent/new-K/
+  new-V differences, and a deterministic zero-noise first decode step. Its
+  `fp16` and `int8_per_head` cache modes are host-side
   round-trip simulations only: LiteRT graph inputs still use float32, so they
   do not reduce actual transfer bytes or represent a speed result.
+- The bundled voice files have 126 prefix frames (Alba, Charles, Javert,
+  Marius, Mary) or 133 (Eve), calculated from their compact fp16 file sizes.
+  Even the minimum planned audio budget makes 128 too small for full speech
+  with these voices. The exporter uses an empty prefix for a parity fixture
+  that would cross the bucket boundary and rejects a fixture wider than PMAX.
 
 For a Linux/WSL export, create an isolated `PT_OUT` directory and run the
 `fused` stage followed by `quant` for each capacity. For example, capacity 256
 produces `pt_flowlm_fused_fp16_pmax256.tflite` and
-`pt_flowlm_fused_dyn8_all_pmax256.tflite`. Capacity 128 is exportable, but the
-bundled Alba voice prefix is longer than 128; the exporter's shape/parity seed
-therefore uses an empty prefix, and the Android harness must use a voice that
-actually fits before that bucket is a supported candidate.
+`pt_flowlm_fused_dyn8_all_pmax256.tflite`. Capacity 128 is exportable for a
+custom short-prefix voice. Alba's 126-frame prefix fits the static shape, but
+126+16 exceeds the exporter's prefill parity fixture, so that fixture uses an
+empty prefix. The app rejects an undersized bucket before prefill.
 
 ```bash
 PT_FLOWLM_PMAX=256 PT_OUT=/tmp/pt-pmax256 python scripts/build_pockettts.py fused
@@ -50,7 +56,7 @@ the app's model store raises `FileNotFoundException` naming the absent graph.
 
 | Check | Status |
 |---|---|
-| Exporter syntax | Passed with bundled Python `py_compile` |
+| Exporter syntax | Passed with bundled Python AST parse |
 | Capacity graph export and tensor parity | Pending; export environment/model weights not exercised here |
 | Exact prefix repack / bucket planner | Added as focused `FlowLmHarnessTest` instrumentation method; not run on device |
 | Android Kotlin compile | Passed: `:app:compileDebugAndroidTestKotlin` with Gradle 9.6 |
@@ -64,3 +70,29 @@ research brief's paired CPU-int8 protocol with the graph checksum, runtime
 versions, device fingerprint, workload, power method, and listening review
 recorded. The precision path needs a real lower-precision graph input and
 supported Android tensor-buffer writes before transfer savings can be claimed.
+
+The documented reference clone and conversion virtual environment were absent
+at the repository paths in WSL, so no reduced-capacity `.tflite` was generated
+in this checkpoint. The 128/256/512 graph parity and Pixel 10 rows are pending.
+
+## Exact device follow-up
+
+Build the 256 variant with the pinned WSL reference checkout and conversion
+environment, then push `pt_flowlm_fused_dyn8_all_pmax256.tflite` beside the
+shipped 512 graph. Run one instrumentation method at a time:
+
+```powershell
+.\gradlew.bat :app:installDebug :app:installDebugAndroidTest
+adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#capacityPlannerAndVoicePrefixRepackingAreExact com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#runTextPromptHarness -e lmGraph pt_flowlm_fused_dyn8_all.tflite -e lmCapacity 256 -e backends CPU -e voice alba -e text 'Hello.' -e kvPrecision fp32 com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+adb pull /sdcard/Android/data/com.pockettts/files/flowlm-harness
+```
+
+Repeat with a second bundled voice, 1-5 and 25-50 token prompts, and a
+near-capacity prompt that still fits the planned frames. Use matched 512 runs
+and reverse A/B order. Inspect every prompt row and the first decode row;
+`first_step_over_1e-3` is diagnostic, not an acceptance gate. Full short,
+medium, and long speech, one-shot and streaming, paired Android power monitors
+with audio-only subtraction, RSS, temperatures, listening, and the graph,
+runtime, dispatch, and AOT details still need separate acceptance runs under
+the research protocol.

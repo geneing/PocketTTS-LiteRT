@@ -12,12 +12,14 @@ import dev.pockettts.PocketTts
 import dev.pockettts.SpTokenizer
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
+import java.security.MessageDigest
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -55,6 +57,10 @@ class FlowLmHarnessTest {
         assertEquals(128, PocketTts.smallestFlowLmCapacity(127, 0, 0))
         assertEquals(256, PocketTts.smallestFlowLmCapacity(128, 0, 0))
         assertEquals(256, PocketTts.smallestFlowLmCapacity(120, 10, 20))
+        assertEquals(128, PocketTts.smallestFlowLmCapacity(0, 0, 127))
+        assertEquals(256, PocketTts.smallestFlowLmCapacity(0, 0, 128))
+        assertEquals(512, PocketTts.smallestFlowLmCapacity(0, 0, 511))
+        assertNull(PocketTts.smallestFlowLmCapacity(0, 0, 512))
         assertEquals("pt_flowlm_fused_dyn8_all_pmax256.tflite",
             PocketTts.flowLmCapacityGraph(PocketTts.LM, 256))
         assertEquals(PocketTts.LM, PocketTts.flowLmCapacityGraph(PocketTts.LM, PocketTts.PMAX))
@@ -89,6 +95,8 @@ class FlowLmHarnessTest {
             "lmCapacity must be one of ${PocketTts.FLOWLM_CAPACITIES}, got $candidateCapacity"
         }
         val candidateGraph = PocketTts.flowLmCapacityGraph(baseGraph, candidateCapacity)
+        val referenceGraph = args.getString("referenceGraph")
+            ?.trim()?.ifEmpty { REFERENCE_GRAPH } ?: REFERENCE_GRAPH
         val kvPrecision = parseKvPrecision(args.getString("kvPrecision"))
         val includeFirstDecode = args.getString("firstDecode")?.toBooleanStrictOrNull() ?: true
         val requested = args.getString("backends")
@@ -126,9 +134,13 @@ class FlowLmHarnessTest {
         val lines = ArrayList<String>()
         lines += "FlowLM text harness"
         lines += "device=${android.os.Build.MODEL} (${android.os.Build.DEVICE}) Android ${android.os.Build.VERSION.RELEASE}"
+        lines += "fingerprint=${android.os.Build.FINGERPRINT}"
+        lines += "LiteRT Android dependency=2.2.0; inspect installed dispatch library for the NPU variant"
         lines += "text=$text"
         lines += "voice=$voice"
         lines += "graph=$candidateGraph capacity=$candidateCapacity kvPrecision=$kvPrecision"
+        lines += "candidate_sha256=${sha256(File(modelDir, candidateGraph))}"
+        lines += "reference_graph=$referenceGraph reference_sha256=${sha256(File(modelDir, referenceGraph))}"
         lines += "tokens=${tokenIds.size} ids=${tokenIds.joinToString(",")}"
         lines += "output=prompt fused outputs plus ${if (includeFirstDecode) "one zero-noise BOS decode step" else "no decode step"}; voice KV prefix=${voiceState.length} tokens"
         lines += "plannedFrames=$plannedFrames recommendedCapacity=${recommendedCapacity ?: "unsupported"} fitsCapacity=$plannedFits; prompt-only probe; planned fit is required for full speech"
@@ -174,8 +186,6 @@ class FlowLmHarnessTest {
 
             // The shipped CPU dynamic-int8 graph is the A/B reference. Running it after the candidates also
             // preserves the runtime's required NPU-first initialization order.
-            val referenceGraph = args.getString("referenceGraph")
-                ?.trim()?.ifEmpty { REFERENCE_GRAPH } ?: REFERENCE_GRAPH
             val referenceCapacity = graphCapacity(referenceGraph)
             val reference = runPrompt(
                 Accel.CPU, referenceGraph, tokenIds, embed, voiceState, environment,
@@ -200,6 +210,8 @@ class FlowLmHarnessTest {
                         result.stageMs, result.runMs, result.readMs, result.kvTransformMs,
                         result.kvInputBytes, m.corr, m.mad, m.msd, file,
                     )
+                    appendStepDifferences(lines, reference.output, result.output,
+                        tokenIds.size, includeFirstDecode)
                 } catch (t: Throwable) {
                     lines += "$backend candidate comparison failed: ${t.message}; output saved=$file"
                 }
@@ -493,6 +505,67 @@ class FlowLmHarnessTest {
         return Metrics(corr, absDiff / n, squareDiff / n)
     }
 
+    /** Report every real newly written K/V row and the first decode output separately. */
+    private fun appendStepDifferences(
+        lines: MutableList<String>, reference: FloatArray, candidate: FloatArray,
+        promptTokens: Int, includeFirstDecode: Boolean,
+    ) {
+        val kvWidth = PocketTts.G * PocketTts.HD
+        val stride = 1 + PocketTts.LDIM + 2 * kvWidth
+        val steps = promptTokens + if (includeFirstDecode) 1 else 0
+        require(reference.size == steps * stride && candidate.size == reference.size) {
+            "step comparison size mismatch: expected ${steps * stride}, " +
+                "reference=${reference.size}, candidate=${candidate.size}"
+        }
+        fun maxAbsDiff(start: Int, count: Int): Double {
+            var maximum = 0.0
+            for (i in start until start + count) {
+                val difference = kotlin.math.abs(reference[i].toDouble() - candidate[i].toDouble())
+                check(difference.isFinite()) { "non-finite difference at output $i" }
+                maximum = maxOf(maximum, difference)
+            }
+            return maximum
+        }
+        var firstDifferent: Int? = null
+        var firstOverTolerance: Int? = null
+        for (step in 0 until steps) {
+            val start = step * stride
+            val eos = maxAbsDiff(start, 1)
+            val latent = maxAbsDiff(start + 1, PocketTts.LDIM)
+            val key = maxAbsDiff(start + 1 + PocketTts.LDIM, kvWidth)
+            val value = maxAbsDiff(start + 1 + PocketTts.LDIM + kvWidth, kvWidth)
+            val maximum = maxOf(eos, latent, key, value)
+            if (maximum > 0.0 && firstDifferent == null) firstDifferent = step
+            if (maximum > 1e-3 && firstOverTolerance == null) firstOverTolerance = step
+            lines += String.format(Locale.US,
+                "step=%d kind=%s eos_abs=%.8g latent_max_abs=%.8g k_max_abs=%.8g v_max_abs=%.8g",
+                step, if (step < promptTokens) "prompt" else "first_decode",
+                eos, latent, key, value)
+        }
+        lines += "first_nonidentical_step=${firstDifferent ?: "none"} " +
+            "first_step_over_1e-3=${firstOverTolerance ?: "none"}; threshold is diagnostic only"
+    }
+
+    private fun sha256(file: File): String {
+        if (!file.isFile) return "missing"
+        val digest = MessageDigest.getInstance("SHA-256")
+        file.inputStream().use { input ->
+            val buffer = ByteArray(64 * 1024)
+            while (true) {
+                val n = input.read(buffer)
+                if (n < 0) break
+                digest.update(buffer, 0, n)
+            }
+        }
+        val hex = "0123456789abcdef"
+        return buildString(64) {
+            for (byte in digest.digest()) {
+                val value = byte.toInt() and 0xff
+                append(hex[value ushr 4]); append(hex[value and 0x0f])
+            }
+        }
+    }
+
     private fun writeFloats(file: File, values: FloatArray) {
         val bytes = ByteBuffer.allocate(values.size * Float.SIZE_BYTES).order(ByteOrder.LITTLE_ENDIAN)
         for (value in values) bytes.putFloat(value)
@@ -511,7 +584,7 @@ class FlowLmHarnessTest {
 
     private companion object {
         const val TAG = "FlowLmHarness"
-        const val DEFAULT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
+        const val DEFAULT_GRAPH = PocketTts.LM
         const val REFERENCE_GRAPH = "pt_flowlm_fused_dyn8_all.tflite"
         const val DEFAULT_TEXT = "Hello world. This is a FlowLM text probe."
     }

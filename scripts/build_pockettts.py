@@ -71,6 +71,10 @@ if PMAX not in FLOWLM_CAPACITIES:
 # buffers, so it costs almost no storage, and the app batches the prompt through
 # it. Set 0 to export the fused graph without it.
 PREFILL_TOKENS = int(os.environ.get("PT_PREFILL_TOKENS", "16"))
+if not 0 <= PREFILL_TOKENS <= PMAX:
+    raise ValueError(
+        f"PT_PREFILL_TOKENS must be between 0 and PMAX={PMAX}, got {PREFILL_TOKENS}"
+    )
 FLOW_DIM = 512
 FLOW_DEPTH = 6
 
