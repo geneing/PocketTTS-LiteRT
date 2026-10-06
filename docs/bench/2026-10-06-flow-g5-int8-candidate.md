@@ -21,6 +21,19 @@ engine creates the one-step input/output buffers at signature index 1 and runs
 that index; K/V are float32 group-major `[1,96,512,64]`. The existing NPU slice
 cache path can use this artifact with `npuPositionMajorCache=false`.
 
+The position-major dynamic INT8 source was subsequently compiled with:
+
+```bash
+.venv-aot/bin/python scripts/aot_tensor_g5.py \
+  pt_flowlm_fused_dyn8_all_contiguous --truncation half
+```
+
+This took **21.9 seconds** and reported `Subgraph 0 fully compiled: 670 / 670
+ops offloaded to 1 partitions`. The AOT model has one `serving_default`
+signature, one `DISPATCH_OP`, float32 external I/O, and position-major K/V
+inputs `[1,512,96,64]` each. The position-major AOT file is a separately
+compiled opt-in candidate; its Pixel quality and latency are unmeasured here.
+
 The new position-major source is generated from the already-exported fp32
 position-major graph with the existing `dyn8_all` recipe:
 
@@ -35,7 +48,8 @@ all seven inputs and the packed output remain float32. K/V inputs are each
 `[1,512,96,64]`, matching `npuPositionMajorCache=true`. The script checks the
 input/output shapes and dtypes and performs a four-step eager-fp32 rollout.
 The first position-major dynamic INT8 step matched the shipped group-major
-dynamic INT8 graph bit-for-bit for latent and K/V output; the graph therefore
+dynamic INT8 graph bit-for-bit across the full packed output (EOS, latent,
+K/V; max absolute difference `0`); the graph therefore
 preserves the shipped quantized step across the layout change on the host.
 
 The short free run against eager fp32 gave minimum 32-dimensional latent
@@ -60,27 +74,32 @@ not measure the single-signature position-major candidate or the G5 compiler's
 | `pt_flowlm_fused_dyn8_all_no_truncation_g5.tflite` | 199,891,664 | `0d7e9a962705a453b792cd90b1816b671f394dce4c172a53ca1a81d82380545e` |
 | `pt_flowlm_fused_fp32_contiguous.tflite` | 338,170,404 | `908a5c9f9487d5ba44b6fe4e0d79f8921a626781fdf222a5c5e08ee5267326fa` |
 | `pt_flowlm_fused_dyn8_all_contiguous.tflite` | 85,707,824 | `0859169d1db2607512cca9f8a3591afdc0d5bbe1b6b3eb475c109f44d2f6abca` |
+| `pt_flowlm_fused_dyn8_all_contiguous_half_g5.tflite` | 88,265,536 | `bc8bd5c19495958dfc5b77915dea314c38a9127b839fd357e076d9038cb56acd` |
 | `pt_flowlm_fused_st16_all_contiguous.tflite` | 85,957,728 | `b89ac1662f01bbbe3f2f26a71582116f9b8b867f3f404b611929e68deb61ed39` |
 
 The 199.9 MB group-major AOT file is larger than its 87.5 MB dynamic INT8
 source and the 172.4 MB fp16 AOT file. LiteRT's public Interpreter exposes only
 a `DISPATCH_OP` with float32 external tensors in the compiled model; the vendor
-program and packed weights are opaque. These observations do **not** establish
-whether the Tensor compiler retained or expanded int8 weights. The large
-group-major AOT file also includes the unused prefill signature. The
-single-signature position-major variant avoids that extra compiled subgraph.
+program and packed weights are opaque. The single-signature position-major
+`half` AOT file is only 2,557,712 bytes larger than its dynamic INT8 source,
+which is consistent with compact weights. These observations do **not** prove
+whether the Tensor compiler retained int8 weights internally. The large
+group-major AOT file also includes the unused prefill signature, while the
+position-major variant has only a one-step compiled subgraph. The two AOT
+artifacts also used different truncation settings, so their size difference
+cannot be attributed to either cause alone.
 
-## Candidate use after AOT validation
+## Candidate use in the Pixel harness
 
-Once the position-major source is AOT-compiled, the output should be named
-`pt_flowlm_fused_dyn8_all_contiguous_no_truncation_g5.tflite`. The harness's
-logical `npuGraph` should then be
-`pt_flowlm_fused_dyn8_all_contiguous_no_truncation.tflite`, with
+The position-major AOT output is
+`pt_flowlm_fused_dyn8_all_contiguous_half_g5.tflite`. Its harness logical
+`npuGraph` is `pt_flowlm_fused_dyn8_all_contiguous_half.tflite`, with
 `npuSliceCache=true` and `npuPositionMajorCache=true`; `PocketTts.g5Variant`
 adds `_g5` to the logical name. The existing group-major candidate uses logical
 name `pt_flowlm_fused_dyn8_all_no_truncation.tflite` and
-`npuPositionMajorCache=false`. Both remain opt-in and need the Pixel A/B quality
-and latency protocol before adoption.
+`npuPositionMajorCache=false`. The group-major `no_truncation` artifact already
+failed the Pixel latency gate; the position-major `half` artifact still needs
+the Pixel A/B quality and latency protocol before adoption.
 
 ## Static W8/A16 fallback inspection
 
