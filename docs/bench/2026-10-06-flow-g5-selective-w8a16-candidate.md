@@ -139,3 +139,54 @@ Its logical Android `npuGraph` name is
 `npuPositionMajorCache=true`. Full speech completion, listening and paired
 Pixel timing are still required by the benchmark protocol. No device work was
 performed in this branch.
+
+## Deferred Pixel long-pair handoff
+
+After the current device experiment releases the Pixel, push only the AOT
+artifact into the app's external model directory. `PocketTts.g5Variant`
+appends `_g5` to the logical `npuGraph` name. The app and test APKs must be
+installed, but a model-only change needs no APK rebuild. Use direct
+instrumentation; `:app:connectedDebugAndroidTest` uninstalls the app and
+removes pushed model files.
+
+```powershell
+$adbExe = 'C:\Users\genei\AppData\Local\Android\Sdk\platform-tools\adb.exe'
+$pixelSerial = '57220DLCR002R6'
+$candidateFile = 'I:\Android_Projects\PocketTTS-LiteRT\build\flowlm-worktrees\option12-static-w8a16\scripts\out\pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite'
+& $adbExe -s $pixelSerial push $candidateFile /sdcard/Android/data/com.pockettts/files/pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite
+& $adbExe -s $pixelSerial shell sha256sum /sdcard/Android/data/com.pockettts/files/pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite
+```
+
+The checksum returned by the device should be
+`183a71a2475e6fb68ab626788f8f2189a85d9fb661bcca8c8637e19ce2906d12`.
+The harness defaults to Alba/seed 42 for the long text, but both are passed
+explicitly here. It uses the shipped CPU dynamic INT8 graph as the CPU arm,
+with the same NPU Mimi transformer and GPU SEANet placements on both arms.
+Run one instrumentation method at a time, first NPU then CPU and then reversed:
+
+```powershell
+& $adbExe -s $pixelSerial shell am instrument -w `
+  -e class com.pockettts.FlowLmHarnessTest#npuResidentCacheSpeechPair `
+  -e npuSliceCache true -e npuResidentCache false `
+  -e npuPositionMajorCache true -e verifyNpuSliceRows false `
+  -e npuGraph pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite `
+  -e referenceGraph pt_flowlm_fused_dyn8_all.tflite `
+  -e workload long -e voice alba -e seed 42 -e energyRepeats 1 `
+  -e order npu-cpu -e aotReport G5-694of694ops-1partition-LiteRT2.2.0 `
+  com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+
+& $adbExe -s $pixelSerial shell am instrument -w `
+  -e class com.pockettts.FlowLmHarnessTest#npuResidentCacheSpeechPair `
+  -e npuSliceCache true -e npuResidentCache false `
+  -e npuPositionMajorCache true -e verifyNpuSliceRows false `
+  -e npuGraph pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite `
+  -e referenceGraph pt_flowlm_fused_dyn8_all.tflite `
+  -e workload long -e voice alba -e seed 42 -e energyRepeats 1 `
+  -e order cpu-npu -e aotReport G5-694of694ops-1partition-LiteRT2.2.0 `
+  com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+Each run writes its report and NPU/CPU WAVs under the device app external
+files `flowlm-npu-slice-position-major/speech-<timestamp>/` directory. The
+`aotReport` argument records compiler coverage alongside the on-device graph
+checksum, backend, power monitors, elapsed time, first audio and stage timing.
