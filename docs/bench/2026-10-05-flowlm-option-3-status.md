@@ -125,6 +125,22 @@ The 360-token near-capacity control remains a prompt-cache diagnostic and
 cannot safely produce full speech in the 256 bucket. The focused device checks
 did not capture speech audio or power measurements.
 
+The first full `shortSpeechCapacityPair` attempt failed before audio with a
+LiteRT host buffer error (`2052` bytes available, `32832` bytes supplied)
+while writing the step mask. The graph files advertise the expected named step
+mask and KV shapes, but `PocketTtsEngine` used positional signature selection
+while the focused harness created its buffers directly. The engine now binds
+and runs `serving_default` by name and checks mask/KV dimensions against
+`lmCapacity` before synthesis. A focused instrumentation method checks both
+candidate and reference graph shapes through the engine's model store. The
+full speech fix still needs a Pixel rerun; the failed run has no performance
+or quality result.
+
+Host inspection of the actual artifacts found `serving_default` at signature
+index 1 in both files, with mask shapes `[1,16,1,257]` and `[1,16,1,513]` and
+K/V shapes `[1,96,256,64]` and `[1,96,512,64]`. The Android test compile passed
+after the named binding and shape checks were added.
+
 ## Exact device follow-up
 
 Build the 256 variant with the pinned WSL reference checkout and conversion
@@ -135,6 +151,7 @@ shipped 512 graph. Run one instrumentation method at a time:
 .\gradlew.bat :app:installDebug :app:installDebugAndroidTest
 adb push build\option3-graphs\256\pt_flowlm_fused_dyn8_all_pmax256.tflite /sdcard/Android/data/com.pockettts/files/
 adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#capacityPlannerAndVoicePrefixRepackingAreExact com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#capacityGraphNamedStepShapesMatchHostBuffers -e lmCapacity 256 com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
 adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#runTextPromptHarness -e lmGraph pt_flowlm_fused_dyn8_all.tflite -e lmCapacity 256 -e backends CPU -e voice alba -e text 'Hello.' -e kvPrecision fp32 com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
 adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#shortSpeechCapacityPair -e lmCapacity 256 -e voice alba -e text 'Hello there, how are you?' -e mode stream -e order candidate_first com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
 adb pull /sdcard/Android/data/com.pockettts/files/flowlm-harness

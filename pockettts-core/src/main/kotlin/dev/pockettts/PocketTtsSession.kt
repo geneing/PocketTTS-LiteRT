@@ -219,7 +219,7 @@ class PocketTtsSession internal constructor(
             ins[5].writeFloat(pk)
             ins[6].writeFloat(pv)
             val rt = System.nanoTime()
-            engine.lm.run(ins, outs, 0)
+            engine.lm.run(ins, outs, PocketTts.PREFILL_SIGNATURE)
             runNs += System.nanoTime() - rt
             val out = outs[0].readFloat()
             var o = 0

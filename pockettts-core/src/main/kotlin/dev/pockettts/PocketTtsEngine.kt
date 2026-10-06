@@ -128,20 +128,41 @@ class PocketTtsEngine(
         null
     }
 
-    /**
-     * `litert_torch` lays named signatures before the default one, so in a file
-     * that carries the prefill the fused step is index 1 and the prefill is
-     * index 0. Buffers belong to a signature, so the step's must be created
-     * explicitly; a single-signature file (older drops) has only index 0.
-     * Created once and kept -- probing with a throwaway set would transiently
-     * double the ~25 MB packed-KV inputs.
-     */
-    private val lmStepIn: List<TensorBuffer>? =
-        runCatching { lm.createInputBuffers(1) }.getOrNull()
+    /** Bind the fused step by signature name. A wrong positional signature can
+     * accept a smaller mask buffer and fail only when the first prompt is sent. */
+    private val lmNamedMaskShape: List<Int>? = runCatching {
+        lm.getInputTensorType("args_3", PocketTts.LM_SIGNATURE).layout?.dimensions
+    }.getOrNull()
+
+    init {
+        if (lmGraphName == PocketTts.LM || lmCapacity < PocketTts.PMAX) {
+            val expected = listOf(1, PocketTts.NH, 1, lmCapacity + 1)
+            check(lmNamedMaskShape == expected) {
+                "FlowLM graph $lmGraphName signature ${PocketTts.LM_SIGNATURE} mask shape " +
+                    "$lmNamedMaskShape; expected $expected for capacity $lmCapacity"
+            }
+            val expectedKv = listOf(1, PocketTts.G, lmCapacity, PocketTts.HD)
+            for (input in listOf("args_4", "args_5")) {
+                val actual = lm.getInputTensorType(input, PocketTts.LM_SIGNATURE).layout?.dimensions
+                check(actual == expectedKv) {
+                    "FlowLM graph $lmGraphName signature ${PocketTts.LM_SIGNATURE} $input shape " +
+                        "$actual; expected $expectedKv for capacity $lmCapacity"
+                }
+            }
+        }
+    }
+
+    /** Older custom graphs without named signatures retain the positional path. */
+    private val lmStepIn: List<TensorBuffer>? = if (lmNamedMaskShape != null) {
+        lm.createInputBuffers(PocketTts.LM_SIGNATURE)
+    } else runCatching { lm.createInputBuffers(1) }.getOrNull()
 
     internal val lmIn: List<TensorBuffer> = lmStepIn ?: lm.createInputBuffers()
-    internal val lmOut: List<TensorBuffer> =
-        if (lmStepIn != null) lm.createOutputBuffers(1) else lm.createOutputBuffers()
+    internal val lmOut: List<TensorBuffer> = when {
+        lmNamedMaskShape != null -> lm.createOutputBuffers(PocketTts.LM_SIGNATURE)
+        lmStepIn != null -> lm.createOutputBuffers(1)
+        else -> lm.createOutputBuffers()
+    }
 
     /**
      * Prompt prefill is a second signature of [lm], not a separate graph: it
@@ -151,16 +172,20 @@ class PocketTtsEngine(
      */
     internal val prefillIn: List<TensorBuffer>? =
         if (config.usePrefill && lmStepIn != null) {
-            runCatching { lm.createInputBuffers(0) }.getOrNull()
+            runCatching { lm.createInputBuffers(PocketTts.PREFILL_SIGNATURE) }.getOrNull()
         } else null
     internal val prefillOut: List<TensorBuffer>? =
-        if (config.usePrefill && lmStepIn != null) {
-            runCatching { lm.createOutputBuffers(0) }.getOrNull()
+        if (prefillIn != null) {
+            lm.createOutputBuffers(PocketTts.PREFILL_SIGNATURE)
         } else null
 
     /** Run the fused step on buffers created above (last signature when named). */
     internal fun runLm(ins: List<TensorBuffer>, outs: List<TensorBuffer>) {
-        if (lmStepIn != null) lm.run(ins, outs, 1) else lm.run(ins, outs)
+        when {
+            lmNamedMaskShape != null -> lm.run(ins, outs, PocketTts.LM_SIGNATURE)
+            lmStepIn != null -> lm.run(ins, outs, 1)
+            else -> lm.run(ins, outs)
+        }
     }
     internal val lmMsIn = lmMs?.createInputBuffers()
     internal val lmMsOut = lmMs?.createOutputBuffers()
@@ -272,7 +297,8 @@ class PocketTtsEngine(
         android.util.Log.i(
             "PocketTTS",
             "engine ${placement.label} capacity=$lmCapacity @ ${Placement.renderer()} (${lmGraphName}) " +
-                "lmSig=${if (lmStepIn != null) 1 else 0} " +
+                "lmSig=${if (lmNamedMaskShape != null) PocketTts.LM_SIGNATURE else if (lmStepIn != null) "1" else "0"} " +
+                "maskShape=$lmNamedMaskShape " +
                 "prefill=${if (prefillIn != null) "${PocketTts.PREFILL_SIGNATURE}/${prefillIn.size}" else "none"} " +
                 "heap=${Runtime.getRuntime().totalMemory() shr 20}MiB " +
                 "native=${android.os.Debug.getNativeHeapAllocatedSize() shr 20}MiB",

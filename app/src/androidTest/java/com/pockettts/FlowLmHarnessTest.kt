@@ -92,6 +92,38 @@ class FlowLmHarnessTest {
     }
 
     @Test
+    fun capacityGraphNamedStepShapesMatchHostBuffers() {
+        val candidateCapacity = args.getString("lmCapacity")?.toIntOrNull() ?: 256
+        require(candidateCapacity in PocketTts.FLOWLM_CAPACITIES)
+        val models = PocketTtsModels.default(context)
+        for (capacity in listOf(candidateCapacity, PocketTts.PMAX).distinct()) {
+            val graph = PocketTts.flowLmCapacityGraph(PocketTts.LM, capacity)
+            val path = models.store.file(graph)
+            require(path.isFile) { "missing FlowLM graph $path" }
+            CompiledModel.create(path.absolutePath, CompiledModel.Options(Accelerator.CPU)).use { model ->
+                val signature = PocketTts.LM_SIGNATURE
+                assertEquals("$graph step mask shape",
+                    listOf(1, PocketTts.NH, 1, capacity + 1),
+                    model.getInputTensorType("args_3", signature).layout?.dimensions)
+                for (name in listOf("args_4", "args_5")) {
+                    assertEquals("$graph $name KV shape",
+                        listOf(1, PocketTts.G, capacity, PocketTts.HD),
+                        model.getInputTensorType(name, signature).layout?.dimensions)
+                }
+                val inputs = model.createInputBuffers(signature)
+                val outputs = model.createOutputBuffers(signature)
+                try {
+                    assertEquals("$graph step input count", 7, inputs.size)
+                    assertEquals("$graph step output count", 1, outputs.size)
+                } finally {
+                    inputs.forEach { it.close() }
+                    outputs.forEach { it.close() }
+                }
+            }
+        }
+    }
+
+    @Test
     fun runTextPromptHarness() {
         val text = args.getString("text")?.trim().orEmpty().ifEmpty { DEFAULT_TEXT }
         val voice = args.getString("voice")?.trim()?.ifEmpty { "alba" } ?: "alba"
