@@ -9,6 +9,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cstring>
+#include <functional>
+#include <memory>
 #include <string>
 
 namespace {
@@ -86,15 +88,37 @@ Buffer handle(JNIEnv* env, jobject tensor_buffer) {
     fail(env, "null LiteRT TensorBuffer");
     return nullptr;
   }
-  // JniHandle.handle is private to litert-api 2.2.0. JNI can access it without
-  // Java reflection. This is intentionally version-pinned and opt-in.
+  // JniHandle.handle points to a C++ litert::TensorBuffer, NOT to the C
+  // LiteRtTensorBuffer. In LiteRT 2.2.0 the wrapper has one nonvirtual
+  // BaseHandle<LiteRtTensorBuffer> base, whose first member is a unique_ptr
+  // holding the C handle (litert/cc/internal/litert_handle.h). The JNI in
+  // litert_tensor_buffer_jni.cc casts this Java value to TensorBuffer*.
+  // This private ABI bridge must be revisited on any LiteRT/NDK update.
   jclass base = env->FindClass("com/google/ai/edge/litert/JniHandle");
   if (!base) return nullptr;
   jfieldID field = env->GetFieldID(base, "handle", "J");
   if (!field) return nullptr;
   auto value = env->GetLongField(tensor_buffer, field);
-  if (!value) fail(env, "closed LiteRT TensorBuffer");
-  return reinterpret_cast<Buffer>(static_cast<intptr_t>(value));
+  if (!value) { fail(env, "closed LiteRT TensorBuffer"); return nullptr; }
+  static const bool first_word_is_unique_ptr = [] {
+    // Check the NDK libc++ layout instead of assuming where unique_ptr keeps
+    // its pointer when it has a std::function deleter.
+    void* sentinel = reinterpret_cast<void*>(static_cast<uintptr_t>(0x1234));
+    std::unique_ptr<void, std::function<void(void*)>> probe(
+        sentinel, [](void*) {});
+    void* first_word = nullptr;
+    std::memcpy(&first_word, &probe, sizeof(first_word));
+    return first_word == sentinel;
+  }();
+  if (!first_word_is_unique_ptr) {
+    fail(env, "LiteRT C++ TensorBuffer wrapper layout differs from pinned ABI");
+    return nullptr;
+  }
+  Buffer c_handle = nullptr;
+  std::memcpy(&c_handle, reinterpret_cast<const void*>(
+                             static_cast<intptr_t>(value)), sizeof(c_handle));
+  if (!c_handle) fail(env, "LiteRT C++ TensorBuffer contains a null C handle");
+  return c_handle;
 }
 
 bool expect_size(JNIEnv* env, const Api& a, Buffer buffer, size_t bytes,
@@ -107,8 +131,27 @@ bool expect_size(JNIEnv* env, const Api& a, Buffer buffer, size_t bytes,
   const int offset_status = a.offset(buffer, &offset);
   const int type_status = a.get_type(buffer, &buffer_type);
   const int tensor_status = a.tensor_type(buffer, &tensor_type);
+  size_t tensor_elements = 1;
+  bool tensor_shape_valid = tensor_status == kOk &&
+                            tensor_type.element_type == 1 &&
+                            tensor_type.layout.rank >= 1 &&
+                            tensor_type.layout.rank <= 8;
+  if (tensor_shape_valid) {
+    for (unsigned int i = 0; i < tensor_type.layout.rank; ++i) {
+      const int32_t dim = tensor_type.layout.dimensions[i];
+      if (dim <= 0 || tensor_elements > bytes / sizeof(float) /
+                                          static_cast<size_t>(dim)) {
+        tensor_shape_valid = false;
+        break;
+      }
+      tensor_elements *= static_cast<size_t>(dim);
+    }
+  }
   if (packed_status != kOk || packed != bytes || size_status != kOk ||
-      offset_status != kOk || type_status != kOk || tensor_status != kOk) {
+      offset_status != kOk || type_status != kOk || tensor_status != kOk ||
+      buffer_type <= 0 || tensor_shape_valid == false ||
+      tensor_elements != bytes / sizeof(float) || offset > allocation ||
+      allocation - offset < bytes) {
     std::string shape = "[";
     if (tensor_status == kOk && tensor_type.layout.rank <= 8) {
       for (unsigned int i = 0; i < tensor_type.layout.rank; ++i) {
@@ -128,6 +171,7 @@ bool expect_size(JNIEnv* env, const Api& a, Buffer buffer, size_t bytes,
                   " rank=" + std::to_string(tensor_type.layout.rank) +
                   " shape=" + shape + " hasStrides=" +
                   std::to_string(tensor_type.layout.has_strides) +
+                  " shapeValid=" + std::to_string(tensor_shape_valid) +
                   " statuses=" + std::to_string(packed_status) + "," +
                   std::to_string(size_status) + "," +
                   std::to_string(offset_status) + "," +
