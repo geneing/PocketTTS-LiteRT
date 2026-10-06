@@ -425,6 +425,233 @@ class FlowLmHarnessTest {
         }
     }
 
+    /**
+     * Diagnostic for the currently installed two-signature graph: legacy P=16
+     * prefill is signature 0 and the fused int8 step is signature 1. Kept
+     * separate from the new five-signature acceptance test so that it cannot
+     * accidentally bless an outdated graph layout.
+     */
+    @Test
+    fun compareLegacyP16Int8PrefillAgainstSequentialOracle() {
+        val graph = args.getString("lmGraph")?.trim()?.ifEmpty { PocketTts.LM } ?: PocketTts.LM
+        require(graph == PocketTts.LM) {
+            "legacy prefill diagnostic expects CPU int8 graph ${PocketTts.LM}, got $graph"
+        }
+        val voiceName = args.getString("voice")?.trim()?.ifEmpty { "alba" } ?: "alba"
+        val sourceText = args.getString("text")?.trim()?.ifEmpty { DEFAULT_PREFILL_TEXT }
+            ?: DEFAULT_PREFILL_TEXT
+        val requestedSizes = args.getString("prefillSizes")?.split(',', ';')
+            ?.map { it.trim().toInt() } ?: listOf(16)
+        require(requestedSizes == listOf(16)) {
+            "legacy prefill diagnostic only supports prefillSizes=16, got $requestedSizes"
+        }
+        val baseIds = SpTokenizer(File(modelDir, PocketTts.TOKENIZER)).encode(sourceText)
+        require(baseIds.isNotEmpty()) { "text encoded to no tokens" }
+        val tokenIds = IntArray(16) { baseIds[it % baseIds.size] }
+        val embedBytes = File(modelDir, PocketTts.EMBED).readBytes()
+        val embedBuffer = ByteBuffer.wrap(embedBytes).order(ByteOrder.LITTLE_ENDIAN)
+        val embedCount = embedBytes.size / 2 / PocketTts.H
+        require(tokenIds.all { it in 0 until embedCount }) { "tokenizer id outside embedding table" }
+        val voice = readVoice(File(modelDir, PocketTts.voiceFile(voiceName)))
+        require(voice.length + tokenIds.size < PocketTts.PMAX) {
+            "voice '$voiceName' length ${voice.length} leaves no room for P=16 and BOS"
+        }
+        val graphFile = File(modelDir, graph)
+        check(graphFile.isFile) { "missing graph: $graphFile" }
+
+        val loadStart = System.nanoTime()
+        val model = CompiledModel.create(graphFile.absolutePath, CompiledModel.Options(Accelerator.CPU), null)
+        val loadMs = (System.nanoTime() - loadStart) / 1e6
+        val stepBuffers = createStepBuffers(model)
+        var prefillBuffers: ModelBuffers? = null
+        val lines = arrayListOf(
+            "Legacy CPU int8 P=16 prefill diagnostic",
+            "device=${android.os.Build.MODEL} (${android.os.Build.DEVICE}) Android ${android.os.Build.VERSION.RELEASE}",
+            "graph=$graph load_ms=${String.format(Locale.US, "%.2f", loadMs)}",
+            "expected_signatures=prefill:0,serving_default_step:1; prefill=P16",
+            "voice=$voiceName voice_prefix=${voice.length} prompt_tokens=16 text=$sourceText",
+        )
+        try {
+            check(stepBuffers.signatureIndex == 1) {
+                "legacy graph step signature is ${stepBuffers.signatureIndex}, expected index 1"
+            }
+            check(stepBuffers.inputs.size == 7 && stepBuffers.outputs.size == 1) {
+                "signature 1 is not a fused step: ${stepBuffers.inputs.size} inputs/${stepBuffers.outputs.size} outputs"
+            }
+            val extraInputs = runCatching { model.createInputBuffers(2) }.getOrNull()
+            if (extraInputs != null) {
+                extraInputs.forEach { it.close() }
+                error("expected legacy two-signature graph; signature index 2 also exists")
+            }
+            val prefillInputs = model.createInputBuffers(0)
+            val prefillOutputs = try {
+                model.createOutputBuffers(0)
+            } catch (t: Throwable) {
+                prefillInputs.forEach { it.close() }
+                throw t
+            }
+            prefillBuffers = ModelBuffers(0, prefillInputs, prefillOutputs)
+            check(prefillInputs.size == 7 && prefillOutputs.size == 1) {
+                "signature 0 is not the P16 prefill: ${prefillInputs.size} inputs/${prefillOutputs.size} outputs"
+            }
+
+            val rowSize = PocketTts.G * PocketTts.HD
+            val referenceK = Array(16) { FloatArray(rowSize) }
+            val referenceV = Array(16) { FloatArray(rowSize) }
+            var referencePk = voice.k.copyOf()
+            var referencePv = voice.v.copyOf()
+            var position = voice.length
+            val zeroNoise = FloatArray(PocketTts.LDIM)
+            var referenceRunNs = 0L
+            val referenceStart = System.nanoTime()
+            for (i in tokenIds.indices) {
+                val emb = embedding(tokenIds[i], embedBuffer)
+                val cosine = FloatArray(PocketTts.HD)
+                val sine = FloatArray(PocketTts.HD)
+                rope(position, cosine, sine)
+                val out = runStep(
+                    model, stepBuffers, emb, cosine, sine, stepMask(position),
+                    referencePk, referencePv, zeroNoise,
+                ) { elapsed -> referenceRunNs += elapsed }
+                val kBase = 1 + PocketTts.LDIM
+                val vBase = kBase + rowSize
+                System.arraycopy(out, kBase, referenceK[i], 0, rowSize)
+                System.arraycopy(out, vBase, referenceV[i], 0, rowSize)
+                putKvRow(referencePk, position, referenceK[i])
+                putKvRow(referencePv, position, referenceV[i])
+                position++
+            }
+            val referenceTotalNs = System.nanoTime() - referenceStart
+
+            var candidatePk = voice.k.copyOf()
+            var candidatePv = voice.v.copyOf()
+            position = voice.length
+            val emb = FloatArray(16 * PocketTts.H)
+            val cosine = FloatArray(16 * PocketTts.HD)
+            val sine = FloatArray(16 * PocketTts.HD)
+            val masks = FloatArray(16 * (PocketTts.PMAX + 1)) { PocketTts.MASK_NEG }
+            val writes = FloatArray(16 * PocketTts.PMAX)
+            for (i in tokenIds.indices) {
+                val rowEmb = embedding(tokenIds[i], embedBuffer)
+                System.arraycopy(rowEmb, 0, emb, i * PocketTts.H, PocketTts.H)
+                val c = FloatArray(PocketTts.HD)
+                val s = FloatArray(PocketTts.HD)
+                rope(position + i, c, s)
+                System.arraycopy(c, 0, cosine, i * PocketTts.HD, PocketTts.HD)
+                System.arraycopy(s, 0, sine, i * PocketTts.HD, PocketTts.HD)
+                val maskBase = i * (PocketTts.PMAX + 1)
+                for (q in 0 until position + i) masks[maskBase + q] = 0f
+                masks[maskBase + PocketTts.PMAX] = 0f
+                writes[i * PocketTts.PMAX + position + i] = 1f
+            }
+            val prefillStart = System.nanoTime()
+            prefillInputs[0].writeFloat(emb)
+            prefillInputs[1].writeFloat(cosine)
+            prefillInputs[2].writeFloat(sine)
+            prefillInputs[3].writeFloat(masks)
+            prefillInputs[4].writeFloat(writes)
+            prefillInputs[5].writeFloat(candidatePk)
+            prefillInputs[6].writeFloat(candidatePv)
+            model.run(prefillInputs, prefillOutputs, 0)
+            val output = prefillOutputs.single().readFloat()
+            val prefillTotalNs = System.nanoTime() - prefillStart
+            check(output.size == 2 * 16 * rowSize) {
+                "legacy P16 output width ${output.size}, expected ${2 * 16 * rowSize}"
+            }
+            for (i in 0 until 16) {
+                val kRow = output.copyOfRange(i * rowSize, (i + 1) * rowSize)
+                val vBase = 16 * rowSize + i * rowSize
+                val vRow = output.copyOfRange(vBase, vBase + rowSize)
+                putKvRow(candidatePk, position + i, kRow)
+                putKvRow(candidatePv, position + i, vRow)
+                val kDiff = maxDiff(referenceK[i], kRow)
+                val vDiff = maxDiff(referenceV[i], vRow)
+                val positionLabel = position + i
+                lines += String.format(
+                    Locale.US,
+                    "position=%d K corr=%.8f max_abs_diff=%.8g V corr=%.8f max_abs_diff=%.8g",
+                    positionLabel, metrics(referenceK[i], kRow).corr, kDiff,
+                    metrics(referenceV[i], vRow).corr, vDiff,
+                )
+                check(kDiff <= PREFILL_PARITY_TOLERANCE) {
+                    "first legacy K divergence at position=$positionLabel max_abs_diff=$kDiff " +
+                        "tolerance=$PREFILL_PARITY_TOLERANCE"
+                }
+                check(vDiff <= PREFILL_PARITY_TOLERANCE) {
+                    "first legacy V divergence at position=$positionLabel max_abs_diff=$vDiff " +
+                        "tolerance=$PREFILL_PARITY_TOLERANCE"
+                }
+            }
+            val prefixKDiff = maxPrefixDiff(candidatePk, voice.k, voice.length)
+            val prefixVDiff = maxPrefixDiff(candidatePv, voice.v, voice.length)
+            lines += "voice_prefix K max_abs_diff=$prefixKDiff V max_abs_diff=$prefixVDiff"
+            check(prefixKDiff == 0.0 && prefixVDiff == 0.0) {
+                "legacy P16 prefill modified the $voiceName voice prefix"
+            }
+
+            val firstCos = FloatArray(PocketTts.HD)
+            val firstSin = FloatArray(PocketTts.HD)
+            rope(position + 16, firstCos, firstSin)
+            val firstReference = runStep(
+                model, stepBuffers, readFloats(File(modelDir, PocketTts.BOS)),
+                firstCos, firstSin, stepMask(position + 16), referencePk, referencePv, zeroNoise,
+            )
+            val firstCandidate = runStep(
+                model, stepBuffers, readFloats(File(modelDir, PocketTts.BOS)),
+                firstCos, firstSin, stepMask(position + 16), candidatePk, candidatePv, zeroNoise,
+            )
+            val eosDiff = maxDiff(firstReference.copyOfRange(0, 1), firstCandidate.copyOfRange(0, 1))
+            val latentDiff = maxDiff(
+                firstReference.copyOfRange(1, 1 + PocketTts.LDIM),
+                firstCandidate.copyOfRange(1, 1 + PocketTts.LDIM),
+            )
+            val firstKDiff = maxDiff(
+                firstReference.copyOfRange(1 + PocketTts.LDIM,
+                    1 + PocketTts.LDIM + rowSize),
+                firstCandidate.copyOfRange(1 + PocketTts.LDIM,
+                    1 + PocketTts.LDIM + rowSize),
+            )
+            val firstVDiff = maxDiff(
+                firstReference.copyOfRange(1 + PocketTts.LDIM + rowSize, firstReference.size),
+                firstCandidate.copyOfRange(1 + PocketTts.LDIM + rowSize, firstCandidate.size),
+            )
+            lines += String.format(
+                Locale.US,
+                "first_decode eos_diff=%.8g latent_corr=%.8f latent_max_abs_diff=%.8g " +
+                    "new_k_max_abs_diff=%.8g new_v_max_abs_diff=%.8g",
+                eosDiff,
+                metrics(firstReference.copyOfRange(1, 1 + PocketTts.LDIM),
+                    firstCandidate.copyOfRange(1, 1 + PocketTts.LDIM)).corr,
+                latentDiff, firstKDiff, firstVDiff,
+            )
+            check(eosDiff <= PREFILL_PARITY_TOLERANCE &&
+                latentDiff <= PREFILL_PARITY_TOLERANCE &&
+                firstKDiff <= PREFILL_PARITY_TOLERANCE &&
+                firstVDiff <= PREFILL_PARITY_TOLERANCE) {
+                "first post-legacy-prefill BOS decode diverged: eos=$eosDiff latent=$latentDiff " +
+                    "K=$firstKDiff V=$firstVDiff tolerance=$PREFILL_PARITY_TOLERANCE"
+            }
+            lines += String.format(
+                Locale.US,
+                "sequential_total_ms=%.3f sequential_run_ms=%.3f prefill_total_ms=%.3f " +
+                    "prefill_ms_per_token=%.4f speedup=%.3fx",
+                referenceTotalNs / 1e6, referenceRunNs / 1e6, prefillTotalNs / 1e6,
+                prefillTotalNs / 1e6 / 16, referenceTotalNs.toDouble() / prefillTotalNs,
+            )
+            val runDir = File(
+                context.getExternalFilesDir("flowlm-harness") ?: File(context.filesDir, "flowlm-harness"),
+                "legacy-prefill-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+            ).apply { mkdirs() }
+            File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
+            lines.forEach { Log.i(TAG, it) }
+            Log.i(TAG, "legacy P16 prefill report saved to ${File(runDir, "report.txt").absolutePath}")
+        } finally {
+            prefillBuffers?.close()
+            stepBuffers.close()
+            model.close()
+        }
+    }
+
     private fun createStepBuffers(model: CompiledModel): ModelBuffers {
         for (index in listOf(PocketTts.PREFILL_BUCKETS.size, 1).distinct()) {
             val inputs = runCatching { model.createInputBuffers(index) }.getOrNull() ?: continue
