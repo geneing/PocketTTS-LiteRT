@@ -54,6 +54,136 @@ class FlowLmHarnessTest {
 
     private data class Metrics(val corr: Double, val mad: Double, val msd: Double)
 
+    /**
+     * First gate for NPU-resident K/V. The AOT graph is built by
+     * scripts/probe_npu_cache_chain.py and has the same 25 MiB cache input as
+     * the current FlowLM. A and B exchange input/output roles after each run;
+     * only the 48 KiB row and one scalar cross the host boundary per step.
+     * The scalar read is also the explicit completion/synchronization point.
+     */
+    @Test
+    fun probeNpuCacheChain() = probeNpuCache(useHostCacheWrites = false, tryAlias = false)
+
+    /** Measure the current full-cache host staging cost on the same tiny graph. */
+    @Test
+    fun probeNpuCacheHostBaseline() = probeNpuCache(useHostCacheWrites = true, tryAlias = false)
+
+    /** One isolated same-buffer attempt; failure is recorded because two banks suffice. */
+    @Test
+    fun probeNpuCacheAlias() = probeNpuCache(useHostCacheWrites = false, tryAlias = true)
+
+    private fun probeNpuCache(useHostCacheWrites: Boolean, tryAlias: Boolean) {
+        val graph = args.getString("cacheGraph")?.trim()?.ifEmpty { CACHE_GRAPH } ?: CACHE_GRAPH
+        val steps = args.getString("cacheSteps")?.toIntOrNull() ?: 32
+        require(steps in 1..256) { "cacheSteps must be 1..256" }
+        val graphFile = File(modelDir, graph)
+        require(graphFile.isFile) { "missing cache proof graph: $graphFile" }
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-harness") ?: File(context.filesDir, "flowlm-harness"),
+            "cache-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+        val reportFile = File(runDir, "report.txt")
+        val lines = ArrayList<String>()
+        lines += "Tensor G5 FlowLM cache first gate"
+        lines += "mode=${if (tryAlias) "same_buffer_alias" else if (useHostCacheWrites) "host_full_cache_write" else "two_bank_chain"}"
+        lines += "graph=$graph sha256=${java.security.MessageDigest.getInstance("SHA-256").digest(graphFile.readBytes()).joinToString("") { "%02x".format(it) }}"
+        lines += "device=${android.os.Build.FINGERPRINT}"
+        lines += "runtime=LiteRT 2.2.0; AOT=ai-edge-litert 2.2.0 + google-tensor SDK 2.2.0; dispatch=record from logcat"
+        lines += "AOT_report=9/9 ops offloaded to one Google_Tensor_G5 partition (host compile)"
+        lines += "cache_shape=[2,96,512,64] fp32 cache_bytes=$CACHE_BYTES row_shape=[2,96,1,64] row_bytes=$CACHE_ROW_BYTES"
+        lines += "actual_buffer_type=not exposed by LiteRT 2.2.0 Kotlin TensorBuffer; inspect dispatch trace before calling this zero-copy"
+        lines += tensorBufferApiDiagnostic()
+        val pssBefore = Debug.getPss()
+        try {
+            Environment.create(
+                context,
+                mapOf(Environment.Option.DispatchLibraryDir to context.applicationInfo.nativeLibraryDir),
+            ).use { environment ->
+                val loadStart = System.nanoTime()
+                CompiledModel.create(graphFile.absolutePath, CompiledModel.Options(Accelerator.NPU), environment).use { model ->
+                    val loadMs = (System.nanoTime() - loadStart) / 1e6
+                    val pssAfterLoad = Debug.getPss()
+                    val inReq = model.getInputBufferRequirements("args_0")
+                    val outReq = model.getOutputBufferRequirements("output_0")
+                    lines += "cache_input_requirements=types=${inReq.supportedTypes} bytes=${inReq.bufferSize} strides=${inReq.strides}"
+                    lines += "cache_output_requirements=types=${outReq.supportedTypes} bytes=${outReq.bufferSize} strides=${outReq.strides}"
+                    lines += "shared_supported_types=${inReq.supportedTypes.intersect(outReq.supportedTypes.toSet())}"
+                    val input = model.createInputBuffers()
+                    val output = model.createOutputBuffers()
+                    try {
+                        check(input.size == 2 && output.size == 2) { "cache probe expected two inputs/two outputs" }
+                        val bankA = input[0]
+                        val rowBuffer = input[1]
+                        val bankB = output[0]
+                        val scalarBuffer = output[1]
+                        val cache = FloatArray(CACHE_BYTES / Float.SIZE_BYTES)
+                        val row = FloatArray(CACHE_ROW_BYTES / Float.SIZE_BYTES).also { it[0] = 1f }
+                        val initStart = System.nanoTime()
+                        bankA.writeFloat(cache)
+                        val initMs = (System.nanoTime() - initStart) / 1e6
+                        val pssAfterBuffers = Debug.getPss()
+                        var rowWriteNs = 0L
+                        var cacheWriteNs = 0L
+                        var runNs = 0L
+                        var scalarReadNs = 0L
+                        var source = bankA
+                        var destination = if (tryAlias) bankA else bankB
+                        var result = "PASS"
+                        for (step in 1..steps) {
+                            if (useHostCacheWrites) {
+                                val t = System.nanoTime()
+                                source.writeFloat(cache)
+                                cacheWriteNs += System.nanoTime() - t
+                            }
+                            var t = System.nanoTime()
+                            rowBuffer.writeFloat(row)
+                            rowWriteNs += System.nanoTime() - t
+                            t = System.nanoTime()
+                            try {
+                                model.run(listOf(source, rowBuffer), listOf(destination, scalarBuffer))
+                            } catch (failure: Throwable) {
+                                if (!tryAlias) throw failure
+                                result = "UNSUPPORTED: ${failure::class.java.simpleName}: ${failure.message}"
+                                break
+                            }
+                            runNs += System.nanoTime() - t
+                            t = System.nanoTime()
+                            val scalar = scalarBuffer.readFloat().single()
+                            scalarReadNs += System.nanoTime() - t
+                            check(scalar == step.toFloat()) { "step $step scalar=$scalar, expected $step; cache chaining lost state" }
+                            if (useHostCacheWrites) {
+                                cache[0] += row[0]
+                            } else if (!tryAlias) {
+                                val old = source
+                                source = destination
+                                destination = old
+                            }
+                        }
+                        val pssAfterRun = Debug.getPss()
+                        lines += "status=$result steps=$steps scalar_expected=1..$steps"
+                        lines += String.format(Locale.US,
+                            "load_ms=%.3f initial_cache_write_ms=%.3f row_write_ms_per_step=%.3f full_cache_write_ms_per_step=%.3f run_ms_per_step=%.3f scalar_read_sync_ms_per_step=%.3f",
+                            loadMs, initMs, rowWriteNs / steps / 1e6, cacheWriteNs / steps / 1e6,
+                            runNs / steps / 1e6, scalarReadNs / steps / 1e6)
+                        lines += "host_bytes_per_step=${CACHE_ROW_BYTES + if (useHostCacheWrites) CACHE_BYTES else 0} host_read_bytes_per_step=${Float.SIZE_BYTES} initial_host_cache_bytes=$CACHE_BYTES"
+                        lines += "pss_kb=[before=$pssBefore,after_load=$pssAfterLoad,after_buffers=$pssAfterBuffers,after_run=$pssAfterRun]"
+                        lines += "device_side_copy_bytes_per_step=unverified; requires Tensor dispatch trace or hardware counters"
+                    } finally {
+                        input.forEach { it.close() }
+                        output.forEach { it.close() }
+                    }
+                }
+            }
+        } catch (failure: Throwable) {
+            lines += "status=FAILED ${failure::class.java.simpleName}: ${failure.message}"
+            throw failure
+        } finally {
+            reportFile.writeText(lines.joinToString("\n", postfix = "\n"))
+            lines.forEach { Log.i(TAG, it) }
+            Log.i(TAG, "saved cache proof report to ${reportFile.absolutePath}")
+        }
+    }
+
     @Test
     fun runTextPromptHarness() {
         val text = args.getString("text")?.trim().orEmpty().ifEmpty { DEFAULT_TEXT }
@@ -416,5 +546,8 @@ class FlowLmHarnessTest {
         const val DEFAULT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val REFERENCE_GRAPH = "pt_flowlm_fused_fp16.tflite"
         const val DEFAULT_TEXT = "Hello world. This is a FlowLM text probe."
+        const val CACHE_GRAPH = "pt_npu_cache_chain_g5.tflite"
+        const val CACHE_BYTES = 2 * 96 * 512 * 64 * Float.SIZE_BYTES
+        const val CACHE_ROW_BYTES = 2 * 96 * 64 * Float.SIZE_BYTES
     }
 }
