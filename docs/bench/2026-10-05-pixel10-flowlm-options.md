@@ -67,9 +67,9 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 5. Mobile-oriented architecture | `codex/flowlm-option-5-architecture` | Feasibility/stop assessment requiring trained model changes | Stopped: no training corpus, pipeline, checkpoint, or held-out quality suite available; no model or device performance result |
 | 6. CPU int8 retuning | `codex/flowlm-option-6-cpu-retune` | Thread counts 2/4/6 plus selective fp32 EOS gate | 18 prompt-only pairs were exact; 6 threads sped 385-token prompt compute 19-23%, but full-pipeline runs were slower in every completed short/medium/long case. Selective EOS export quantized to the baseline graph |
 | 7. G5 NPU slice cache | `codex/flowlm-kv-slice` | Full FlowLM graph on NPU; persistent AHWB K/V inputs with native per-position updates | Group-major: two long pairs, mean 1.30x vs CPU. Position-major: two more long pairs, mean 1.31x; host input traffic fell about 104x, row patch fell to 1.78 s. Still slower than CPU |
-| 8. G5 dynamic INT8 | `codex/flowlm-g5-int8` | W8/float-activation candidates; group-major `no_truncation` and position-major `half` | Long Alba runs: 52.38/24.76 s (2.11x) and 53.008/24.933 s (2.13x) NPU/CPU; both emitted 753/759 frames. Rejected on speed and completion gates; see [candidate report](2026-10-06-flow-g5-int8-candidate.md) |
+| 8. G5 dynamic INT8 | `codex/flowlm-g5-int8` | W8/float-activation candidates; group-major `no_truncation` and position-major `half` | Long Alba group-major pairs averaged 52.224/25.021 s NPU/CPU (2.09x), 753/759 frames; position-major forward pair was 53.008/24.933 s (2.13x), also 753/759. Fails speed and completion; reverse position-major pair pending; see [candidate report](2026-10-06-flow-g5-int8-candidate.md) |
 | 9. G5 static INT8 | `codex/flowlm-g5-static-int8` | Calibrated W8/A8 NPU recipe with float external tensors | Host quality failed at step 0 (latent corr 0.0105, EOS delta 6.465); 32-step minimum corr -0.1744. Stopped before AOT or Pixel test; see [candidate report](2026-10-06-flow-g5-static-int8-candidate.md) |
-| 10. G5 `HIGH_PERFORMANCE` runtime mode | `codex/flowlm-g5-high-performance` | Native LiteRT C opaque `google_tensor` option, `performance_mode=3`; harness-only opt-in | One long order: 30.247 / 24.959 s NPU/CPU (`1.212x`), all 759 frames; first audio 1.573 / 1.126 s. Reversed order pending |
+| 10. G5 `HIGH_PERFORMANCE` runtime mode | `codex/flowlm-g5-high-performance` | Native LiteRT C opaque `google_tensor` option, `performance_mode=3`; harness-only opt-in | Two long Alba pairs averaged 29.827 / 25.052 s NPU/CPU (`1.191x`), all 759 frames; mean first audio 1.524 / 1.137 s. Improves NPU time 8.7% over option 7 position-major FP16, but still misses parity; see [candidate report](2026-10-06-g5-high-performance.md) |
 | 11. G5 FP16 `half` truncation | `codex/flowlm-g5-half-truncation` | Existing position-major FP16 graph compiled with AOT `--truncation half` | Host/AOT only: 717/717 ops in one G5 partition; 33.3 s compile, same 172.4 MB size as no-truncation but different SHA. Pixel latency/quality pending |
 
 ### Option 6: CPU thread tuning
@@ -192,11 +192,12 @@ performance settings, including in the newer 2.3.0 API AAR. An opt-in native
 LiteRT C bridge passes the opaque `google_tensor` payload
 `performance_mode = 3` to create a second compiled model; the AOT graph is
 already targeted at Tensor G5. The one-token Pixel smoke passed with NPU/CPU
-latent correlation 0.999989. In the first long order, both sides emitted 759
-frames; NPU took 30.247 s and CPU int8 24.959 s (1.212x), with first audio at
-1.573 s and 1.126 s respectively. The reversed order is still pending, so this
-is an interim result rather than an acceptance decision. Code and harness
-changes are isolated on `codex/flowlm-g5-high-performance`.
+latent correlation 0.999989. Two long Alba runs in opposite orders both
+emitted all 759 frames. NPU averaged 29.827 s versus CPU int8 25.052 s (1.191x);
+first audio averaged 1.524 s versus 1.137 s. The reversed order confirms the
+result, but CPU parity is still not reached. Code and harness changes are
+isolated on `codex/flowlm-g5-high-performance`; exact run data are in the
+[high-performance candidate report](2026-10-06-g5-high-performance.md).
 
 ### Option 11: FP16 AOT half truncation
 

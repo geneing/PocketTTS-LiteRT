@@ -61,29 +61,33 @@ speech quality or EOS stopping agreement. No device test or long-utterance
 harness was run by the exporter.
 
 The Pixel long-utterance harness runs supplied by the parent task failed their
-latency gate:
+latency and completion gates:
 
-| AOT candidate | Frames, NPU / CPU | End-to-end, NPU / CPU | Run stage, NPU / CPU | First audio, NPU / CPU |
-|---|---:|---:|---:|---:|
-| Group-major dynamic INT8 `no_truncation` | 753 / 759 | 52.380 / 24.764 s (`2.11×`) | 36.345 / 14.962 s (`2.43×`) | 2.901 / 1.143 s (`2.54×`) |
-| Position-major dynamic INT8 `half` | 753 / 759 | 53.008 / 24.933 s (`2.13×`) | 37.099 / 14.951 s (`2.48×`) | 2.883 / 1.105 s (`2.61×`) |
+| AOT candidate | Order | Frames, NPU / CPU | End-to-end, NPU / CPU | Run stage, NPU / CPU | First audio, NPU / CPU |
+|---|---|---:|---:|---:|---:|
+| Group-major dynamic INT8 `no_truncation` | NPU → CPU | 753 / 759 | 52.380 / 24.764 s (`2.11×`) | 36.345 / 14.962 s (`2.43×`) | 2.901 / 1.143 s (`2.54×`) |
+| Group-major dynamic INT8 `no_truncation` | CPU → NPU | 753 / 759 | 52.068 / 25.278 s (`2.06×`) | 36.503 / 15.268 s (`2.39×`) | 2.831 / 1.148 s (`2.47×`) |
+| Group-major dynamic INT8 `no_truncation` | Mean | 753 / 759 | 52.224 / 25.021 s (`2.09×`) | 36.424 / 15.115 s (`2.41×`) | 2.866 / 1.146 s (`2.50×`) |
+| Position-major dynamic INT8 `half` | NPU → CPU | 753 / 759 | 53.008 / 24.933 s (`2.13×`) | 37.099 / 14.951 s (`2.48×`) | 2.883 / 1.105 s (`2.61×`) |
 
-No reverse pair was run after the group-major failure. These are forward
-long-utterance comparisons; the similar frame counts make the large time gap
-unlikely to be explained by different generation lengths. The position-major
+The reversed group-major pair confirms its slowdown is not explained by run
+order. Both group-major runs and the position-major forward run stopped six
+frames before CPU, so they also fail the completion gate. The position-major
 layout and `half` truncation did not restore a latency advantage over CPU INT8
-in this protocol. The position-major output quality has not been independently
-established by this timing result.
+in this protocol. A reverse-order position-major pair remains pending; the
+existing position-major long-run report with both orders is the FP16 baseline,
+not this INT8 candidate. The position-major INT8 output quality has not been
+independently established by these timing results.
 
 The stage timings identify where the measured gap occurs: each NPU LM
 `CompiledModel.run()` total was 36.3-37.1 s, versus about 15.0 s for the CPU
-int8 graph. In the same runs, NPU host input transfer was 0.99-1.21 s versus
-2.43-2.45 s on CPU; the cache-row patch was 1.91-2.28 s, and packed-output
-readback 2.50-2.87 s. So cache input transfer is not the source of the INT8
-slowdown; graph execution dominates. All graph ops were compiled into one
-opaque G5 dispatch partition. Without vendor dispatch profiling, these results
-do not isolate whether the internal cost comes from INT8 weight handling,
-kernel selection, or another compiler/runtime choice.
+int8 graph. In the two group-major orders, NPU host input transfer averaged
+0.964 s versus 2.397 s on CPU; native cache-row patch was 2.28-2.50 s and
+packed-output readback 2.87-3.13 s. So cache input transfer is not the source
+of the INT8 slowdown; graph execution dominates. All graph ops were compiled
+into one opaque G5 dispatch partition. Without vendor dispatch profiling,
+these results do not isolate whether the internal cost comes from INT8 weight
+handling, kernel selection, or another compiler/runtime choice.
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
