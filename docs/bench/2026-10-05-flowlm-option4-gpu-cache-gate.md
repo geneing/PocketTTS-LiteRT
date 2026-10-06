@@ -6,7 +6,8 @@ by this record. The production CPU dynamic-int8 FlowLM stays the control.
 ## Fixed-shape experiment
 
 `scripts/export_gpu_cache_probe.py` exports `pt_gpu_cache_probe.tflite` without
-Pocket TTS weights. It has a combined K/V cache of `[1,192,512,64]` float32
+Pocket TTS weights and checks its positional I/O and row-update math through
+the CPU TFLite interpreter. It has a combined K/V cache of `[1,192,512,64]` float32
 (25,165,824 bytes), a `[1,192,1,64]` new row, and a one-hot position mask
 `[1,1,512,1]`. It returns the full updated cache and one float for host
 readback. The gate in `FlowLmHarnessTest.gpuCacheChainGate` alternates two
