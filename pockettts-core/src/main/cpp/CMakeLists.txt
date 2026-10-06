@@ -1,0 +1,5 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(pockettts_kv_slice LANGUAGES CXX)
+
+add_library(pockettts_kv_slice SHARED npu_slice_cache.cpp)
+target_link_libraries(pockettts_kv_slice PRIVATE dl log)

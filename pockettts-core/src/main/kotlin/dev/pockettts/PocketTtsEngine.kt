@@ -22,6 +22,10 @@ internal data class ResidentLmStepRun(
     val inputNs: Long,
     val runNs: Long,
     val readNs: Long,
+    val outputMapNs: Long = 0,
+    val cacheMapNs: Long = 0,
+    val cacheCopyNs: Long = 0,
+    val cacheUnmapNs: Long = 0,
 )
 
 /**
@@ -163,6 +167,7 @@ class PocketTtsEngine(
      * The 33-float control tensor is the only output read by Kotlin.
      */
     internal val usesNpuResidentCache: Boolean = config.npuResidentCache
+    internal val usesNpuSliceCache: Boolean = config.npuSliceCache
     internal val lmResidentIn: MutableList<TensorBuffer>? =
         if (usesNpuResidentCache) lm.createInputBuffers().toMutableList() else null
     internal val lmResidentOut: MutableList<TensorBuffer>? =
@@ -201,7 +206,19 @@ class PocketTtsEngine(
                     residentBankBK != null && residentBankBV != null,
             ) { "NPU-resident FlowLM cache banks are missing" }
         }
+        if (usesNpuSliceCache) {
+            check(lmIn.size == 7 && lmOut.size == 1) {
+                "NPU slice FlowLM expects 7 inputs and one packed output; got ${lmIn.size}/${lmOut.size}"
+            }
+        }
     }
+
+    /** Actual backing types; 2 is AHardwareBuffer, 1 is host memory. */
+    internal val npuSliceBufferTypes: IntArray? = if (usesNpuSliceCache) {
+        NpuSliceCacheBridge.bufferTypes(lmIn[4], lmIn[5], lmOut[0]).also {
+            android.util.Log.i("PocketTTSTime", "NPU slice buffer types K/V/out=${it.joinToString()}")
+        }
+    } else null
 
     /** Run the fused step on buffers created above (last signature when named). */
     internal fun runLm(ins: List<TensorBuffer>, outs: List<TensorBuffer>) {
@@ -275,6 +292,55 @@ class PocketTtsEngine(
         outputs[1] = oldK
         outputs[2] = oldV
         return ResidentLmStepRun(control, inputNs, runNs, readNs)
+    }
+
+    /** Seed persistent NPU inputs once per utterance; later updates touch one row. */
+    internal fun resetNpuSliceCache(k: FloatArray, v: FloatArray): Long {
+        check(usesNpuSliceCache) { "NPU slice cache is disabled" }
+        val expected = PocketTts.G * PocketTts.PMAX * PocketTts.HD
+        require(k.size == expected && v.size == expected)
+        val start = System.nanoTime()
+        lmIn[4].writeFloat(k)
+        lmIn[5].writeFloat(v)
+        return System.nanoTime() - start
+    }
+
+    /** Uses the existing packed-output G5 graph without a Kotlin K/V round-trip. */
+    internal fun runNpuSliceLm(
+        emb: FloatArray, cos: FloatArray, sin: FloatArray, mask: FloatArray,
+        noise: FloatArray, position: Int,
+    ): ResidentLmStepRun {
+        check(usesNpuSliceCache) { "NPU slice cache is disabled" }
+        require(position in 0 until PocketTts.PMAX)
+        var started = System.nanoTime()
+        lmIn[0].writeFloat(emb)
+        lmIn[1].writeFloat(cos)
+        lmIn[2].writeFloat(sin)
+        lmIn[3].writeFloat(mask)
+        lmIn[6].writeFloat(noise)
+        val inputNs = System.nanoTime() - started
+        started = System.nanoTime()
+        runLm(lmIn, lmOut)
+        val runNs = System.nanoTime() - started
+        started = System.nanoTime()
+        val timings = LongArray(4)
+        val control = NpuSliceCacheBridge.update(
+            lmIn[4], lmIn[5], lmOut[0], position,
+            PocketTts.PMAX, PocketTts.G, PocketTts.HD, timings,
+        )
+        if (config.verifyNpuSliceRows) {
+            val delta = NpuSliceCacheBridge.rowMaxDifference(
+                lmIn[4], lmIn[5], lmOut[0], position,
+                PocketTts.PMAX, PocketTts.G, PocketTts.HD,
+            )
+            check(delta == 0f) { "NPU slice K/V row mismatch at $position: $delta" }
+        }
+        val readNs = System.nanoTime() - started
+        check(control.size == 1 + PocketTts.LDIM)
+        return ResidentLmStepRun(
+            control, inputNs, runNs, readNs,
+            timings[0], timings[1], timings[2], timings[3],
+        )
     }
 
     internal val lmMsIn = lmMs?.createInputBuffers()

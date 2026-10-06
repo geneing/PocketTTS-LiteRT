@@ -93,6 +93,10 @@ class PocketTtsSession internal constructor(
     private var sLmIn = 0L
     private var sLmRun = 0L
     private var sLmRead = 0L
+    private var sLmOutputMap = 0L
+    private var sLmCacheMap = 0L
+    private var sLmCacheCopy = 0L
+    private var sLmCacheUnmap = 0L
     private var sLmSteps = 0
     private var sLmInv = 0
     private var sLmInBytes = 0L
@@ -130,6 +134,9 @@ class PocketTtsSession internal constructor(
         pos = voiceLen
         if (engine.usesNpuResidentCache) {
             sLmIn += engine.resetNpuResidentCache(pk, pv)
+            sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+        } else if (engine.usesNpuSliceCache) {
+            sLmIn += engine.resetNpuSliceCache(pk, pv)
             sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
         }
     }
@@ -253,17 +260,26 @@ class PocketTtsSession internal constructor(
     private fun step(emb: FloatArray, noise: FloatArray): Pair<FloatArray, Float> {
         check(pos < PMAX) { "KV cache overflow at $pos" }
         val out: FloatArray
-        if (engine.usesNpuResidentCache) {
+        if (engine.usesNpuResidentCache || engine.usesNpuSliceCache) {
             val prepareStart = System.nanoTime()
             ropeFill(pos)
             val prepareNs = System.nanoTime() - prepareStart
-            val run = engine.runNpuResidentLm(emb, cosArr, sinArr, mask, noise, pos)
+            val run = if (engine.usesNpuResidentCache) {
+                engine.runNpuResidentLm(emb, cosArr, sinArr, mask, noise, pos)
+            } else {
+                engine.runNpuSliceLm(emb, cosArr, sinArr, mask, noise, pos)
+            }
             out = run.control
             sLmIn += prepareNs + run.inputNs
             sLmRun += run.runNs
             sLmRead += run.readNs
+            sLmOutputMap += run.outputMapNs
+            sLmCacheMap += run.cacheMapNs
+            sLmCacheCopy += run.cacheCopyNs
+            sLmCacheUnmap += run.cacheUnmapNs
             sLmInBytes += (
-                emb.size + cosArr.size + sinArr.size + mask.size + noise.size + PMAX
+                emb.size + cosArr.size + sinArr.size + mask.size + noise.size +
+                    (if (engine.usesNpuResidentCache) PMAX else 0)
                 ).toLong() * Float.SIZE_BYTES
         } else {
             val t0 = System.nanoTime()
@@ -288,7 +304,7 @@ class PocketTtsSession internal constructor(
         }
         val eos = out[0]
         val latent = out.copyOfRange(1, 1 + LDIM)
-        if (!engine.usesNpuResidentCache) {
+        if (!engine.usesNpuResidentCache && !engine.usesNpuSliceCache) {
             val kvBase = 1 + LDIM
             for (g in 0 until G) {
                 System.arraycopy(out, kvBase + g * HD, pk, g * PMAX * HD + pos * HD, HD)
@@ -879,6 +895,7 @@ class PocketTtsSession internal constructor(
 
     private fun resetProfile() {
         sLmIn = 0; sLmRun = 0; sLmRead = 0; sLmSteps = 0; sLmInv = 0
+        sLmOutputMap = 0; sLmCacheMap = 0; sLmCacheCopy = 0; sLmCacheUnmap = 0
         sLmInBytes = 0; sLmOutBytes = 0
         sPrompt = 0; sFrames = 0; sDecTx = 0; sSeanet = 0; sChunks = 0
         sFirstChunk = -1; sAudioChunks = 0
@@ -899,6 +916,11 @@ class PocketTtsSession internal constructor(
         lmOutBytes = sLmOutBytes,
         firstChunkMs = sFirstChunk,
         audioChunks = sAudioChunks,
+        lmOutputMapMs = sLmOutputMap / 1_000_000,
+        lmCacheMapMs = sLmCacheMap / 1_000_000,
+        lmCacheCopyMs = sLmCacheCopy / 1_000_000,
+        lmCacheUnmapMs = sLmCacheUnmap / 1_000_000,
+        lmBufferTypes = engine.npuSliceBufferTypes?.joinToString() ?: "",
     )
 
     // ---- text preparation (ports of pocket_tts.models.tts_model) ----------

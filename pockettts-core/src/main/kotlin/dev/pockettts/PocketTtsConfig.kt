@@ -68,6 +68,10 @@ class PocketTtsConfig(
      * measured against the CPU int8 control on the target device.
      */
     val npuResidentCache: Boolean = false,
+    /** Patch one output K/V row into persistent LiteRT inputs through a native buffer lock. */
+    val npuSliceCache: Boolean = false,
+    /** Check every patched row against the graph output; adds synchronization overhead. */
+    val verifyNpuSliceRows: Boolean = false,
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }
@@ -76,6 +80,16 @@ class PocketTtsConfig(
             require(lmGraph != null) { "NPU-resident cache requires its AOT lmGraph override" }
             require(lmSteps == 1) { "NPU-resident cache currently supports one LM step per invocation" }
             require(!usePrefill) { "NPU-resident cache uses the one-step graph for prompt tokens" }
+        }
+        if (npuSliceCache) {
+            require(!npuResidentCache) { "select one NPU cache protocol" }
+            require(placement.lm == Accel.NPU) { "NPU slice cache requires lm:NPU" }
+            require(lmGraph != null) { "NPU slice cache requires its AOT lmGraph override" }
+            require(lmSteps == 1) { "NPU slice cache supports one LM step per invocation" }
+            require(!usePrefill) { "NPU slice cache uses the one-step graph for prompt tokens" }
+        }
+        require(!verifyNpuSliceRows || npuSliceCache) {
+            "row verification requires NPU slice cache"
         }
     }
 

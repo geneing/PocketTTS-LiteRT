@@ -189,6 +189,13 @@ data class TtsProfile(
     /** Time to the first audio chunk (streaming), or -1 for one-shot. */
     val firstChunkMs: Long = -1,
     val audioChunks: Int = 0,
+    /** Native NPU slice path: packed-output map, cache maps, row copy, unmaps. */
+    val lmOutputMapMs: Long = 0,
+    val lmCacheMapMs: Long = 0,
+    val lmCacheCopyMs: Long = 0,
+    val lmCacheUnmapMs: Long = 0,
+    /** LiteRtTensorBufferType for cache K/V and graph output, if available. */
+    val lmBufferTypes: String = "",
 )
 
 /** One utterance's result. [audio] is 24 kHz mono float PCM, [ms] is wall clock. */

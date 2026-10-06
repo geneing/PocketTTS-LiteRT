@@ -1,0 +1,239 @@
+// LiteRT 2.2.0 C ABI: litert/c/litert_tensor_buffer.h. Resolve from the AAR's
+// libLiteRt.so so the bridge uses the exact runtime that owns Kotlin buffers.
+#include <jni.h>
+#include <dlfcn.h>
+#include <time.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <string>
+
+namespace {
+using Buffer = void*;
+using GetType = int (*)(Buffer, int*);
+using GetPackedSize = int (*)(Buffer, size_t*);
+using Lock = int (*)(Buffer, void**, int);
+using Unlock = int (*)(Buffer);
+constexpr int kOk = 0;
+constexpr int kRead = 0;
+constexpr int kReadWrite = 2;
+constexpr int kControl = 33;
+
+struct Api {
+  void* library = nullptr;
+  GetType get_type = nullptr;
+  GetPackedSize packed_size = nullptr;
+  Lock lock = nullptr;
+  Unlock unlock = nullptr;
+  bool valid() const {
+    return library && get_type && packed_size && lock && unlock;
+  }
+};
+
+const Api& api() {
+  static const Api loaded = [] {
+    Api a;
+    a.library = dlopen("libLiteRt.so", RTLD_NOW | RTLD_LOCAL);
+    if (!a.library) return a;
+    a.get_type = reinterpret_cast<GetType>(dlsym(a.library, "LiteRtGetTensorBufferType"));
+    a.packed_size = reinterpret_cast<GetPackedSize>(dlsym(a.library, "LiteRtGetTensorBufferPackedSize"));
+    a.lock = reinterpret_cast<Lock>(dlsym(a.library, "LiteRtLockTensorBuffer"));
+    a.unlock = reinterpret_cast<Unlock>(dlsym(a.library, "LiteRtUnlockTensorBuffer"));
+    return a;
+  }();
+  return loaded;
+}
+
+void fail(JNIEnv* env, const std::string& message) {
+  jclass cls = env->FindClass("java/lang/IllegalStateException");
+  if (cls) env->ThrowNew(cls, message.c_str());
+}
+
+int64_t now_ns() {
+  timespec t{};
+  clock_gettime(CLOCK_MONOTONIC, &t);
+  return static_cast<int64_t>(t.tv_sec) * 1000000000LL + t.tv_nsec;
+}
+
+Buffer handle(JNIEnv* env, jobject tensor_buffer) {
+  if (!tensor_buffer) {
+    fail(env, "null LiteRT TensorBuffer");
+    return nullptr;
+  }
+  // JniHandle.handle is private to litert-api 2.2.0. JNI can access it without
+  // Java reflection. This is intentionally version-pinned and opt-in.
+  jclass base = env->FindClass("com/google/ai/edge/litert/JniHandle");
+  if (!base) return nullptr;
+  jfieldID field = env->GetFieldID(base, "handle", "J");
+  if (!field) return nullptr;
+  auto value = env->GetLongField(tensor_buffer, field);
+  if (!value) fail(env, "closed LiteRT TensorBuffer");
+  return reinterpret_cast<Buffer>(static_cast<intptr_t>(value));
+}
+
+bool expect_size(JNIEnv* env, const Api& a, Buffer buffer, size_t bytes,
+                 const char* label) {
+  size_t actual = 0;
+  const int status = a.packed_size(buffer, &actual);
+  if (status != kOk || actual != bytes) {
+    fail(env, std::string(label) + " packed bytes: expected " +
+                  std::to_string(bytes) + ", got " + std::to_string(actual) +
+                  ", LiteRT status " + std::to_string(status));
+    return false;
+  }
+  return true;
+}
+
+struct Mapped {
+  const Api& a;
+  Buffer buffer;
+  void* data = nullptr;
+  bool locked = false;
+  Mapped(const Api& api, Buffer b) : a(api), buffer(b) {}
+  ~Mapped() { if (locked) a.unlock(buffer); }
+  bool map(JNIEnv* env, int mode, const char* label) {
+    const int status = a.lock(buffer, &data, mode);
+    if (status != kOk || !data) {
+      fail(env, std::string("LiteRT lock ") + label + " failed: " +
+                    std::to_string(status));
+      return false;
+    }
+    locked = true;
+    return true;
+  }
+  bool unmap(JNIEnv* env, const char* label) {
+    if (!locked) return true;
+    locked = false;
+    const int status = a.unlock(buffer);
+    if (status != kOk) {
+      fail(env, std::string("LiteRT unlock ") + label + " failed: " +
+                    std::to_string(status));
+      return false;
+    }
+    return true;
+  }
+};
+
+bool geometry(JNIEnv* env, int position, int capacity, int groups, int head_dim) {
+  if (position < 0 || capacity <= 0 || position >= capacity ||
+      groups <= 0 || head_dim <= 0) {
+    fail(env, "invalid FlowLM cache geometry or position");
+    return false;
+  }
+  return true;
+}
+}  // namespace
+
+extern "C" JNIEXPORT jintArray JNICALL
+Java_dev_pockettts_NpuSliceCacheBridge_bufferTypes(
+    JNIEnv* env, jobject, jobject cache_k_obj, jobject cache_v_obj,
+    jobject output_obj) {
+  const auto& a = api();
+  if (!a.valid()) { fail(env, "LiteRT 2.2.0 tensor buffer C ABI unavailable"); return nullptr; }
+  Buffer buffers[] = {handle(env, cache_k_obj), handle(env, cache_v_obj),
+                      handle(env, output_obj)};
+  if (env->ExceptionCheck()) return nullptr;
+  jint types[3]{};
+  for (int i = 0; i < 3; ++i) {
+    const int status = a.get_type(buffers[i], &types[i]);
+    if (status != kOk) {
+      fail(env, "LiteRT buffer type query failed: " + std::to_string(status));
+      return nullptr;
+    }
+  }
+  jintArray result = env->NewIntArray(3);
+  if (result) env->SetIntArrayRegion(result, 0, 3, types);
+  return result;
+}
+
+extern "C" JNIEXPORT jfloatArray JNICALL
+Java_dev_pockettts_NpuSliceCacheBridge_update(
+    JNIEnv* env, jobject, jobject cache_k_obj, jobject cache_v_obj,
+    jobject output_obj, jint position, jint capacity, jint groups,
+    jint head_dim, jlongArray timings) {
+  const auto& a = api();
+  if (!a.valid()) { fail(env, "LiteRT 2.2.0 tensor buffer C ABI unavailable"); return nullptr; }
+  if (!geometry(env, position, capacity, groups, head_dim)) return nullptr;
+  if (!timings || env->GetArrayLength(timings) < 4) {
+    fail(env, "cache timing array must have four entries"); return nullptr;
+  }
+  Buffer k = handle(env, cache_k_obj);
+  Buffer v = handle(env, cache_v_obj);
+  Buffer out = handle(env, output_obj);
+  if (env->ExceptionCheck()) return nullptr;
+  const size_t row_floats = static_cast<size_t>(groups) * head_dim;
+  const size_t cache_floats = row_floats * capacity;
+  if (!expect_size(env, a, k, cache_floats * sizeof(float), "K cache") ||
+      !expect_size(env, a, v, cache_floats * sizeof(float), "V cache") ||
+      !expect_size(env, a, out, (kControl + 2 * row_floats) * sizeof(float),
+                   "FlowLM output")) return nullptr;
+
+  Mapped output(a, out), cache_k(a, k), cache_v(a, v);
+  const int64_t t0 = now_ns();
+  if (!output.map(env, kRead, "FlowLM output")) return nullptr;
+  const int64_t t1 = now_ns();
+  if (!cache_k.map(env, kReadWrite, "K cache") ||
+      !cache_v.map(env, kReadWrite, "V cache")) return nullptr;
+  const int64_t t2 = now_ns();
+
+  const auto* values = static_cast<const float*>(output.data);
+  auto* keys = static_cast<float*>(cache_k.data);
+  auto* vals = static_cast<float*>(cache_v.data);
+  jfloatArray control = env->NewFloatArray(kControl);
+  if (!control) return nullptr;
+  env->SetFloatArrayRegion(control, 0, kControl, values);
+  if (env->ExceptionCheck()) return nullptr;
+  for (int g = 0; g < groups; ++g) {
+    const size_t dst = (static_cast<size_t>(g) * capacity + position) * head_dim;
+    const size_t src = static_cast<size_t>(g) * head_dim;
+    std::memcpy(keys + dst, values + kControl + src, head_dim * sizeof(float));
+    std::memcpy(vals + dst, values + kControl + row_floats + src,
+                head_dim * sizeof(float));
+  }
+  const int64_t t3 = now_ns();
+  if (!cache_k.unmap(env, "K cache") || !cache_v.unmap(env, "V cache") ||
+      !output.unmap(env, "FlowLM output")) return nullptr;
+  const int64_t t4 = now_ns();
+  const jlong stages[] = {t1 - t0, t2 - t1, t3 - t2, t4 - t3};
+  env->SetLongArrayRegion(timings, 0, 4, stages);
+  return control;
+}
+
+extern "C" JNIEXPORT jfloat JNICALL
+Java_dev_pockettts_NpuSliceCacheBridge_rowMaxDifference(
+    JNIEnv* env, jobject, jobject cache_k_obj, jobject cache_v_obj,
+    jobject output_obj, jint position, jint capacity, jint groups,
+    jint head_dim) {
+  const auto& a = api();
+  if (!a.valid()) { fail(env, "LiteRT 2.2.0 tensor buffer C ABI unavailable"); return 0; }
+  if (!geometry(env, position, capacity, groups, head_dim)) return 0;
+  Buffer k = handle(env, cache_k_obj);
+  Buffer v = handle(env, cache_v_obj);
+  Buffer out = handle(env, output_obj);
+  if (env->ExceptionCheck()) return 0;
+  const size_t row_floats = static_cast<size_t>(groups) * head_dim;
+  const size_t cache_floats = row_floats * capacity;
+  if (!expect_size(env, a, k, cache_floats * sizeof(float), "K cache") ||
+      !expect_size(env, a, v, cache_floats * sizeof(float), "V cache") ||
+      !expect_size(env, a, out, (kControl + 2 * row_floats) * sizeof(float),
+                   "FlowLM output")) return 0;
+  Mapped output(a, out), cache_k(a, k), cache_v(a, v);
+  if (!output.map(env, kRead, "FlowLM output") ||
+      !cache_k.map(env, kRead, "K cache") ||
+      !cache_v.map(env, kRead, "V cache")) return 0;
+  const auto* values = static_cast<const float*>(output.data);
+  const auto* keys = static_cast<const float*>(cache_k.data);
+  const auto* vals = static_cast<const float*>(cache_v.data);
+  float max_delta = 0;
+  for (int g = 0; g < groups; ++g) {
+    const size_t dst = (static_cast<size_t>(g) * capacity + position) * head_dim;
+    const size_t src = static_cast<size_t>(g) * head_dim;
+    for (int h = 0; h < head_dim; ++h) {
+      max_delta = std::max(max_delta, std::abs(keys[dst + h] - values[kControl + src + h]));
+      max_delta = std::max(max_delta, std::abs(vals[dst + h] - values[kControl + row_floats + src + h]));
+    }
+  }
+  return max_delta;
+}

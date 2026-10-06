@@ -11,12 +11,21 @@ android {
         // 31+ because the Tensor G5 NPU dispatch runtime requires it.
         minSdk = 31
         consumerProguardFiles("consumer-rules.pro")
+        externalNativeBuild {
+            cmake { cppFlags += "-std=c++17" }
+        }
     }
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
     kotlinOptions { jvmTarget = "17" }
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
     testOptions {
         // android.util.Log (used for the PocketTTSTime timing traces) is a stub
         // in local unit tests; return defaults instead of throwing.
