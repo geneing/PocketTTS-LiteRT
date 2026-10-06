@@ -63,6 +63,18 @@ class PowerBenchmarkTest {
         lmSteps = 4,
     )
 
+    /** N=4 follow-up using the production CPU dynamic-int8 graph as its paired reference. */
+    @Test
+    fun longParagraphFlowLmGpuFp16Ms4VsCpuDyn8Power() = runFlowLmPowerBenchmark(
+        caseName = "gpu-requested-fp16-ms4-vs-cpu-dyn8",
+        lmPlacement = Accel.GPU,
+        // For N=4, PocketTtsEngine loads pt_flowlm_ms4_fp16.tflite as the
+        // generated-frame graph; this selects the production dyn8 graph for
+        // the CPU reference and the candidate's prompt/step graph.
+        lmGraph = PocketTts.LM,
+        lmSteps = 4,
+    )
+
     @Test
     fun longParagraphFlowLmGpuDyn8Int8Power() = runFlowLmPowerBenchmark(
         caseName = "gpu-requested-dyn8-int8-step",

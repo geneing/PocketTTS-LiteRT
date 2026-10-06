@@ -7,6 +7,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
+import com.google.ai.edge.litert.TensorBuffer
 import dev.pockettts.Accel
 import dev.pockettts.PocketTts
 import dev.pockettts.SpTokenizer
@@ -14,6 +15,7 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
+import java.lang.reflect.Modifier
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
@@ -134,6 +136,56 @@ class FlowLmHarnessTest {
         } finally {
             environment?.close()
         }
+    }
+
+    /**
+     * Reports whether the pinned Kotlin CompiledModel API can expose the
+     * storage needed to prove a GPU-owned cache chain. This is an API gate
+     * only: it does not claim or measure GPU residency. `run` accepts supplied
+     * TensorBuffers, but this FlowLM graph emits one-row KV updates while its
+     * next invocation requires full caches, so its output cannot be chained as
+     * the cache input. The C++ LiteRT API has separate GL/OpenCL interop.
+     */
+    @Test
+    fun gpuResidentCacheBufferApiGate() {
+        val tensorBufferMethods = TensorBuffer::class.java.methods
+            .filter { Modifier.isPublic(it.modifiers) && !it.isSynthetic }
+            .map { it.name }
+            .distinct()
+            .sorted()
+        val internalHandleAccessors = tensorBufferMethods.filter { it.startsWith("getHandle" + '$') || it == "getHandle" }
+        val interopMethods = tensorBufferMethods.filter { name ->
+            val lower = name.lowercase(Locale.ROOT)
+            listOf("ahw", "gl", "opencl", "clbuffer", "nativehandle", "gpu").any(lower::contains)
+        }
+        val modelBufferMethods = CompiledModel::class.java.methods
+            .filter { Modifier.isPublic(it.modifiers) && it.name in setOf(
+                "createInputBuffer", "createInputBuffers", "createOutputBuffer", "createOutputBuffers",
+                "getInputBufferRequirements", "getOutputBufferRequirements", "run",
+            ) }
+            .map { it.name }
+            .distinct()
+            .sorted()
+
+        val report = listOf(
+            "device=${android.os.Build.MODEL} (${android.os.Build.DEVICE}) Android ${android.os.Build.VERSION.RELEASE}",
+            "runtime=com.google.ai.edge.litert 2.2.0",
+            "TensorBuffer public methods=${tensorBufferMethods.joinToString(",")}",
+            "TensorBuffer Kotlin-internal JVM handle accessor=${internalHandleAccessors.ifEmpty { listOf("none") }.joinToString(",")}",
+            "CompiledModel buffer methods=${modelBufferMethods.joinToString(",")}",
+            "TensorBuffer GPU interop methods=${interopMethods.ifEmpty { listOf("none") }.joinToString(",")}",
+            "flowLmCacheShapeGate=FAIL_inputs_are_1x96x512x64_outputs_are_96x64_KV_rows_only",
+            "gate=NOT_PASSED_no_supported_or_measured_same_shape_device_buffer_chain",
+            "hostBytesPerStep=not-measured cacheResident=no-claim",
+            "nextStep=prototype_same-shape_cache_graph_and_measure_or_use_C++_CreateFromClBuffer/CreateFromGlBuffer",
+        ).joinToString("\n")
+        report.lines().forEach { Log.i(TAG, it) }
+
+        assertTrue("LiteRT Kotlin TensorBuffer should retain typed array I/O", "writeFloat" in tensorBufferMethods)
+        assertTrue(
+            "Kotlin API unexpectedly gained a GPU buffer handle/interop method; review the API gate",
+            interopMethods.isEmpty(),
+        )
     }
 
     private fun runPrompt(
