@@ -1,6 +1,6 @@
 # FlowLM dynamic INT8 on Tensor G5: opt-in candidates
 
-This is a host, AOT, and initial Pixel checkpoint. The production graph remains
+This is a host, AOT, and Pixel checkpoint. The production graph remains
 `pt_flowlm_fused_dyn8_all.tflite` on CPU by default.
 
 ## Reproduction and interfaces
@@ -32,7 +32,7 @@ This took **21.9 seconds** and reported `Subgraph 0 fully compiled: 670 / 670
 ops offloaded to 1 partitions`. The AOT model has one `serving_default`
 signature, one `DISPATCH_OP`, float32 external I/O, and position-major K/V
 inputs `[1,512,96,64]` each. The position-major AOT file is a separately
-compiled opt-in candidate; its Pixel quality and latency are unmeasured here.
+compiled opt-in candidate; its Pixel result is recorded below.
 
 The new position-major source is generated from the already-exported fp32
 position-major graph with the existing `dyn8_all` recipe:
@@ -60,13 +60,20 @@ difference was `0.6556`; later EOS differences were `0.2444`, `0.2223`, and
 speech quality or EOS stopping agreement. No device test or long-utterance
 harness was run by the exporter.
 
-The Pixel long-utterance harness run supplied by the parent task for the
-**group-major dynamic INT8 `no_truncation` AOT** failed its latency gate:
-`753` candidate frames versus `759` CPU-control frames, and `52.38 s` versus
-`24.76 s` end-to-end (`2.11×` slower). The reverse pair was not run. This
-result applies to that 199.9 MB, two-signature group-major artifact; it does
-not measure the single-signature position-major candidate or the G5 compiler's
-`half` truncation setting.
+The Pixel long-utterance harness runs supplied by the parent task failed their
+latency gate:
+
+| AOT candidate | Frames, NPU / CPU | End-to-end, NPU / CPU | Run stage, NPU / CPU | First audio, NPU / CPU |
+|---|---:|---:|---:|---:|
+| Group-major dynamic INT8 `no_truncation` | 753 / 759 | 52.38 / 24.76 s (`2.11×`) | not recorded here | not recorded here |
+| Position-major dynamic INT8 `half` | 753 / 759 | 53.008 / 24.933 s (`2.13×`) | 37.099 / 14.951 s (`2.48×`) | 2.883 / 1.105 s (`2.61×`) |
+
+No reverse pair was run after the group-major failure. These are forward
+long-utterance comparisons; the similar frame counts make the large time gap
+unlikely to be explained by different generation lengths. The position-major
+layout and `half` truncation did not restore a latency advantage over CPU INT8
+in this protocol. The position-major output quality has not been independently
+established by this timing result.
 
 | Artifact | Bytes | SHA-256 |
 |---|---:|---|
@@ -97,9 +104,8 @@ The position-major AOT output is
 `npuSliceCache=true` and `npuPositionMajorCache=true`; `PocketTts.g5Variant`
 adds `_g5` to the logical name. The existing group-major candidate uses logical
 name `pt_flowlm_fused_dyn8_all_no_truncation.tflite` and
-`npuPositionMajorCache=false`. The group-major `no_truncation` artifact already
-failed the Pixel latency gate; the position-major `half` artifact still needs
-the Pixel A/B quality and latency protocol before adoption.
+`npuPositionMajorCache=false`. Both candidates failed the Pixel latency gate;
+neither is selected by the production default.
 
 ## Static W8/A16 fallback inspection
 
