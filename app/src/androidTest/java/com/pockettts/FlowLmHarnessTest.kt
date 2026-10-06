@@ -115,6 +115,10 @@ class FlowLmHarnessTest {
                 try {
                     assertEquals("$graph step input count", 7, inputs.size)
                     assertEquals("$graph step output count", 1, outputs.size)
+                    // Metadata can look right while the native buffer chosen by
+                    // a signature index is smaller. Exercise the mask write that
+                    // failed in PocketTtsSession.step before running full speech.
+                    inputs[3].writeFloat(FloatArray(PocketTts.NH * (capacity + 1)))
                 } finally {
                     inputs.forEach { it.close() }
                     outputs.forEach { it.close() }
