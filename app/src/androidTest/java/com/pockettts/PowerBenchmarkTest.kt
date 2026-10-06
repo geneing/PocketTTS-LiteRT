@@ -82,7 +82,15 @@ class PowerBenchmarkTest {
         assumeTrue("pass -e flowLmCpuThreads=<positive count>", cpuThreads != null && cpuThreads > 0)
         val text = args.getString("flowLmText")?.trim()?.takeIf { it.isNotEmpty() } ?: PARAGRAPH
         val voice = args.getString("flowLmVoice")?.trim()?.takeIf { it.isNotEmpty() } ?: "alba"
-        runFlowLmCpuThreadsPowerBenchmark(cpuThreads!!, text, voice)
+        runFlowLmCpuVariantPowerBenchmark("threads-$cpuThreads", PocketTts.LM, cpuThreads, text, voice)
+    }
+
+    @Test
+    fun flowLmCpuEosFp32Power() {
+        val args = InstrumentationRegistry.getArguments()
+        val text = args.getString("flowLmText")?.trim()?.takeIf { it.isNotEmpty() } ?: PARAGRAPH
+        val voice = args.getString("flowLmVoice")?.trim()?.takeIf { it.isNotEmpty() } ?: "alba"
+        runFlowLmCpuVariantPowerBenchmark("eos-fp32", EOS_FP32_GRAPH, null, text, voice)
     }
 
     @Test
@@ -395,13 +403,14 @@ class PowerBenchmarkTest {
         }
     }
 
-    /**
-     * Compare the shipped CPU dynamic-int8 graph at LiteRT's default thread
-     * count with an opt-in XNNPACK thread count. Runs A/B and then B/A, with a
-     * fresh engine for each sample so graph, placement, seed, and decoder policy
-     * stay explicit and identical across the pair.
-     */
-    private fun runFlowLmCpuThreadsPowerBenchmark(cpuThreads: Int, text: String, voice: String) {
+    /** Paired CPU int8 control versus one opt-in graph or thread candidate. */
+    private fun runFlowLmCpuVariantPowerBenchmark(
+        candidateLabel: String,
+        candidateGraph: String,
+        candidateThreads: Int?,
+        text: String,
+        voice: String,
+    ) {
         assumeTrue("PowerMonitor requires Android 15 / API 35", Build.VERSION.SDK_INT >= 35)
 
         val context = InstrumentationRegistry.getInstrumentation().targetContext
@@ -422,9 +431,10 @@ class PowerBenchmarkTest {
             defaultPlacement.lm == Accel.CPU,
         )
         assumeTrue("missing dynamic-int8 reference graph: ${PocketTts.LM}", models.store.exists(PocketTts.LM))
-        val graphFile = models.store.file(PocketTts.LM)
-        val graphSha256 = sha256(graphFile)
-        val tokenCount = SpTokenizer(File(dir, PocketTts.TOKENIZER)).encode(text).size
+        assumeTrue("missing candidate graph: $candidateGraph", models.store.exists(candidateGraph))
+        val referenceSha256 = sha256(models.store.file(PocketTts.LM))
+        val candidateSha256 = sha256(models.store.file(candidateGraph))
+        val tokenCount = SpTokenizer(models.store.file(PocketTts.TOKENIZER)).encode(text).size
         require(tokenCount > 0) { "benchmark text encoded to no tokens" }
         val seed = FLOW_LM_SEED
         val powerManager = context.getSystemService(PowerManager::class.java)
@@ -433,15 +443,19 @@ class PowerBenchmarkTest {
 
         Log.i(
             TAG,
-            "CPU thread test device=${Build.MODEL}/${Build.DEVICE} fingerprint=${Build.FINGERPRINT} " +
+            "CPU int8 variant test device=${Build.MODEL}/${Build.DEVICE} fingerprint=${Build.FINGERPRINT} " +
                 "sdk=${Build.VERSION.SDK_INT} LiteRT=2.2.0 dispatch=unused(CPU) " +
-                "graph=${PocketTts.LM} graphSha256=$graphSha256 placement=${defaultPlacement.label} " +
+                "reference=${PocketTts.LM} referenceSha256=$referenceSha256 " +
+                "candidate=$candidateGraph candidateSha256=$candidateSha256 " +
+                "candidateThreads=${candidateThreads ?: "LiteRT-default"} placement=${defaultPlacement.label} " +
                 "seed=$seed voice=$voice promptTokens=$tokenCount textChars=${text.length} " +
                 "energy=CPU+GPU+TPU PowerMonitor synthesize+play minus duration-scaled PCM-only playback",
         )
 
         data class ThreadRun(
             val label: String,
+            val graph: String,
+            val graphSha256: String,
             val cpuThreads: Int?,
             val loadMs: Long,
             val allGraphLoadMs: Map<String, Long>,
@@ -457,9 +471,11 @@ class PowerBenchmarkTest {
             val pssAfterKb: Long,
             val thermalStart: Int,
             val thermalEnd: Int,
+            val cumulativePeakRssKb: String?,
         )
 
-        fun runVariant(label: String, threads: Int?): ThreadRun {
+        fun runVariant(label: String, graph: String, threads: Int?): ThreadRun {
+            val graphFile = models.store.file(graph)
             val thermalStart = powerManager?.currentThermalStatus ?: -1
             val pssBefore = Debug.getPss()
             val engine = PocketTtsEngine(
@@ -467,7 +483,7 @@ class PowerBenchmarkTest {
                 PocketTtsConfig(
                     models = models,
                     placement = defaultPlacement,
-                    lmGraph = PocketTts.LM,
+                    lmGraph = graph,
                     lmSteps = 1,
                     noiseSeed = seed,
                     lmCpuThreads = threads,
@@ -498,10 +514,12 @@ class PowerBenchmarkTest {
                     "$label same-config repeat correlation: $repeatCorr",
                     repeatCorr >= MIN_REPEAT_CORRELATION,
                 )
-                val file = "flowlm-cpu-threads-$label.wav"
+                val file = "flowlm-cpu-variant-$label.wav"
                 saveSample(sampleDir, file, full.result.audio)
                 return ThreadRun(
                     label = label,
+                    graph = graph,
+                    graphSha256 = if (graph == PocketTts.LM) referenceSha256 else candidateSha256,
                     cpuThreads = threads,
                     loadMs = loadMs,
                     allGraphLoadMs = allGraphLoadMs,
@@ -517,6 +535,7 @@ class PowerBenchmarkTest {
                     pssAfterKb = Debug.getPss(),
                     thermalStart = thermalStart,
                     thermalEnd = powerManager?.currentThermalStatus ?: -1,
+                    cumulativePeakRssKb = processPeakRssKb(),
                 )
             } finally {
                 engine.close()
@@ -531,14 +550,16 @@ class PowerBenchmarkTest {
             val rtf = speedAudioSeconds / (sample.speedTake.ms.coerceAtLeast(1) / 1000.0)
             Log.i(
                 TAG,
-                "threadSample=${sample.label} requestedThreads=${sample.cpuThreads ?: "LiteRT-default"} " +
-                    "graph=${PocketTts.LM} placement=${defaultPlacement.label} seed=$seed voice=$voice " +
+                "variantSample=${sample.label} requestedThreads=${sample.cpuThreads ?: "LiteRT-default"} " +
+                    "graph=${sample.graph} graphSha256=${sample.graphSha256} " +
+                    "placement=${defaultPlacement.label} seed=$seed voice=$voice " +
                     "promptTokens=$tokenCount graphBytes=${sample.graphBytes} lmLoadMs=${sample.loadMs} " +
                     "allGraphLoadMs=${sample.allGraphLoadMs} warmupMs=${sample.warmupMs} " +
                     "firstAudioMs=${fmt(sample.firstAudioMs)} inferenceMs=${sample.speedTake.ms} " +
                     "audioSeconds=${fmt(audioSeconds)} speedAudioSeconds=${fmt(speedAudioSeconds)} " +
                     "rtf=${fmt(rtf)} frames=${sample.full.result.frames} " +
                     "repeatCorr=${fmt(sample.repeatCorr)} pssKb=${sample.pssBeforeKb}/${sample.pssLoadedKb}/${sample.pssAfterKb} " +
+                    "processCumulativePeakRssKb=${sample.cumulativePeakRssKb ?: "unavailable"} " +
                     "thermalStatus=${sample.thermalStart}->${sample.thermalEnd}",
             )
             logFlowLmStages(sample.label, sample.full.result, sample.full.elapsedMs)
@@ -553,22 +574,39 @@ class PowerBenchmarkTest {
             )
         }
 
-        val defaultAB = runVariant("ab-default", null)
-        val threadedAB = runVariant("ab-threads-$cpuThreads", cpuThreads)
-        val threadedBA = runVariant("ba-threads-$cpuThreads", cpuThreads)
-        val defaultBA = runVariant("ba-default", null)
-        listOf(defaultAB, threadedAB, threadedBA, defaultBA).forEach(::report)
+        val defaultAB = runVariant("ab-default", PocketTts.LM, null)
+        val candidateAB = runVariant("ab-$candidateLabel", candidateGraph, candidateThreads)
+        val candidateBA = runVariant("ba-$candidateLabel", candidateGraph, candidateThreads)
+        val defaultBA = runVariant("ba-default", PocketTts.LM, null)
+        listOf(defaultAB, candidateAB, candidateBA, defaultBA).forEach(::report)
 
-        val qualityAB = AudioQuality.compare(defaultAB.full.result.audio, threadedAB.full.result.audio)
-        val qualityBA = AudioQuality.compare(defaultBA.full.result.audio, threadedBA.full.result.audio)
+        val qualityAB = AudioQuality.compare(defaultAB.full.result.audio, candidateAB.full.result.audio)
+        val qualityBA = AudioQuality.compare(defaultBA.full.result.audio, candidateBA.full.result.audio)
+        val controls = listOf(defaultAB, defaultBA)
+        val candidates = listOf(candidateAB, candidateBA)
+        fun median(values: List<Double>) = values.sorted().let { (it[0] + it[1]) / 2.0 }
+        fun energy(sample: ThreadRun) = incrementalEnergy(sample.audioOnly, sample.full).values.sum()
         Log.i(
             TAG,
-            "CPU thread paired diagnostic order=default->threads then threads->default " +
-                "graph=${PocketTts.LM} placement=${defaultPlacement.label} seed=$seed " +
-                "ABcorr=${fmt(qualityAB.corr)} ABsamples=${defaultAB.full.result.audio.size}/${threadedAB.full.result.audio.size} " +
-                "BAcorr=${fmt(qualityBA.corr)} BAsamples=${defaultBA.full.result.audio.size}/${threadedBA.full.result.audio.size} " +
-                "threadFirstAudioP50P95=${percentiles(listOf(threadedAB.firstAudioMs, threadedBA.firstAudioMs))} " +
-                "defaultFirstAudioP50P95=${percentiles(listOf(defaultAB.firstAudioMs, defaultBA.firstAudioMs))}",
+            "CPU variant paired diagnostic order=default->$candidateLabel then $candidateLabel->default " +
+                "referenceGraph=${PocketTts.LM} candidateGraph=$candidateGraph " +
+                "placement=${defaultPlacement.label} seed=$seed " +
+                "ABcorr=${fmt(qualityAB.corr)} ABsamples=${defaultAB.full.result.audio.size}/${candidateAB.full.result.audio.size} " +
+                "BAcorr=${fmt(qualityBA.corr)} BAsamples=${defaultBA.full.result.audio.size}/${candidateBA.full.result.audio.size} " +
+                "candidateFirstAudioP50P95_n2=${percentiles(listOf(candidateAB.firstAudioMs, candidateBA.firstAudioMs))} " +
+                "defaultFirstAudioP50P95_n2=${percentiles(listOf(defaultAB.firstAudioMs, defaultBA.firstAudioMs))}",
+        )
+        Log.i(
+            TAG,
+            "CPU variant paired summary n=2/arm candidate=$candidateLabel " +
+                "controlInferenceMedianMs=${fmt(median(controls.map { it.speedTake.ms.toDouble() }))} " +
+                "candidateInferenceMedianMs=${fmt(median(candidates.map { it.speedTake.ms.toDouble() }))} " +
+                "controlInferenceP95_n2=${percentiles(controls.map { it.speedTake.ms.toDouble() })} " +
+                "candidateInferenceP95_n2=${percentiles(candidates.map { it.speedTake.ms.toDouble() })} " +
+                "controlIncrementalMedianJ=${fmt(median(controls.map(::energy)))} " +
+                "candidateIncrementalMedianJ=${fmt(median(candidates.map(::energy)))} " +
+                "controlFullWallMedianMs=${fmt(median(controls.map { it.full.elapsedMs.toDouble() }))} " +
+                "candidateFullWallMedianMs=${fmt(median(candidates.map { it.full.elapsedMs.toDouble() }))}",
         )
     }
 
@@ -597,6 +635,14 @@ class PowerBenchmarkTest {
         }
         return digest.digest().joinToString("") { "%02x".format(it) }
     }
+
+    /** Linux process high-water RSS; this accumulates across the four paired arms. */
+    private fun processPeakRssKb(): String? = runCatching {
+        File("/proc/self/status").useLines { lines ->
+            lines.firstOrNull { it.startsWith("VmHWM:") }
+                ?.substringAfter(':')?.trim()?.substringBefore(' ')
+        }
+    }.getOrNull()
 
     private fun logFlowLmStages(label: String, result: TtsResult, playbackElapsedMs: Long) {
         val profile = result.profile
@@ -939,6 +985,7 @@ class PowerBenchmarkTest {
         const val FP16_FLOWLM_GRAPH = "pt_flowlm_fused_fp16.tflite"
         const val FP16_FLOWLM_NO_TRUNCATION_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val FLOW_LM_SEED = 42L
+        const val EOS_FP32_GRAPH = "pt_flowlm_fused_dyn8_all_eosfp32.tflite"
         const val MIN_REPEAT_CORRELATION = 0.99
         val PARAGRAPH = """
             Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.
