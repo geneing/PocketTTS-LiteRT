@@ -88,7 +88,11 @@ Marius: 689 frames / 55.12 s), with PCM correlation 1.000 and thermal status
 short and medium runs, so those readings cannot rank the candidate. Both long
 energy estimates were higher at six threads; the aggregate may include
 overlapping rail domains. Device WAVs remain under the app's `power-benchmark`
-files directory; the full console/logcat record is in ignored `scripts/out`.
+files directory. Option 3 short-pair WAVs are in
+`build/flowlm-worktrees/option3-kv-capacity/scripts/out/option3-speech-device/`;
+the final Marius long A/B/B/A WAVs are in
+`build/flowlm-worktrees/option6-cpu-retune/scripts/out/option6-long-marius/`.
+The full console/logcat record is in ignored `scripts/out`.
 
 ## Acceptance coverage
 
