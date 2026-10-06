@@ -24,6 +24,11 @@ pending.
   `fp16` and `int8_per_head` cache modes are host-side
   round-trip simulations only: LiteRT graph inputs still use float32, so they
   do not reduce actual transfer bytes or represent a speed result.
+- `FlowLmHarnessTest.shortSpeechCapacityPair` runs a complete short utterance
+  through the 256 candidate and 512 production control, one engine at a time
+  with the same seed and decoder placement. It saves both WAVs and reports
+  synthesis, first audio, graph load, LM, Mimi, frames, and waveform correlation.
+  The method accepts `text`, `voice`, `lmCapacity`, `mode`, and `order` arguments.
 - The bundled voice files have 126 prefix frames (Alba, Charles, Javert,
   Marius, Mary) or 133 (Eve), calculated from their compact fp16 file sizes.
   Even the minimum planned audio budget makes 128 too small for full speech
@@ -131,6 +136,7 @@ shipped 512 graph. Run one instrumentation method at a time:
 adb push build\option3-graphs\256\pt_flowlm_fused_dyn8_all_pmax256.tflite /sdcard/Android/data/com.pockettts/files/
 adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#capacityPlannerAndVoicePrefixRepackingAreExact com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
 adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#runTextPromptHarness -e lmGraph pt_flowlm_fused_dyn8_all.tflite -e lmCapacity 256 -e backends CPU -e voice alba -e text 'Hello.' -e kvPrecision fp32 com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -e class com.pockettts.FlowLmHarnessTest#shortSpeechCapacityPair -e lmCapacity 256 -e voice alba -e text 'Hello there, how are you?' -e mode stream -e order candidate_first com.pockettts.test/androidx.test.runner.AndroidJUnitRunner
 adb pull /sdcard/Android/data/com.pockettts/files/flowlm-harness
 ```
 

@@ -8,8 +8,14 @@ import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
 import dev.pockettts.Accel
+import dev.pockettts.Placement
 import dev.pockettts.PocketTts
+import dev.pockettts.PocketTtsConfig
+import dev.pockettts.PocketTtsEngine
+import dev.pockettts.PocketTtsModels
 import dev.pockettts.SpTokenizer
+import dev.pockettts.TtsResult
+import dev.pockettts.Wav
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -227,6 +233,92 @@ class FlowLmHarnessTest {
         } finally {
             environment?.close()
         }
+    }
+
+    /** Full short-utterance A/B with the production decoder placement and seed. */
+    @Test
+    fun shortSpeechCapacityPair() {
+        val text = args.getString("text")?.trim().orEmpty().ifEmpty { "Hello there, how are you?" }
+        val voice = args.getString("voice")?.trim()?.ifEmpty { "alba" } ?: "alba"
+        val capacity = args.getString("lmCapacity")?.toIntOrNull() ?: 256
+        require(capacity in PocketTts.FLOWLM_CAPACITIES && capacity < PocketTts.PMAX) {
+            "lmCapacity must be 128 or 256 for the reduced-capacity speech pair"
+        }
+        val mode = args.getString("mode")?.trim()?.ifEmpty { "stream" } ?: "stream"
+        require(mode == "stream" || mode == "oneShot") { "mode must be stream or oneShot" }
+        val order = args.getString("order")?.trim()?.ifEmpty { "candidate_first" }
+            ?: "candidate_first"
+        require(order == "candidate_first" || order == "reference_first") {
+            "order must be candidate_first or reference_first"
+        }
+        val placement = Placement.default(context, modelDir)
+        require(placement.lm == Accel.CPU) {
+            "FlowLM bucket A/B requires the production CPU LM placement; got ${placement.label}"
+        }
+        val models = PocketTtsModels.default(context)
+        val candidateGraph = PocketTts.flowLmCapacityGraph(PocketTts.LM, capacity)
+        require(models.store.exists(candidateGraph)) { "missing candidate graph $candidateGraph" }
+        require(models.store.exists(PocketTts.LM)) { "missing reference graph ${PocketTts.LM}" }
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-harness") ?: File(context.filesDir, "flowlm-harness"),
+            "speech-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+        data class SpeechRun(val result: TtsResult, val loadMs: Double, val graph: String,
+                             val runtime: String)
+        fun run(label: String, selectedCapacity: Int): SpeechRun {
+            val started = System.nanoTime()
+            return PocketTtsEngine(context, PocketTtsConfig(
+                models = models,
+                placement = placement,
+                lmCapacity = selectedCapacity,
+                noiseSeed = 42L,
+            )).use { engine ->
+                val loadMs = (System.nanoTime() - started) / 1e6
+                check(engine.runtimeAccelerators["lm"] == Accel.CPU) {
+                    "FlowLM $label unexpectedly loaded on ${engine.runtimeAccelerators["lm"]}"
+                }
+                val result = if (mode == "stream") engine.stream(text, voice) {}
+                    else engine.synthesize(text, voice)
+                check(result.frames > 0 && result.audio.isNotEmpty() && result.audio.all { it.isFinite() }) {
+                    "$label produced no finite speech"
+                }
+                Wav.write(File(runDir, "$label.wav"), result.audio)
+                SpeechRun(result, loadMs, engine.lmGraphName, engine.runtimeAccelerators.toString())
+            }
+        }
+        val first = if (order == "candidate_first") "candidate" else "reference"
+        val firstRun = run(first, if (first == "candidate") capacity else PocketTts.PMAX)
+        val second = if (first == "candidate") "reference" else "candidate"
+        val secondRun = run(second, if (second == "candidate") capacity else PocketTts.PMAX)
+        val candidate = if (first == "candidate") firstRun else secondRun
+        val reference = if (first == "reference") firstRun else secondRun
+        val quality = AudioQuality.compare(reference.result.audio, candidate.result.audio)
+        val lines = mutableListOf(
+            "FlowLM short speech capacity pair",
+            "fingerprint=${android.os.Build.FINGERPRINT}",
+            "text=$text voice=$voice seed=42 mode=$mode order=$order placement=${placement.label}",
+            "candidate_graph=${candidate.graph} sha256=${sha256(File(modelDir, candidate.graph))}",
+            "reference_graph=${reference.graph} sha256=${sha256(File(modelDir, reference.graph))}",
+        )
+        fun describe(label: String, run: SpeechRun) {
+            val result = run.result
+            val p = result.profile
+            val seconds = result.audio.size.toDouble() / PocketTts.SAMPLE_RATE
+            lines += String.format(Locale.US,
+                "%s runtime=%s load=%.2f ms frames=%d audio=%.3f s synthesis=%d ms RTF=%.3f " +
+                    "first_audio=%d ms lm_in=%d ms lm_run=%d ms lm_read=%d ms " +
+                    "dectx=%d ms seanet=%d ms chunks=%d saved=%s.wav",
+                label, run.runtime, run.loadMs, result.frames, seconds, result.ms,
+                seconds * 1000 / result.ms, p.firstChunkMs, p.lmInMs, p.lmRunMs,
+                p.lmReadMs, p.decTxMs, p.seanetMs, p.audioChunks, label)
+        }
+        describe("candidate", candidate)
+        describe("reference", reference)
+        lines += "waveform_corr=${quality.corr}; compare completion and listen to both WAVs"
+        val report = lines.joinToString("\n", postfix = "\n")
+        File(runDir, "report.txt").writeText(report)
+        report.lineSequence().forEach { Log.i(TAG, it) }
+        assertTrue("candidate speech is empty", candidate.result.audio.isNotEmpty())
     }
 
     private fun runPrompt(
