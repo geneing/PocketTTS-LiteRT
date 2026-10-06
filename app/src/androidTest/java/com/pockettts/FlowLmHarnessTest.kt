@@ -2,6 +2,8 @@ package com.pockettts
 
 import android.util.Half
 import android.util.Log
+import android.os.Debug
+import android.os.PowerManager
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.google.ai.edge.litert.Accelerator
@@ -9,7 +11,12 @@ import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
 import dev.pockettts.Accel
 import dev.pockettts.PocketTts
+import dev.pockettts.PocketTtsConfig
+import dev.pockettts.PocketTtsEngine
+import dev.pockettts.PocketTtsModels
+import dev.pockettts.Placement
 import dev.pockettts.SpTokenizer
+import dev.pockettts.Wav
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -18,6 +25,7 @@ import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.text.SimpleDateFormat
 import java.util.Date
+import java.util.LinkedHashMap
 import java.util.Locale
 import kotlin.math.sqrt
 
@@ -38,6 +46,15 @@ class FlowLmHarnessTest {
     )
 
     private data class Metrics(val corr: Double, val mad: Double, val msd: Double)
+
+    private data class SpeechProbe(
+        val result: dev.pockettts.TtsResult,
+        val loadMs: Map<String, Long>,
+        val backends: Map<String, Accel>,
+        val pssBeforeRunKb: Long,
+        val pssAfterRunKb: Long,
+        val wav: File,
+    )
 
     @Test
     fun runTextPromptHarness() {
@@ -134,6 +151,98 @@ class FlowLmHarnessTest {
         } finally {
             environment?.close()
         }
+    }
+
+    /** End-to-end two-bank FlowLM cache chain against the shipped CPU int8 graph. */
+    @Test
+    fun npuResidentCacheSpeechPair() {
+        val residentBase = args.getString("residentGraph")?.trim()
+            ?.ifEmpty { DEFAULT_RESIDENT_GRAPH } ?: DEFAULT_RESIDENT_GRAPH
+        val residentGraph = PocketTts.g5Variant(residentBase)
+        val referenceGraph = args.getString("referenceGraph")?.trim()
+            ?.ifEmpty { PocketTts.LM } ?: PocketTts.LM
+        val text = args.getString("text")?.trim().orEmpty().ifEmpty { RESIDENT_TEXT }
+        val voice = args.getString("voice")?.trim()?.ifEmpty { "alba" } ?: "alba"
+        val seed = args.getString("seed")?.toLongOrNull() ?: 42L
+        val order = args.getString("order")?.trim()?.lowercase(Locale.ROOT) ?: "npu-cpu"
+        require(order == "npu-cpu" || order == "cpu-npu") {
+            "order must be npu-cpu or cpu-npu"
+        }
+        val models = PocketTtsModels.default(context)
+        assertTrue("missing resident NPU graph ${File(modelDir, residentGraph)}", models.store.exists(residentGraph))
+        assertTrue("missing CPU reference graph ${File(modelDir, referenceGraph)}", models.store.exists(referenceGraph))
+
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-npu-resident")
+                ?: File(context.filesDir, "flowlm-npu-resident"),
+            "speech-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+
+        fun runArm(arm: String): SpeechProbe {
+            val resident = arm == "npu"
+            val placement = if (resident) {
+                Placement(Accel.NPU, Accel.NPU, Accel.GPU)
+            } else {
+                Placement(Accel.CPU, Accel.NPU, Accel.GPU)
+            }
+            val graph = if (resident) residentBase else referenceGraph
+            val engine = PocketTtsEngine(
+                context,
+                PocketTtsConfig(
+                    models = models,
+                    placement = placement,
+                    lmGraph = graph,
+                    noiseSeed = seed,
+                    npuResidentCache = resident,
+                ),
+            )
+            try {
+                val load = engine.loadMs.toMap()
+                val backends = engine.runtimeAccelerators
+                val warmup = engine.stream("A short warmup sentence.", voice) {}
+                assertTrue("$arm warmup produced no audio", warmup.audio.isNotEmpty())
+                val pssBefore = Debug.getPss().toLong()
+                val result = engine.stream(text, voice) {}
+                val pssAfter = Debug.getPss().toLong()
+                assertTrue("$arm run produced no audio", result.audio.isNotEmpty())
+                val wav = File(runDir, "$arm.wav")
+                Wav.write(wav, result.audio)
+                return SpeechProbe(result, load, backends, pssBefore, pssAfter, wav)
+            } finally {
+                engine.close()
+            }
+        }
+
+        val orderArms = if (order == "npu-cpu") listOf("npu", "cpu") else listOf("cpu", "npu")
+        val probes = LinkedHashMap<String, SpeechProbe>()
+        for (arm in orderArms) probes[arm] = runArm(arm)
+        val candidate = requireNotNull(probes["npu"])
+        val reference = requireNotNull(probes["cpu"])
+        val quality = AudioQuality.compare(reference.result.audio, candidate.result.audio)
+        val graphFile = File(modelDir, residentGraph)
+        val graphSha = sha256(graphFile)
+        val thermal = context.getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1
+        val lines = listOf(
+            "FlowLM Tensor G5 resident-cache speech pair",
+            "device=${android.os.Build.MODEL}/${android.os.Build.DEVICE} android=${android.os.Build.VERSION.RELEASE}",
+            "fingerprint=${android.os.Build.FINGERPRINT}",
+            "order=$order seed=$seed voice=$voice text=$text",
+            "candidateGraph=$residentGraph sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
+            "referenceGraph=$referenceGraph placement=lm:CPU dectx:NPU dec:GPU",
+            "candidatePlacement=${candidate.backends} loadMs=${candidate.loadMs} pssKb=${candidate.pssBeforeRunKb}->${candidate.pssAfterRunKb}",
+            "referencePlacement=${reference.backends} loadMs=${reference.loadMs} pssKb=${reference.pssBeforeRunKb}->${reference.pssAfterRunKb}",
+            "candidate frames=${candidate.result.frames} audioSeconds=${candidate.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${candidate.result.ms} firstAudioMs=${candidate.result.profile.firstChunkMs}",
+            "reference frames=${reference.result.frames} audioSeconds=${reference.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${reference.result.ms} firstAudioMs=${reference.result.profile.firstChunkMs}",
+            "candidate lmMs in/run/read=${candidate.result.profile.lmInMs}/${candidate.result.profile.lmRunMs}/${candidate.result.profile.lmReadMs} steps=${candidate.result.profile.lmSteps} hostBytesIn=${candidate.result.profile.lmInBytes} hostBytesOut=${candidate.result.profile.lmOutBytes}",
+            "reference lmMs in/run/read=${reference.result.profile.lmInMs}/${reference.result.profile.lmRunMs}/${reference.result.profile.lmReadMs} steps=${reference.result.profile.lmSteps} hostBytesIn=${reference.result.profile.lmInBytes} hostBytesOut=${reference.result.profile.lmOutBytes}",
+            "waveform corr=${quality.corr} lag=${quality.lag} snrDb=${quality.snrDb} highBandErrDb=${quality.highBandErrDb} refHnrDb=${quality.refHnrDb} candidateHnrDb=${quality.candHnrDb}",
+            "thermalStatus=$thermal candidateWav=${candidate.wav.absolutePath} referenceWav=${reference.wav.absolutePath}",
+            "cache buffers are ping-ponged; Kotlin reads only the 33-float control output; actual AHWB type/device-side copy volume remain unverified",
+        )
+        File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
+        lines.forEach { Log.i(TAG, it) }
+        assertTrue("resident run did not use NPU placement: ${candidate.backends}", candidate.backends["lm"] == Accel.NPU)
+        assertTrue("resident run produced no FlowLM frames", candidate.result.frames > 0)
     }
 
     private fun runPrompt(
@@ -301,10 +410,25 @@ class FlowLmHarnessTest {
         file.writeBytes(bytes.array())
     }
 
+    private fun sha256(file: File): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+        file.inputStream().buffered().use { input ->
+            val buffer = ByteArray(1 shl 20)
+            while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                digest.update(buffer, 0, count)
+            }
+        }
+        return digest.digest().joinToString("") { "%02x".format(it) }
+    }
+
     private companion object {
         const val TAG = "FlowLmHarness"
         const val DEFAULT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
         const val REFERENCE_GRAPH = "pt_flowlm_fused_fp16.tflite"
         const val DEFAULT_TEXT = "Hello world. This is a FlowLM text probe."
+        const val DEFAULT_RESIDENT_GRAPH = "pt_flowlm_fused_fp16_resident_no_truncation.tflite"
+        const val RESIDENT_TEXT = "Hello there, how are you?"
     }
 }

@@ -128,6 +128,10 @@ class PocketTtsSession internal constructor(
             mask[base + PMAX] = 0f
         }
         pos = voiceLen
+        if (engine.usesNpuResidentCache) {
+            sLmIn += engine.resetNpuResidentCache(pk, pv)
+            sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+        }
     }
 
     private fun embRow(id: Int): FloatArray {
@@ -248,35 +252,53 @@ class PocketTtsSession internal constructor(
      */
     private fun step(emb: FloatArray, noise: FloatArray): Pair<FloatArray, Float> {
         check(pos < PMAX) { "KV cache overflow at $pos" }
-        val t0 = System.nanoTime()
-        ropeFill(pos)
-        engine.lmIn[0].writeFloat(emb)
-        engine.lmIn[1].writeFloat(cosArr)
-        engine.lmIn[2].writeFloat(sinArr)
-        engine.lmIn[3].writeFloat(mask)
-        engine.lmIn[4].writeFloat(pk)
-        engine.lmIn[5].writeFloat(pv)
-        engine.lmIn[6].writeFloat(noise)
-        val t1 = System.nanoTime()
-        engine.runLm(engine.lmIn, engine.lmOut)
-        val t2 = System.nanoTime()
-        val out = engine.lmOut[0].readFloat()
+        val out: FloatArray
+        if (engine.usesNpuResidentCache) {
+            val prepareStart = System.nanoTime()
+            ropeFill(pos)
+            val prepareNs = System.nanoTime() - prepareStart
+            val run = engine.runNpuResidentLm(emb, cosArr, sinArr, mask, noise, pos)
+            out = run.control
+            sLmIn += prepareNs + run.inputNs
+            sLmRun += run.runNs
+            sLmRead += run.readNs
+            sLmInBytes += (
+                emb.size + cosArr.size + sinArr.size + mask.size + noise.size + PMAX
+                ).toLong() * Float.SIZE_BYTES
+        } else {
+            val t0 = System.nanoTime()
+            ropeFill(pos)
+            engine.lmIn[0].writeFloat(emb)
+            engine.lmIn[1].writeFloat(cosArr)
+            engine.lmIn[2].writeFloat(sinArr)
+            engine.lmIn[3].writeFloat(mask)
+            engine.lmIn[4].writeFloat(pk)
+            engine.lmIn[5].writeFloat(pv)
+            engine.lmIn[6].writeFloat(noise)
+            val t1 = System.nanoTime()
+            engine.runLm(engine.lmIn, engine.lmOut)
+            val t2 = System.nanoTime()
+            out = engine.lmOut[0].readFloat()
+            val t3 = System.nanoTime()
+            sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2
+            sLmInBytes += (
+                emb.size + cosArr.size + sinArr.size + mask.size +
+                    pk.size + pv.size + noise.size
+                ).toLong() * Float.SIZE_BYTES
+        }
         val eos = out[0]
         val latent = out.copyOfRange(1, 1 + LDIM)
-        val kvBase = 1 + LDIM
-        for (g in 0 until G) {
-            System.arraycopy(out, kvBase + g * HD, pk, g * PMAX * HD + pos * HD, HD)
-            System.arraycopy(out, kvBase + G * HD + g * HD, pv, g * PMAX * HD + pos * HD, HD)
+        if (!engine.usesNpuResidentCache) {
+            val kvBase = 1 + LDIM
+            for (g in 0 until G) {
+                System.arraycopy(out, kvBase + g * HD, pk, g * PMAX * HD + pos * HD, HD)
+                System.arraycopy(out, kvBase + G * HD + g * HD, pv, g * PMAX * HD + pos * HD, HD)
+            }
         }
         for (h in 0 until NH) mask[h * (PMAX + 1) + pos] = 0f
         pos++
-        val t3 = System.nanoTime()
-        sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2; sLmSteps++
+        sLmSteps++
         sLmInv++
-        sLmInBytes += (
-            emb.size + cosArr.size + sinArr.size + mask.size +
-                pk.size + pv.size + noise.size
-            ).toLong() * Float.SIZE_BYTES
         sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
         return latent to eos
     }

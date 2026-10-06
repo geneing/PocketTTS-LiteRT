@@ -60,9 +60,23 @@ class PocketTtsConfig(
     val voices: List<Voice> = defaultVoices(models),
     /** Override the streaming SEANet graph filename; null selects [PocketTts.deconlyGraph]. */
     val streamDecoderGraph: String? = null,
+    /**
+     * Use the experimental Tensor G5 graph whose K/V outputs are full updated
+     * cache banks, chaining two LiteRT buffers between autoregressive steps.
+     * Requires a one-step AOT graph override and an NPU placement. The graph is
+     * opt-in because its output-bank copy cost and speech quality must be
+     * measured against the CPU int8 control on the target device.
+     */
+    val npuResidentCache: Boolean = false,
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }
+        if (npuResidentCache) {
+            require(placement.lm == Accel.NPU) { "NPU-resident cache requires lm:NPU" }
+            require(lmGraph != null) { "NPU-resident cache requires its AOT lmGraph override" }
+            require(lmSteps == 1) { "NPU-resident cache currently supports one LM step per invocation" }
+            require(!usePrefill) { "NPU-resident cache uses the one-step graph for prompt tokens" }
+        }
     }
 
     companion object {
