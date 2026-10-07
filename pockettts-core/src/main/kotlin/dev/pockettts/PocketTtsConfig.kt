@@ -113,14 +113,28 @@ class PocketTtsConfig(
 
         /**
          * The device policy: adb-pushed models first, GitHub release fallback,
-         * and [Placement.default] for the accelerator split.
+         * and [Placement.default] for the accelerator split. On Tensor G5,
+         * select the tuned FlowLM AOT graph with the persistent position-major
+         * cache and HIGH_PERFORMANCE mode when that graph is installed.
          */
         fun default(
             context: Context,
             models: PocketTtsModels = PocketTtsModels.default(context),
         ): PocketTtsConfig {
             val dir = context.getExternalFilesDir(null) ?: context.filesDir
-            return PocketTtsConfig(models, Placement.default(context, dir))
+            val npuLmGraphInstalled = models.store.exists(
+                PocketTts.g5Variant(PocketTts.LM_G5_HIGH_PERFORMANCE),
+            )
+            val placement = Placement.default(context, dir, npuLmGraphInstalled)
+            val useNpuFlowLm = placement.lm == Accel.NPU
+            return PocketTtsConfig(
+                models = models,
+                placement = placement,
+                lmGraph = PocketTts.LM_G5_HIGH_PERFORMANCE.takeIf { useNpuFlowLm },
+                npuSliceCache = useNpuFlowLm,
+                npuPositionMajorCache = useNpuFlowLm,
+                g5HighPerformance = useNpuFlowLm,
+            )
         }
     }
 }

@@ -75,8 +75,14 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
          *
          * @param modelDir directory that holds the graphs, used to detect the
          *   AOT-compiled decoder transformer before opting into the NPU.
+         * @param flowLmNpuAvailable whether the tuned FlowLM AOT graph resolves
+         *   through the configured model sources.
          */
-        fun default(context: Context, modelDir: File): Placement {
+        fun default(
+            context: Context,
+            modelDir: File,
+            flowLmNpuAvailable: Boolean = false,
+        ): Placement {
             val dir = context.getExternalFilesDir(null)
             fun keys(file: String): Set<String> =
                 File(dir, file).takeIf { it.exists() }
@@ -87,13 +93,21 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
             val fp32 = keys("force_fp32.txt")
             val forceGpu = keys("force_gpu.txt")
             val powerVr = renderer().contains("PowerVR", ignoreCase = true)
+            val hasGoogleTensorDispatch = File(
+                context.applicationInfo.nativeLibraryDir,
+                "libLiteRtDispatch_GoogleTensor.so",
+            ).exists()
 
-            // PowerVR (Tensor G5 / Pixel 10): the OpenCL delegate's per-AR-step
-            // overhead makes the flow-LM ~2.7x slower than XNNPACK here.
+            // Prefer the measured static W8/A16 graph on Tensor G5 when its AOT
+            // file and dispatch library are installed. Preserve the force files
+            // as explicit developer overrides.
+            val useNpuFlowLm = powerVr && flowLmNpuAvailable && hasGoogleTensorDispatch
             val lm = when {
                 "lm" in userCpu -> Accel.CPU
-                powerVr && "lm" !in forceGpu -> Accel.CPU
                 "lm" in fp32 -> Accel.GPU32
+                "lm" in forceGpu -> Accel.GPU
+                useNpuFlowLm -> Accel.NPU
+                powerVr -> Accel.CPU
                 else -> Accel.GPU
             }
             // The Mimi decoder transformer defaults to CPU: its GPU output is
@@ -101,10 +115,7 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
             // opted into only when the AOT graph and dispatch shim are present.
             val npuDectx = powerVr && "dectx" !in userCpu &&
                 File(modelDir, PocketTts.g5Variant(PocketTts.DEC_TX)).exists() &&
-                File(
-                    context.applicationInfo.nativeLibraryDir,
-                    "libLiteRtDispatch_GoogleTensor.so",
-                ).exists()
+                hasGoogleTensorDispatch
             val dectx = when {
                 npuDectx -> Accel.NPU
                 "dectx" !in forceGpu -> Accel.CPU

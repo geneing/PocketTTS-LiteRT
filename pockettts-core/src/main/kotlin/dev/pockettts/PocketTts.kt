@@ -51,6 +51,10 @@ object PocketTts {
      */
     const val LM = "pt_flowlm_fused_dyn8_all.tflite"
 
+    /** Tuned static W8/A16 FlowLM graph used by the Tensor G5 NPU default. */
+    const val LM_G5_HIGH_PERFORMANCE =
+        "pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite"
+
     /**
      * Name `litert_torch` gives the fused graph's default signature. The
      * head-less prompt batch is a second signature ([PREFILL_SIGNATURE]) in the

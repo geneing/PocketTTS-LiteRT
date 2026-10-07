@@ -66,10 +66,14 @@ val session = engine.newSession("alba")
 
 `PocketTtsConfig` overrides the policy: `placement`, `lmGraph`, `lmSteps`,
 `streamW`, `noiseSeed` (deterministic repeats), `gpuCache` (serialized GPU program
-cache). `Placement.default` picks the split per device: flow-LM int8 on CPU, the
-Mimi decoder transformer on the Tensor G5 NPU when the `_g5` graph and the dispatch
-shim are both installed, SEANet streaming on the GPU. `force_cpu.txt`,
-`force_gpu.txt` and `force_fp32.txt` in the external files dir still override.
+cache). `PocketTtsConfig.default` picks the split per device. When the tuned
+`pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite` graph and Google
+Tensor dispatch shim are installed on Tensor G5, FlowLM uses the NPU with
+position-major persistent cache updates and HIGH_PERFORMANCE mode. Without that
+graph, FlowLM follows the existing CPU/GPU policy. The Mimi decoder transformer
+uses the Tensor G5 NPU when its `_g5` graph and dispatch shim are installed, and
+SEANet streaming uses the GPU. `force_cpu.txt`, `force_gpu.txt` and
+`force_fp32.txt` in the external files dir still override placement.
 
 ### Three entry points
 
