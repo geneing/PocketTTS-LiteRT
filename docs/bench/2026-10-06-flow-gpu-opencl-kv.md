@@ -17,6 +17,9 @@ Both arms used CPU decoder transformer and GPU SEANet. The GPU graph is the
 position-major fused FP16 `pt_flowlm_fused_fp16_contiguous.tflite`, SHA-256
 `1d6fe48ed4435b415970a240916a726f1b8994036aacf3c009085722a8a632c7`.
 The installed device graph hash matched before testing.
+App logcat recorded `717/717` nodes delegated to one `LITERT_CL` partition
+for this position-major graph; the filtered transcript is retained at ignored
+`scripts/out/gpu-flowlm/delegation-logcat.txt`.
 
 The opt-in `gpuOpenClCache=true` path compiles with LiteRT 2.2.0's public C API.
 K/V are persistent `OpenClBufferPacked` (type 14) buffers, seeded once per
@@ -30,6 +33,17 @@ output `[1,12321]`. Runtime CL allocations were 12,582,912 bytes per K/V bank
 and 49,296 bytes for the packed output (49,284 useful bytes plus padding).
 The AAR packages `libLiteRt.so` but no C headers; minimal version-pinned
 public declarations are in the native bridge, resolved by public symbol names.
+
+This applies the [Transformer-Lite paper's fixed-capacity, sub-tensor K/V
+idea](https://arxiv.org/abs/2403.20041) to the interfaces available here:
+the graph emits only new K/V, the two preallocated cache banks retain their
+contents across steps, and row copies target byte offsets in those banks.
+The existing fused graph packs control, K, and V into one output tensor, so it
+cannot bind its K/V outputs directly to two offset buffer views without a
+new graph export. The two same-queue GPU copies are the supported equivalent
+for this candidate. The existing graph is fused and delegated in one partition;
+this experiment does not claim additional kernel fusion or general GPU memory
+reuse beyond those persistent cache buffers.
 
 The first direct-queue attempt used an independent same-context OpenCL queue.
 It read an all-zero first output and then the prior step's output: queue
