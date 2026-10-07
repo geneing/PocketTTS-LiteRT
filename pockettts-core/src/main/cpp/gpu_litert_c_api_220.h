@@ -15,6 +15,7 @@ constexpr Status kOk = 0;
 constexpr int kGpu = 1 << 1;
 constexpr int kFloat32 = 1;
 constexpr int kAhwb = 2;
+constexpr int kOpenClBufferPacked = 14;
 constexpr int kRead = 0;
 constexpr int kWrite = 1;
 
@@ -54,6 +55,7 @@ using CreateFromAhwb = Status (*)(Handle, const RankedType*, AHardwareBuffer*,
                                   size_t, void (*)(AHardwareBuffer*), Handle*);
 using CreateManagedFromRequirements = Status (*)(Handle, const RankedType*,
                                                 Handle, Handle*);
+using GetOpenClMemory = Status (*)(Handle, void**);
 using GetBufferType = Status (*)(Handle, int*);
 using LockBuffer = Status (*)(Handle, void**, int);
 using UnlockBuffer = Status (*)(Handle);

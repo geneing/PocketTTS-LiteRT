@@ -21,6 +21,7 @@ import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
 import dev.pockettts.Accel
 import dev.pockettts.GpuAhwbLmRunner
+import dev.pockettts.GpuOpenClLmRunner
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsConfig
 import dev.pockettts.PocketTtsEngine
@@ -436,6 +437,72 @@ class FlowLmHarnessTest {
             File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
             lines.forEach { Log.i(TAG, it) }
             assertTrue("AHWB GPU output disagrees with CPU FP16: $m", m.corr > 0.999)
+        }
+    }
+
+    /** Probe OpenCL packed-buffer compatibility, then compare a short cache-chained GPU prompt to CPU FP16. */
+    @Test
+    fun gpuOpenClPromptGate() {
+        val graph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "pt_flowlm_fused_fp16_contiguous.tflite"
+        val path = File(modelDir, graph)
+        assertTrue("missing position-major GPU graph $path", path.isFile)
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-gpu-opencl") ?: File(context.filesDir, "flowlm-gpu-opencl"),
+            "prompt-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+        val lines = mutableListOf("FlowLM GPU OpenCL prompt gate", "graph=$graph sha256=${sha256(path)}")
+        GpuOpenClLmRunner(path).use { gpu ->
+            lines += gpu.details
+            File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
+            assertTrue("OpenCL packed-buffer compatibility or cache requirements failed; report=$runDir", gpu.ready)
+
+            val tokenIds = SpTokenizer(File(modelDir, PocketTts.TOKENIZER)).encode("Hello there.")
+            val voice = readVoice(File(modelDir, PocketTts.voiceFile("alba")))
+            val embed = ByteBuffer.wrap(File(modelDir, PocketTts.EMBED).readBytes())
+                .order(ByteOrder.LITTLE_ENDIAN)
+            val mask = FloatArray(PocketTts.NH * (PocketTts.PMAX + 1)) { PocketTts.MASK_NEG }
+            for (h in 0 until PocketTts.NH) {
+                val base = h * (PocketTts.PMAX + 1)
+                for (p in 0 until voice.length) mask[base + p] = 0f
+                mask[base + PocketTts.PMAX] = 0f
+            }
+            val cos = FloatArray(PocketTts.HD)
+            val sin = FloatArray(PocketTts.HD)
+            val noise = FloatArray(PocketTts.LDIM)
+            val width = 1 + PocketTts.LDIM + 2 * PocketTts.G * PocketTts.HD
+            val result = FloatArray(tokenIds.size * width)
+            val timings = LongArray(6)
+            gpu.seed(voice.k, voice.v)
+            var pos = voice.length
+            for ((step, id) in tokenIds.withIndex()) {
+                val embedding = FloatArray(PocketTts.H)
+                var offset = id * PocketTts.H * Short.SIZE_BYTES
+                for (i in embedding.indices) {
+                    embedding[i] = Half.toFloat(embed.getShort(offset))
+                    offset += Short.SIZE_BYTES
+                }
+                rope(pos, cos, sin)
+                val output = gpu.step(embedding, cos, sin, mask, noise, pos, fullOutput = true)
+                assertTrue("GPU OpenCL output width changed", output.packed.size == width)
+                System.arraycopy(output.packed, 0, result, step * width, width)
+                for (i in timings.indices) timings[i] += output.timingsNs[i]
+                for (h in 0 until PocketTts.NH) mask[h * (PocketTts.PMAX + 1) + pos] = 0f
+                pos++
+            }
+            val reference = runPrompt(
+                Accel.CPU, "pt_flowlm_fused_fp16.tflite", tokenIds,
+                File(modelDir, PocketTts.EMBED).readBytes(), voice, null,
+            )
+            val m = metrics(reference.output, result)
+            writeFloats(File(runDir, "gpu-opencl.f32le"), result)
+            writeFloats(File(runDir, "cpu-fp16.f32le"), reference.output)
+            lines += "tokens=${tokenIds.size} voicePrefix=${voice.length} values=${result.size}"
+            lines += "timingsMs input/run/read/cacheMap/cacheCopy/cacheUnmap=${timings.joinToString("/") { String.format(Locale.US, "%.3f", it / 1e6) }}"
+            lines += "cpuFp16 corr=${m.corr} mad=${m.mad} msd=${m.msd}"
+            File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
+            lines.forEach { Log.i(TAG, it) }
+            assertTrue("OpenCL GPU output disagrees with CPU FP16: $m", m.corr > 0.999)
         }
     }
 
@@ -914,3 +981,4 @@ class FlowLmHarnessTest {
         """.trimIndent().replace('\n', ' ')
     }
 }
+
