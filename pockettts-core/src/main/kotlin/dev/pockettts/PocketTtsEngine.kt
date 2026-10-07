@@ -240,6 +240,17 @@ class PocketTtsEngine(
         } else if (lmStepIn != null) lm.run(ins, outs, 1) else lm.run(ins, outs)
     }
 
+    /** Opt-in, low-level hardware metrics for the actual native G5 FlowLM model. */
+    fun startLmHardwareMetrics(detailLevel: Int = 0) {
+        requireNotNull(highPerformanceLm) {
+            "G5 HIGH_PERFORMANCE FlowLM is required for hardware metrics"
+        }.startMetricsCollection(detailLevel)
+    }
+
+    fun stopLmHardwareMetrics(): List<String> = requireNotNull(highPerformanceLm) {
+        "G5 HIGH_PERFORMANCE FlowLM is required for hardware metrics"
+    }.stopMetricsCollection()
+
     /** Seed one cache bank from the selected voice and restore A -> B roles. */
     internal fun resetNpuResidentCache(k: FloatArray, v: FloatArray): Long {
         check(usesNpuResidentCache) { "NPU-resident cache is disabled" }

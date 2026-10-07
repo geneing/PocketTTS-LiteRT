@@ -23,6 +23,11 @@ using FindOpaque = int (*)(Handle, const char*, void**);
 using CreateCompiled = int (*)(Handle, Handle, Handle, Handle*);
 using Run = int (*)(Handle, size_t, size_t, Handle*, size_t, Handle*);
 using StatusString = const char* (*)(int);
+using StartMetricsCollection = int (*)(Handle, int);
+using StopMetricsCollection = int (*)(Handle, Handle);
+using CreateMetrics = int (*)(Handle*);
+using GetNumMetrics = int (*)(Handle, int*);
+using GetMetric = int (*)(Handle, int, void*);
 
 struct Api {
   void* library = nullptr;
@@ -39,6 +44,12 @@ struct Api {
   Destroy destroy_compiled = nullptr;
   Run run = nullptr;
   StatusString status_string = nullptr;
+  StartMetricsCollection start_metrics = nullptr;
+  StopMetricsCollection stop_metrics = nullptr;
+  CreateMetrics create_metrics = nullptr;
+  GetNumMetrics get_num_metrics = nullptr;
+  GetMetric get_metric = nullptr;
+  Destroy destroy_metrics = nullptr;
   bool valid() const {
     return library && create_model && destroy_model && create_options &&
            destroy_options && set_accelerator && create_opaque &&
@@ -67,6 +78,12 @@ const Api& api() {
     LOAD(destroy_compiled, "LiteRtDestroyCompiledModel");
     LOAD(run, "LiteRtRunCompiledModel");
     LOAD(status_string, "LiteRtGetStatusString");
+    LOAD(start_metrics, "LiteRtCompiledModelStartMetricsCollection");
+    LOAD(stop_metrics, "LiteRtCompiledModelStopMetricsCollection");
+    LOAD(create_metrics, "LiteRtCreateMetrics");
+    LOAD(get_num_metrics, "LiteRtGetNumMetrics");
+    LOAD(get_metric, "LiteRtGetMetric");
+    LOAD(destroy_metrics, "LiteRtDestroyMetrics");
 #undef LOAD
     return x;
   }();
@@ -130,7 +147,52 @@ Handle environment_handle(JNIEnv* env, jobject object) {
   return result;
 }
 
-struct NativeModel { Handle model = nullptr; Handle compiled = nullptr; };
+// Public LiteRT 2.2.0 metrics ABI. Kept local because the Maven AAR does not
+// ship the C headers; the layout matches litert_metrics.h/litert_any.h.
+enum LiteRtAnyType : int {
+  kAnyBool = 1,
+  kAnyInt = 2,
+  kAnyReal = 3,
+  kAnyString = 8,
+  kAnyVoidPtr = 9,
+};
+struct LiteRtAny {
+  int type;
+  union {
+    bool bool_value;
+    int64_t int_value;
+    double real_value;
+    const char* str_value;
+    const void* ptr_value;
+  };
+};
+struct LiteRtMetric { const char* name; LiteRtAny value; };
+static_assert(sizeof(LiteRtAny) == 12 || sizeof(LiteRtAny) == 16,
+              "LiteRT 2.2.0 LiteRtAny ABI mismatch");
+
+struct NativeModel {
+  Handle model = nullptr;
+  Handle compiled = nullptr;
+  Handle metrics = nullptr;
+  bool collecting_metrics = false;
+};
+
+void destroy_metrics(NativeModel* native) {
+  if (native->metrics) api().destroy_metrics(native->metrics);
+  native->metrics = nullptr;
+  native->collecting_metrics = false;
+}
+
+std::string metric_value(const LiteRtAny& value) {
+  switch (value.type) {
+    case kAnyBool: return std::string("bool:") + (value.bool_value ? "true" : "false");
+    case kAnyInt: return "int:" + std::to_string(value.int_value);
+    case kAnyReal: return "real:" + std::to_string(value.real_value);
+    case kAnyString: return std::string("string:") + (value.str_value ? value.str_value : "");
+    case kAnyVoidPtr: return "pointer";
+    default: return "type:" + std::to_string(value.type);
+  }
+}
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
@@ -215,10 +277,81 @@ Java_dev_pockettts_G5PerformanceModel_nativeRun(
 }
 
 extern "C" JNIEXPORT void JNICALL
+Java_dev_pockettts_G5PerformanceModel_nativeStartMetricsCollection(
+    JNIEnv* env, jobject, jlong native_handle, jint detail_level) {
+  const auto& a = api();
+  if (!native_handle || detail_level < 0) {
+    fail(env, "invalid G5 hardware metrics arguments"); return;
+  }
+  if (!a.start_metrics || !a.stop_metrics || !a.create_metrics ||
+      !a.get_num_metrics || !a.get_metric || !a.destroy_metrics) {
+    fail(env, "LiteRT 2.2.0 hardware metrics API unavailable"); return;
+  }
+  auto* native = reinterpret_cast<NativeModel*>(native_handle);
+  if (native->collecting_metrics || native->metrics) {
+    fail(env, "G5 hardware metrics collection is already active"); return;
+  }
+  if (!ok(env, a.create_metrics(&native->metrics), "LiteRtCreateMetrics")) return;
+  if (!ok(env, a.start_metrics(native->compiled, detail_level),
+          "LiteRtCompiledModelStartMetricsCollection")) {
+    destroy_metrics(native);
+    return;
+  }
+  native->collecting_metrics = true;
+}
+
+extern "C" JNIEXPORT jobjectArray JNICALL
+Java_dev_pockettts_G5PerformanceModel_nativeStopMetricsCollection(
+    JNIEnv* env, jobject, jlong native_handle) {
+  if (!native_handle) { fail(env, "closed G5 performance model"); return nullptr; }
+  auto* native = reinterpret_cast<NativeModel*>(native_handle);
+  const auto& a = api();
+  if (!native->collecting_metrics || !native->metrics) {
+    fail(env, "G5 hardware metrics collection is not active"); return nullptr;
+  }
+  if (!ok(env, a.stop_metrics(native->compiled, native->metrics),
+          "LiteRtCompiledModelStopMetricsCollection")) {
+    destroy_metrics(native);
+    return nullptr;
+  }
+  native->collecting_metrics = false;
+
+  int count = 0;
+  if (!ok(env, a.get_num_metrics(native->metrics, &count), "LiteRtGetNumMetrics")) {
+    destroy_metrics(native);
+    return nullptr;
+  }
+  jclass string_class = env->FindClass("java/lang/String");
+  if (!string_class) { destroy_metrics(native); return nullptr; }
+  jobjectArray result = env->NewObjectArray(count, string_class, nullptr);
+  if (!result) { destroy_metrics(native); return nullptr; }
+  for (int i = 0; i < count; ++i) {
+    LiteRtMetric metric{};
+    if (!ok(env, a.get_metric(native->metrics, i, &metric), "LiteRtGetMetric")) {
+      destroy_metrics(native);
+      return nullptr;
+    }
+    const std::string line = std::string(metric.name ? metric.name : "<unnamed>") +
+                             "=" + metric_value(metric.value);
+    jstring item = env->NewStringUTF(line.c_str());
+    if (!item) { destroy_metrics(native); return nullptr; }
+    env->SetObjectArrayElement(result, i, item);
+    env->DeleteLocalRef(item);
+    if (env->ExceptionCheck()) { destroy_metrics(native); return nullptr; }
+  }
+  destroy_metrics(native);
+  return result;
+}
+
+extern "C" JNIEXPORT void JNICALL
 Java_dev_pockettts_G5PerformanceModel_nativeClose(JNIEnv*, jobject,
                                                     jlong native_handle) {
   if (!native_handle) return;
   auto* native = reinterpret_cast<NativeModel*>(native_handle);
+  if (native->collecting_metrics && native->metrics) {
+    api().stop_metrics(native->compiled, native->metrics);
+  }
+  destroy_metrics(native);
   api().destroy_compiled(native->compiled);
   api().destroy_model(native->model);
   delete native;

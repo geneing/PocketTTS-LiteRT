@@ -202,6 +202,13 @@ class FlowLmHarnessTest {
             ?.toBooleanStrictOrNull() ?: false
         val g5HighPerformance = args.getString("g5HighPerformance")
             ?.toBooleanStrictOrNull() ?: false
+        val g5MetricsDetail = args.getString("g5MetricsDetail")?.toIntOrNull()
+        require(g5MetricsDetail == null || g5MetricsDetail >= 0) {
+            "g5MetricsDetail must be nonnegative"
+        }
+        require(g5MetricsDetail == null || g5HighPerformance) {
+            "G5 hardware metrics require g5HighPerformance=true"
+        }
         require(!(npuResidentCache && npuSliceCache)) {
             "select either npuResidentCache or npuSliceCache"
         }
@@ -252,6 +259,7 @@ class FlowLmHarnessTest {
                 ?: File(context.filesDir, "flowlm-npu-$cacheMode"),
             "speech-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
         ).apply { mkdirs() }
+        var candidateHardwareMetrics: List<String> = emptyList()
 
         fun runArm(arm: String): SpeechProbe {
             val isNpu = arm == "npu"
@@ -289,10 +297,16 @@ class FlowLmHarnessTest {
                 val powerBefore = powerSnapshot(health, relevantMonitors)
                 val synthesisStartMs = SystemClock.elapsedRealtime()
                 val pssBefore = Debug.getPss().toLong()
+                if (isNpu && g5MetricsDetail != null) {
+                    engine.startLmHardwareMetrics(g5MetricsDetail)
+                }
                 var result = baselineTake
                 repeat(energyRepeats) {
                     result = engine.stream(text, voice) {}
                     assertTrue("$arm repeated run produced no audio", result.audio.isNotEmpty())
+                }
+                if (isNpu && g5MetricsDetail != null) {
+                    candidateHardwareMetrics = engine.stopLmHardwareMetrics()
                 }
                 val pssAfter = Debug.getPss().toLong()
                 val synthesisElapsedMs = SystemClock.elapsedRealtime() - synthesisStartMs
@@ -357,6 +371,10 @@ class FlowLmHarnessTest {
         )
         candidate.energy?.let { lines += energyLine("candidate", it, candidate.result.audio.size) }
         reference.energy?.let { lines += energyLine("reference", it, reference.result.audio.size) }
+        if (g5MetricsDetail != null) {
+            lines += "candidate G5 hardware metrics detail=$g5MetricsDetail count=${candidateHardwareMetrics.size}"
+            lines += candidateHardwareMetrics.map { "candidate G5 hardware metric $it" }
+        }
         File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
         lines.forEach { Log.i(TAG, it) }
         assertTrue("candidate run did not use NPU placement: ${candidate.backends}", candidate.backends["lm"] == Accel.NPU)
