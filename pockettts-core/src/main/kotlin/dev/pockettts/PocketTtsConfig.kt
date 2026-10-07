@@ -122,9 +122,7 @@ class PocketTtsConfig(
             models: PocketTtsModels = PocketTtsModels.default(context),
         ): PocketTtsConfig {
             val dir = context.getExternalFilesDir(null) ?: context.filesDir
-            val npuLmGraphInstalled = models.store.exists(
-                PocketTts.g5Variant(PocketTts.LM_G5_HIGH_PERFORMANCE),
-            )
+            val npuLmGraphInstalled = models.store.exists(PocketTts.LM_G5_HIGH_PERFORMANCE)
             val placement = Placement.default(context, dir, npuLmGraphInstalled)
             val useNpuFlowLm = placement.lm == Accel.NPU
             return PocketTtsConfig(

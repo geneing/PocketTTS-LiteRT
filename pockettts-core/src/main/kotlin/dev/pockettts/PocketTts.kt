@@ -51,9 +51,9 @@ object PocketTts {
      */
     const val LM = "pt_flowlm_fused_dyn8_all.tflite"
 
-    /** Tuned static W8/A16 FlowLM graph used by the Tensor G5 NPU default. */
+    /** Compiled static W8/A16 FlowLM AOT graph used by the Tensor G5 default. */
     const val LM_G5_HIGH_PERFORMANCE =
-        "pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite"
+        "pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite"
 
     /**
      * Name `litert_torch` gives the fused graph's default signature. The
@@ -84,8 +84,9 @@ object PocketTts {
 
     const val DEC_TX = "pt_mimi_dec_tx_fp16.tflite"
 
-    /** AOT-compiled Tensor G5 variant of a stock graph (NPU placement). */
-    fun g5Variant(name: String) = name.replace(".tflite", "_g5.tflite")
+    /** AOT-compiled Tensor G5 graph (NPU placement); accepts base or compiled names. */
+    fun g5Variant(name: String) =
+        if (name.endsWith("_g5.tflite")) name else name.replace(".tflite", "_g5.tflite")
 
     /** One-shot SEANet decoder. */
     const val DECONLY = "pt_mimi_deconly_fp16.tflite"
