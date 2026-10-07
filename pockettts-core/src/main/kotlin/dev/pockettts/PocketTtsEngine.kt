@@ -172,7 +172,7 @@ class PocketTtsEngine(
     internal val usesGpuOpenClCache: Boolean = config.gpuOpenClCache
     private val gpuOpenClRunner: GpuOpenClLmRunner? = if (usesGpuOpenClCache) {
         val started = System.nanoTime()
-        GpuOpenClLmRunner(models.store.file(lmGraphName)).also {
+        GpuOpenClLmRunner(models.store.file(lmGraphName), config.gpuOpenClHighPriority).also {
             check(it.ready) { "GPU OpenCL packed cache requirements failed: ${it.details}" }
             loadMs["lm_opencl"] = (System.nanoTime() - started) / 1_000_000
             android.util.Log.i("PocketTTSTime", it.details)

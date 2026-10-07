@@ -4,8 +4,8 @@ import java.io.Closeable
 import java.io.File
 
 /** Experimental GPU FlowLM path with persistent OpenCL packed K/V inputs. */
-class GpuOpenClLmRunner(graph: File) : Closeable {
-    private var handle = GpuOpenClLmBridge.open(graph.absolutePath)
+class GpuOpenClLmRunner(graph: File, highPriority: Boolean = false) : Closeable {
+    private var handle = GpuOpenClLmBridge.open(graph.absolutePath, highPriority)
 
     val details: String get() = GpuOpenClLmBridge.details(requireHandle())
     val ready: Boolean get() = GpuOpenClLmBridge.ready(requireHandle())
@@ -39,7 +39,7 @@ data class GpuOpenClLmStep(val packed: FloatArray, val timingsNs: LongArray)
 internal object GpuOpenClLmBridge {
     init { System.loadLibrary("pockettts_gpu_opencl") }
 
-    external fun open(path: String): Long
+    external fun open(path: String, highPriority: Boolean): Long
     external fun details(handle: Long): String
     external fun ready(handle: Long): Boolean
     external fun seed(handle: Long, k: FloatArray, v: FloatArray)

@@ -16,6 +16,7 @@ constexpr int kGpu = 1 << 1;
 constexpr int kFloat32 = 1;
 constexpr int kAhwb = 2;
 constexpr int kOpenClBufferPacked = 14;
+constexpr int kGpuPriorityHigh = 3;
 constexpr int kRead = 0;
 constexpr int kWrite = 1;
 
@@ -49,6 +50,13 @@ using DestroyModel = void (*)(Handle);
 using CreateOptions = Status (*)(Handle*);
 using DestroyOptions = void (*)(Handle);
 using SetHardwareAccelerators = Status (*)(Handle, int);
+using CreateGpuOptions = Status (*)(Handle*);
+using DestroyGpuOptions = void (*)(Handle);
+using SetGpuPriority = Status (*)(Handle, int);
+using GetOpaqueGpuOptionsData = Status (*)(Handle, const char**, void**,
+                                           void (**)(void*));
+using CreateOpaqueOptions = Status (*)(const char*, void*, void (*)(void*), Handle*);
+using AddOpaqueOptions = Status (*)(Handle, Handle);
 using CreateCompiledModel = Status (*)(Handle, Handle, Handle, Handle*);
 using DestroyCompiledModel = void (*)(Handle);
 using GetInputRequirements = Status (*)(Handle, size_t, size_t, Handle*);

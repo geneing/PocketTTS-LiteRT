@@ -55,6 +55,12 @@ struct Api {
   CreateOptions create_options = nullptr;
   DestroyOptions destroy_options = nullptr;
   SetHardwareAccelerators set_accelerators = nullptr;
+  CreateGpuOptions create_gpu_options = nullptr;
+  DestroyGpuOptions destroy_gpu_options = nullptr;
+  SetGpuPriority set_gpu_priority = nullptr;
+  GetOpaqueGpuOptionsData get_opaque_gpu_data = nullptr;
+  CreateOpaqueOptions create_opaque_options = nullptr;
+  AddOpaqueOptions add_opaque_options = nullptr;
   CreateCompiledModel create_compiled = nullptr;
   DestroyCompiledModel destroy_compiled = nullptr;
   GetInputRequirements input_req = nullptr;
@@ -91,6 +97,14 @@ const Api& api() {
     RESOLVE(create_options, "LiteRtCreateOptions");
     RESOLVE(destroy_options, "LiteRtDestroyOptions");
     RESOLVE(set_accelerators, "LiteRtSetOptionsHardwareAccelerators");
+    // The pinned Android AAR may omit the public GPU-options builder symbols.
+    // Resolve only for the opt-in priority experiment; default GPU stays usable.
+    x.create_gpu_options = reinterpret_cast<CreateGpuOptions>(dlsym(x.library, "LrtCreateGpuOptions"));
+    x.destroy_gpu_options = reinterpret_cast<DestroyGpuOptions>(dlsym(x.library, "LrtDestroyGpuOptions"));
+    x.set_gpu_priority = reinterpret_cast<SetGpuPriority>(dlsym(x.library, "LrtSetGpuOptionsGpuPriority"));
+    x.get_opaque_gpu_data = reinterpret_cast<GetOpaqueGpuOptionsData>(dlsym(x.library, "LrtGetOpaqueGpuOptionsData"));
+    RESOLVE(create_opaque_options, "LiteRtCreateOpaqueOptions");
+    RESOLVE(add_opaque_options, "LiteRtAddOpaqueOptions");
     RESOLVE(create_compiled, "LiteRtCreateCompiledModel");
     RESOLVE(destroy_compiled, "LiteRtDestroyCompiledModel");
     RESOLVE(input_req, "LiteRtGetCompiledModelInputBufferRequirements");
@@ -164,6 +178,7 @@ size_t elements(const Layout& shape) {
 struct Runner {
   const Api& a = api();
   Handle env = nullptr, model = nullptr, options = nullptr, compiled = nullptr;
+  Handle gpu_options = nullptr;
   std::array<Handle, kInputs> inputs{};
   Handle output = nullptr;
   const ClApi& cl = cl_api();
@@ -177,6 +192,7 @@ struct Runner {
     for (auto& input : inputs) if (input) a.destroy_buffer(input);
     if (compiled) a.destroy_compiled(compiled);
     if (options) a.destroy_options(options);
+    if (gpu_options) a.destroy_gpu_options(gpu_options);
     if (model) a.destroy_model(model);
     if (env) a.destroy_env(env);
   }
@@ -205,13 +221,34 @@ struct Runner {
     return s;
   }
 
-  void init(const char* path) {
+  void init(const char* path, bool high_priority) {
     checked(a.create_env(0, nullptr, &env), "create environment");
     checked(a.create_model(env, path, &model), "create model");
     checked(a.create_options(&options), "create options");
     checked(a.set_accelerators(options, kGpu), "request GPU");
+    if (high_priority) {
+      if (!a.create_gpu_options || !a.destroy_gpu_options ||
+          !a.set_gpu_priority || !a.get_opaque_gpu_data) {
+        throw std::runtime_error(
+            "GPU HIGH priority unavailable: pinned LiteRT 2.2.0 AAR omits "
+            "public Lrt*GpuOptions symbols");
+      }
+      checked(a.create_gpu_options(&gpu_options), "create GPU options");
+      checked(a.set_gpu_priority(gpu_options, kGpuPriorityHigh),
+              "set public GPU high priority");
+      const char* identifier = nullptr;
+      void* payload = nullptr;
+      void (*payload_deleter)(void*) = nullptr;
+      checked(a.get_opaque_gpu_data(gpu_options, &identifier, &payload,
+                                    &payload_deleter), "serialize GPU options");
+      Handle opaque = nullptr;
+      checked(a.create_opaque_options(identifier, payload, payload_deleter,
+                                      &opaque), "create opaque GPU options");
+      checked(a.add_opaque_options(options, opaque), "attach GPU options");
+    }
     checked(a.create_compiled(env, model, options, &compiled), "compile GPU model");
-    details = "LiteRT 2.2.0 C GPU OpenCL packed cache";
+    details = std::string("LiteRT 2.2.0 C GPU OpenCL packed cache priority=") +
+              (high_priority ? "HIGH(3)" : "default");
 
     std::array<Handle, kInputs> requirements{};
     for (int i = 0; i < kInputs; ++i) {
@@ -418,7 +455,8 @@ Runner* runner(jlong pointer) {
 }  // namespace
 
 extern "C" JNIEXPORT jlong JNICALL
-Java_dev_pockettts_GpuOpenClLmBridge_open(JNIEnv* env, jobject, jstring path) {
+Java_dev_pockettts_GpuOpenClLmBridge_open(JNIEnv* env, jobject, jstring path,
+                                          jboolean high_priority) {
   try {
     if (!path) throw std::runtime_error("null FlowLM graph path");
     const char* utf = env->GetStringUTFChars(path, nullptr);
@@ -426,7 +464,7 @@ Java_dev_pockettts_GpuOpenClLmBridge_open(JNIEnv* env, jobject, jstring path) {
     std::string name(utf);
     env->ReleaseStringUTFChars(path, utf);
     auto value = std::make_unique<Runner>();
-    value->init(name.c_str());
+    value->init(name.c_str(), high_priority);
     return static_cast<jlong>(reinterpret_cast<intptr_t>(value.release()));
   } catch (const std::exception& e) {
     java_fail(env, e.what());

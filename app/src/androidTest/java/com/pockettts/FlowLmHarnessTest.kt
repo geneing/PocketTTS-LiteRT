@@ -444,6 +444,7 @@ class FlowLmHarnessTest {
     /** Probe OpenCL packed-buffer compatibility, then compare a short cache-chained GPU prompt to CPU FP16. */
     @Test
     fun gpuOpenClPromptGate() {
+        val priorityHigh = args.getString("gpuPriorityHigh")?.toBooleanStrictOrNull() ?: false
         val graph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
             ?: "pt_flowlm_fused_fp16_contiguous.tflite"
         val path = File(modelDir, graph)
@@ -453,7 +454,7 @@ class FlowLmHarnessTest {
             "prompt-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
         ).apply { mkdirs() }
         val lines = mutableListOf("FlowLM GPU OpenCL prompt gate", "graph=$graph sha256=${sha256(path)}")
-        GpuOpenClLmRunner(path).use { gpu ->
+        GpuOpenClLmRunner(path, priorityHigh).use { gpu ->
             lines += gpu.details
             File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
             assertTrue("OpenCL packed-buffer compatibility or cache requirements failed; report=$runDir", gpu.ready)
@@ -511,6 +512,7 @@ class FlowLmHarnessTest {
     @Test
     fun gpuSpeechPair() {
         val openClCache = args.getString("gpuOpenClCache")?.toBooleanStrictOrNull() ?: false
+        val priorityHigh = args.getString("gpuPriorityHigh")?.toBooleanStrictOrNull() ?: false
         val gpuGraph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
             ?: "pt_flowlm_fused_fp16.tflite"
         val referenceGraph = args.getString("referenceGraph")?.trim()?.takeIf { it.isNotEmpty() }
@@ -557,6 +559,7 @@ class FlowLmHarnessTest {
                     noiseSeed = seed,
                     gpuCache = gpuProgramCache,
                     gpuOpenClCache = isGpu && openClCache,
+                    gpuOpenClHighPriority = isGpu && priorityHigh,
                 ),
             )
             try {
@@ -622,7 +625,7 @@ class FlowLmHarnessTest {
             "FlowLM fused GPU speech pair",
             "device=${Build.MODEL}/${Build.DEVICE} android=${Build.VERSION.RELEASE} fingerprint=${Build.FINGERPRINT}",
             "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
-            "gpuGraph=$gpuGraph sha256=${sha256(File(modelDir, gpuGraph))} gpuProgramCache=$gpuProgramCache openClCache=$openClCache",
+            "gpuGraph=$gpuGraph sha256=${sha256(File(modelDir, gpuGraph))} gpuProgramCache=$gpuProgramCache openClCache=$openClCache priorityHigh=$priorityHigh",
             "referenceGraph=$referenceGraph sha256=${sha256(File(modelDir, referenceGraph))}",
             "powerMonitors=${monitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
             "gpuPlacement=${gpu.backends} loadMs=${gpu.loadMs} pssKb=${gpu.pssBeforeRunKb}->${gpu.pssAfterRunKb}",
