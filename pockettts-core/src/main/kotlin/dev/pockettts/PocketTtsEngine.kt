@@ -89,6 +89,8 @@ class PocketTtsEngine(
                     val opts = CompiledModel.Options(Accelerator.GPU)
                     val gpu = if (accel == Accel.GPU32) {
                         CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
+                    } else if (key == "lm" && config.gpuLmPriorityHigh) {
+                        CompiledModel.GpuOptions(priority = CompiledModel.GpuOptions.Priority.HIGH)
                     } else {
                         CompiledModel.GpuOptions()
                     }

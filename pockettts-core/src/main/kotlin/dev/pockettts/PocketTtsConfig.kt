@@ -76,6 +76,8 @@ class PocketTtsConfig(
     val verifyNpuSliceRows: Boolean = false,
     /** Opt-in GPU FlowLM with position-major K/V in persistent OpenCL packed buffers. */
     val gpuOpenClCache: Boolean = false,
+    /** Opt-in Kotlin CompiledModel GPU priority for the standard FlowLM path only. */
+    val gpuLmPriorityHigh: Boolean = false,
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }
@@ -103,6 +105,11 @@ class PocketTtsConfig(
             require(lmGraph != null) { "OpenCL cache requires its position-major lmGraph" }
             require(lmSteps == 1 && !usePrefill) { "OpenCL cache requires single-step FlowLM" }
             require(!npuResidentCache && !npuSliceCache) { "select one cache protocol" }
+        }
+        if (gpuLmPriorityHigh) {
+            require(placement.lm == Accel.GPU && !gpuOpenClCache) {
+                "Kotlin GPU HIGH priority requires the standard lm:GPU path"
+            }
         }
     }
 

@@ -507,10 +507,46 @@ class FlowLmHarnessTest {
         }
     }
 
+    /** Compare public Kotlin GPU HIGH priority to the default on one short prompt. */
+    @Test
+    fun gpuKotlinPriorityPromptGate() {
+        val graph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "pt_flowlm_fused_fp16.tflite"
+        val tokenIds = SpTokenizer(File(modelDir, PocketTts.TOKENIZER)).encode("Hello there.")
+        val voice = readVoice(File(modelDir, PocketTts.voiceFile("alba")))
+        val embed = File(modelDir, PocketTts.EMBED).readBytes()
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-gpu-priority")
+                ?: File(context.filesDir, "flowlm-gpu-priority"),
+            "prompt-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+        val normal = runPrompt(Accel.GPU, graph, tokenIds, embed, voice, null)
+        val high = runPrompt(Accel.GPU, graph, tokenIds, embed, voice, null,
+            gpuPriorityHigh = true)
+        val cpu = runPrompt(Accel.CPU, graph, tokenIds, embed, voice, null)
+        val priorityParity = metrics(normal.output, high.output)
+        val cpuParity = metrics(cpu.output, high.output)
+        writeFloats(File(runDir, "gpu-high.f32le"), high.output)
+        writeFloats(File(runDir, "gpu-default.f32le"), normal.output)
+        val lines = listOf(
+            "FlowLM Kotlin GPU HIGH-priority prompt gate",
+            "graph=$graph sha256=${sha256(File(modelDir, graph))} voice=alba tokens=${tokenIds.size}",
+            "gpuDefault loadMs=${normal.loadMs} inputMs=${normal.inputMs} runMs=${normal.runMs} readMs=${normal.readMs}",
+            "gpuHigh loadMs=${high.loadMs} inputMs=${high.inputMs} runMs=${high.runMs} readMs=${high.readMs}",
+            "gpuHighVsDefault corr=${priorityParity.corr} mad=${priorityParity.mad} msd=${priorityParity.msd}",
+            "gpuHighVsCpuFp16 corr=${cpuParity.corr} mad=${cpuParity.mad} msd=${cpuParity.msd}",
+        )
+        File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
+        lines.forEach { Log.i(TAG, it) }
+        assertTrue("GPU HIGH changed FP16 prompt output: $priorityParity", priorityParity.corr > 0.99999)
+        assertTrue("GPU HIGH diverged from CPU FP16: $cpuParity", cpuParity.corr > 0.999)
+    }
+
     /** Opt-in long speech comparison of the fused GPU FlowLM and shipped CPU int8. */
     @Test
     fun gpuSpeechPair() {
         val openClCache = args.getString("gpuOpenClCache")?.toBooleanStrictOrNull() ?: false
+        val priorityHigh = args.getString("gpuLmPriorityHigh")?.toBooleanStrictOrNull() ?: false
         val gpuGraph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
             ?: "pt_flowlm_fused_fp16.tflite"
         val referenceGraph = args.getString("referenceGraph")?.trim()?.takeIf { it.isNotEmpty() }
@@ -557,6 +593,7 @@ class FlowLmHarnessTest {
                     noiseSeed = seed,
                     gpuCache = gpuProgramCache,
                     gpuOpenClCache = isGpu && openClCache,
+                    gpuLmPriorityHigh = isGpu && priorityHigh,
                 ),
             )
             try {
@@ -622,7 +659,7 @@ class FlowLmHarnessTest {
             "FlowLM fused GPU speech pair",
             "device=${Build.MODEL}/${Build.DEVICE} android=${Build.VERSION.RELEASE} fingerprint=${Build.FINGERPRINT}",
             "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
-            "gpuGraph=$gpuGraph sha256=${sha256(File(modelDir, gpuGraph))} gpuProgramCache=$gpuProgramCache openClCache=$openClCache",
+            "gpuGraph=$gpuGraph sha256=${sha256(File(modelDir, gpuGraph))} gpuProgramCache=$gpuProgramCache openClCache=$openClCache kotlinPriorityHigh=$priorityHigh",
             "referenceGraph=$referenceGraph sha256=${sha256(File(modelDir, referenceGraph))}",
             "powerMonitors=${monitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
             "gpuPlacement=${gpu.backends} loadMs=${gpu.loadMs} pssKb=${gpu.pssBeforeRunKb}->${gpu.pssAfterRunKb}",
@@ -790,6 +827,7 @@ class FlowLmHarnessTest {
         embedBytes: ByteArray,
         voice: VoiceState,
         environment: Environment?,
+        gpuPriorityHigh: Boolean = false,
     ): Run {
         check(backend != Accel.NPU || environment != null) { "NPU environment is unavailable" }
         val path = File(modelDir, graph)
@@ -802,6 +840,8 @@ class FlowLmHarnessTest {
         val options = CompiledModel.Options(accelerator)
         if (backend == Accel.GPU32) {
             options.gpuOptions = CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
+        } else if (backend == Accel.GPU && gpuPriorityHigh) {
+            options.gpuOptions = CompiledModel.GpuOptions(priority = CompiledModel.GpuOptions.Priority.HIGH)
         }
         val loadStart = System.nanoTime()
         val model = CompiledModel.create(path.absolutePath, options, if (backend == Accel.NPU) environment else null)
