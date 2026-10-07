@@ -13,6 +13,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Spinner
 import android.widget.TextView
+import dev.pockettts.BuildConfig
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsEngine
 import dev.pockettts.PocketTtsModels
@@ -72,7 +73,11 @@ class MainActivity : Activity() {
             )
         }
         button = Button(this).apply { text = "Generate"; isEnabled = false }
-        benchButton = Button(this).apply { text = "Benchmark"; isEnabled = false }
+        benchButton = Button(this).apply {
+            text = "Benchmark"
+            isEnabled = false
+            if (!BuildConfig.DEBUG) visibility = android.view.View.GONE
+        }
         status = TextView(this).apply { text = "Loading model…"; textSize = 14f }
         waveform = WaveformView(this)
         val topMargins = intArrayOf(0, 24, 32, 8, 24)
@@ -99,7 +104,7 @@ class MainActivity : Activity() {
                 return@execute
             }
             engine = e
-            android.util.Log.i("PocketTTS", "ready (${e.placements})")
+            if (BuildConfig.DEBUG) android.util.Log.i("PocketTTS", "ready (${e.placements})")
             runOnUiThread {
                 status.text = "Ready (${e.placements})."
                 button.isEnabled = true
@@ -128,14 +133,20 @@ class MainActivity : Activity() {
                     track.release()
                     saveWav(r.audio, voice)
                     val secs = r.audio.size.toFloat() / PocketTts.SAMPLE_RATE
-                    val line = (
-                        "Spoke %.1fs (%d frames) in %d ms wall — first audio %d ms, " +
-                            "%d chunks (%s)"
-                        ).format(
-                        secs, r.frames, r.ms,
-                        r.profile.firstChunkMs, r.profile.audioChunks, e.placements,
-                    )
-                    android.util.Log.i("PocketTTS", line)
+                    val line = if (BuildConfig.DEBUG) {
+                        (
+                            "Spoke %.1fs (%d frames) in %d ms wall — first audio %d ms, " +
+                                "%d chunks (%s)"
+                            ).format(
+                            secs, r.frames, r.ms,
+                            r.profile.firstChunkMs, r.profile.audioChunks, e.placements,
+                        )
+                    } else {
+                        "Spoke %.1fs (%d frames) in %d ms wall (%s)".format(
+                            secs, r.frames, r.ms, e.placements,
+                        )
+                    }
+                    if (BuildConfig.DEBUG) android.util.Log.i("PocketTTS", line)
                     runOnUiThread {
                         status.text = line
                         button.isEnabled = true
@@ -208,7 +219,7 @@ class MainActivity : Activity() {
                 }
             }
         }
-        if (i.getBooleanExtra("bench", false)) {
+        if (BuildConfig.DEBUG && i.getBooleanExtra("bench", false)) {
             benchRuns = i.getIntExtra("runs", 3)
             if (benchButton.isEnabled) benchButton.performClick()
             return

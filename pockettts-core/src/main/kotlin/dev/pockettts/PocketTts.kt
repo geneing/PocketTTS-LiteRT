@@ -176,7 +176,7 @@ data class Voice(
     }
 }
 
-/** Stage timings for one synthesis call (ms unless noted). */
+/** Stage timings for one synthesis call (ms unless noted); populated in debug builds. */
 data class TtsProfile(
     val lmSteps: Int,
     val promptSteps: Int,

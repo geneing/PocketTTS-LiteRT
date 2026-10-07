@@ -6,6 +6,7 @@ import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
 import android.speech.tts.TextToSpeechService
 import android.speech.tts.Voice
+import dev.pockettts.BuildConfig
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsEngine
 import dev.pockettts.PocketTtsSession
@@ -62,13 +63,15 @@ class PocketTtsService : TextToSpeechService() {
         // bind and submit synthesis requests; otherwise the first request pays
         // this multi-second startup cost before it can receive even its first PCM.
         val preload = Thread({
-            val started = System.nanoTime()
+            val started = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             try {
                 engine()
-                android.util.Log.i(
-                    "PocketTTSTime",
-                    "service engine preload ready in ${(System.nanoTime() - started) / 1_000_000}ms",
-                )
+                if (BuildConfig.DEBUG) {
+                    android.util.Log.i(
+                        "PocketTTSTime",
+                        "service engine preload ready in ${(System.nanoTime() - started) / 1_000_000}ms",
+                    )
+                }
             } catch (e: Throwable) {
                 android.util.Log.e(TAG, "engine preload failed; synthesis will retry lazily", e)
             }
@@ -130,23 +133,27 @@ class PocketTtsService : TextToSpeechService() {
             if (requestedPitch == DEFAULT_PITCH) defaultPitch() else requestedPitch / 100f
             ).coerceIn(PocketTtsSettings.MIN_PITCH, PocketTtsSettings.MAX_PITCH)
 
-        val t0 = System.nanoTime()
-        val utt = UTTERANCE.incrementAndGet()
-        android.util.Log.i(
-            "PocketTTSTime",
-            "service synth#$utt chars=${text.length} voice=${voice.name} rate=$rate pitch=$pitch",
-        )
+        val t0 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
+        val utt = if (BuildConfig.DEBUG) UTTERANCE.incrementAndGet() else 0L
+        if (BuildConfig.DEBUG) {
+            android.util.Log.i(
+                "PocketTTSTime",
+                "service synth#$utt chars=${text.length} voice=${voice.name} rate=$rate pitch=$pitch",
+            )
+        }
 
         val session: PocketTtsSession
         try {
-            val loadT = System.nanoTime()
+            val loadT = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             session = engine().newSession(voice.name)
-            val loadMs = (System.nanoTime() - loadT) / 1_000_000
-            if (loadMs >= 30) {
-                android.util.Log.i(
-                    "PocketTTSTime",
-                    "service #$utt engine+session=${loadMs}ms",
-                )
+            if (BuildConfig.DEBUG) {
+                val loadMs = (System.nanoTime() - loadT) / 1_000_000
+                if (loadMs >= 30) {
+                    android.util.Log.i(
+                        "PocketTTSTime",
+                        "service #$utt engine+session=${loadMs}ms",
+                    )
+                }
             }
         } catch (e: Throwable) {
             android.util.Log.e(TAG, "engine load failed", e)
@@ -207,7 +214,7 @@ class PocketTtsService : TextToSpeechService() {
                 val chunk = queue.take()
                 if (chunk === sentinel) break
                 if (stopped) continue
-                if (firstAudio < 0) {
+                if (BuildConfig.DEBUG && firstAudio < 0) {
                     firstAudio = (System.nanoTime() - t0) / 1_000_000
                     android.util.Log.i(
                         "PocketTTSTime",
@@ -223,12 +230,14 @@ class PocketTtsService : TextToSpeechService() {
                 }
             }
             producerError?.let { throw it }
-            android.util.Log.i(
-                "PocketTTSTime",
-                "service #$utt done=${(System.nanoTime() - t0) / 1_000_000}ms " +
-                    "firstAudio=${firstAudio}ms audioAvailable=${out.calls} pcm=${out.bytes}B " +
-                    "callbackTotal=${out.callbackTotalMs}ms callbackMax=${out.callbackMaxMs}ms",
-            )
+            if (BuildConfig.DEBUG) {
+                android.util.Log.i(
+                    "PocketTTSTime",
+                    "service #$utt done=${(System.nanoTime() - t0) / 1_000_000}ms " +
+                        "firstAudio=${firstAudio}ms audioAvailable=${out.calls} pcm=${out.bytes}B " +
+                        "callbackTotal=${out.callbackTotalMs}ms callbackMax=${out.callbackMaxMs}ms",
+                )
+            }
         } catch (e: Throwable) {
             failed = true
             session.cancel()
@@ -287,13 +296,15 @@ class PocketTtsService : TextToSpeechService() {
                     buf[o++] = ((s shr 8) and 0xFF).toByte()
                 }
                 i += take
-                val callT = System.nanoTime()
+                val callT = if (BuildConfig.DEBUG) System.nanoTime() else 0L
                 val stopped = callback.audioAvailable(buf, 0, o) == TextToSpeech.STOPPED
-                val callMs = (System.nanoTime() - callT) / 1_000_000
-                callbackTotalMs += callMs
-                callbackMaxMs = maxOf(callbackMaxMs, callMs)
-                calls++
-                bytes += o
+                if (BuildConfig.DEBUG) {
+                    val callMs = (System.nanoTime() - callT) / 1_000_000
+                    callbackTotalMs += callMs
+                    callbackMaxMs = maxOf(callbackMaxMs, callMs)
+                    calls++
+                    bytes += o
+                }
                 if (stopped) return false
             }
             return true

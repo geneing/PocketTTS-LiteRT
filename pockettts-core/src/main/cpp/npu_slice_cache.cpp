@@ -252,7 +252,7 @@ Java_dev_pockettts_NpuSliceCacheBridge_update(
   const auto& a = api();
   if (!a.valid()) { fail(env, "LiteRT 2.2.0 tensor buffer C ABI unavailable"); return nullptr; }
   if (!geometry(env, position, capacity, groups, head_dim)) return nullptr;
-  if (!timings || env->GetArrayLength(timings) < 4) {
+  if (timings && env->GetArrayLength(timings) < 4) {
     fail(env, "cache timing array must have four entries"); return nullptr;
   }
   Buffer k = handle(env, cache_k_obj);
@@ -267,12 +267,13 @@ Java_dev_pockettts_NpuSliceCacheBridge_update(
                    "FlowLM output")) return nullptr;
 
   Mapped output(a, out), cache_k(a, k), cache_v(a, v);
-  const int64_t t0 = now_ns();
+  const bool collect_timings = timings != nullptr;
+  const int64_t t0 = collect_timings ? now_ns() : 0;
   if (!output.map(env, kRead, "FlowLM output")) return nullptr;
-  const int64_t t1 = now_ns();
+  const int64_t t1 = collect_timings ? now_ns() : 0;
   if (!cache_k.map(env, kReadWrite, "K cache") ||
       !cache_v.map(env, kReadWrite, "V cache")) return nullptr;
-  const int64_t t2 = now_ns();
+  const int64_t t2 = collect_timings ? now_ns() : 0;
 
   const auto* values = static_cast<const float*>(output.data);
   auto* keys = static_cast<float*>(cache_k.data);
@@ -295,12 +296,14 @@ Java_dev_pockettts_NpuSliceCacheBridge_update(
                   head_dim * sizeof(float));
     }
   }
-  const int64_t t3 = now_ns();
+  const int64_t t3 = collect_timings ? now_ns() : 0;
   if (!cache_k.unmap(env, "K cache") || !cache_v.unmap(env, "V cache") ||
       !output.unmap(env, "FlowLM output")) return nullptr;
-  const int64_t t4 = now_ns();
-  const jlong stages[] = {t1 - t0, t2 - t1, t3 - t2, t4 - t3};
-  env->SetLongArrayRegion(timings, 0, 4, stages);
+  if (collect_timings) {
+    const int64_t t4 = now_ns();
+    const jlong stages[] = {t1 - t0, t2 - t1, t3 - t2, t4 - t3};
+    env->SetLongArrayRegion(timings, 0, 4, stages);
+  }
   return control;
 }
 

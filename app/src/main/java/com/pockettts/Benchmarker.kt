@@ -1,6 +1,7 @@
 package com.pockettts
 
 import android.content.Context
+import dev.pockettts.BuildConfig
 import dev.pockettts.Accel
 import dev.pockettts.Placement
 import dev.pockettts.PocketTts
@@ -63,6 +64,7 @@ class Benchmarker(private val context: Context) {
     )
 
     fun run(text: String, voice: String, repeats: Int): String {
+        check(BuildConfig.DEBUG) { "benchmarking is available only in debug builds" }
         val sb = StringBuilder()
         // gold first (it is the audio reference), then the NPU cases: LiteRT's
         // environment is process-global and the *first* load fixes dispatch
@@ -192,7 +194,7 @@ class Benchmarker(private val context: Context) {
 
         val report = sb.toString()
         File(context.filesDir, "benchmark.txt").writeText(report)
-        report.lines().forEach { android.util.Log.i("PocketTTSBench", it) }
+        if (BuildConfig.DEBUG) report.lines().forEach { android.util.Log.i("PocketTTSBench", it) }
         return report
     }
 

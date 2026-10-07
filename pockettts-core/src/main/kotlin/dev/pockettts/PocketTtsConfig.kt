@@ -209,19 +209,21 @@ class SonicStretcher(
     fun push(chunk: FloatArray): FloatArray {
         val s = stream ?: return chunk
         if (chunk.isEmpty()) return chunk
-        val t = System.nanoTime()
+        val t = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         s.writeFloatToStream(chunk, chunk.size)
         val out = read(s)
-        val ms = (System.nanoTime() - t) / 1_000_000
-        sonicMs += ms
-        inSamples += chunk.size
-        outSamples += out.size
-        pushes++
-        Log.i(
-            "PocketTTSTime",
-            "sonic push#$pushes in=${chunk.size} out=${out.size} ${ms}ms " +
-                "(speed=$speed pitch=$shifted)",
-        )
+        if (BuildConfig.DEBUG) {
+            val ms = (System.nanoTime() - t) / 1_000_000
+            sonicMs += ms
+            inSamples += chunk.size
+            outSamples += out.size
+            pushes++
+            Log.i(
+                "PocketTTSTime",
+                "sonic push#$pushes in=${chunk.size} out=${out.size} ${ms}ms " +
+                    "(speed=$speed pitch=$shifted)",
+            )
+        }
         return out
     }
 

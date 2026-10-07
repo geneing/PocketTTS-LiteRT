@@ -7,6 +7,10 @@ android {
     namespace = "dev.pockettts"
     compileSdk = 35
 
+    buildFeatures {
+        buildConfig = true
+    }
+
     defaultConfig {
         // 31+ because the Tensor G5 NPU dispatch runtime requires it.
         minSdk = 31

@@ -16,7 +16,7 @@ internal object NpuSliceCacheBridge {
         cacheK: TensorBuffer, cacheV: TensorBuffer, stepOutput: TensorBuffer,
         position: Int, capacity: Int, groups: Int, headDim: Int,
         positionMajor: Boolean,
-        timings: LongArray,
+        timings: LongArray?,
     ): FloatArray
 
     /** Exact row check for opt-in diagnostics; returns the maximum absolute difference. */

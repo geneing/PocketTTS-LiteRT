@@ -133,11 +133,17 @@ class PocketTtsSession internal constructor(
         }
         pos = voiceLen
         if (engine.usesNpuResidentCache) {
-            sLmIn += engine.resetNpuResidentCache(pk, pv)
-            sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+            val cacheInitNs = engine.resetNpuResidentCache(pk, pv)
+            if (BuildConfig.DEBUG) {
+                sLmIn += cacheInitNs
+                sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+            }
         } else if (engine.usesNpuSliceCache) {
-            sLmIn += engine.resetNpuSliceCache(pk, pv)
-            sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+            val cacheInitNs = engine.resetNpuSliceCache(pk, pv)
+            if (BuildConfig.DEBUG) {
+                sLmIn += cacheInitNs
+                sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+            }
         }
     }
 
@@ -196,7 +202,7 @@ class PocketTtsSession internal constructor(
         val sin = engine.prefillSin
         val msk = engine.prefillMask
         val wr = engine.prefillWrite
-        val t0 = System.nanoTime()
+        val t0 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         var runNs = 0L
         var i = 0
         while (i < ids.size && !cancelled) {
@@ -225,9 +231,9 @@ class PocketTtsSession internal constructor(
             ins[4].writeFloat(wr)
             ins[5].writeFloat(pk)
             ins[6].writeFloat(pv)
-            val rt = System.nanoTime()
+            val rt = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             engine.lm.run(ins, outs, 0)
-            runNs += System.nanoTime() - rt
+            if (BuildConfig.DEBUG) runNs += System.nanoTime() - rt
             val out = outs[0].readFloat()
             var o = 0
             for (j in 0 until n) {
@@ -246,11 +252,13 @@ class PocketTtsSession internal constructor(
             pos += n
             i += n
         }
-        val t1 = System.nanoTime()
-        sLmIn += (t1 - t0) - runNs
-        sLmRun += runNs
-        sLmSteps += ids.size
-        sLmInv += (ids.size + p - 1) / p
+        if (BuildConfig.DEBUG) {
+            val t1 = System.nanoTime()
+            sLmIn += (t1 - t0) - runNs
+            sLmRun += runNs
+            sLmSteps += ids.size
+            sLmInv += (ids.size + p - 1) / p
+        }
     }
 
     /**
@@ -261,28 +269,30 @@ class PocketTtsSession internal constructor(
         check(pos < PMAX) { "KV cache overflow at $pos" }
         val out: FloatArray
         if (engine.usesNpuResidentCache || engine.usesNpuSliceCache) {
-            val prepareStart = System.nanoTime()
+            val prepareStart = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             ropeFill(pos)
-            val prepareNs = System.nanoTime() - prepareStart
+            val prepareNs = if (BuildConfig.DEBUG) System.nanoTime() - prepareStart else 0L
             val run = if (engine.usesNpuResidentCache) {
                 engine.runNpuResidentLm(emb, cosArr, sinArr, mask, noise, pos)
             } else {
                 engine.runNpuSliceLm(emb, cosArr, sinArr, mask, noise, pos)
             }
             out = run.control
-            sLmIn += prepareNs + run.inputNs
-            sLmRun += run.runNs
-            sLmRead += run.readNs
-            sLmOutputMap += run.outputMapNs
-            sLmCacheMap += run.cacheMapNs
-            sLmCacheCopy += run.cacheCopyNs
-            sLmCacheUnmap += run.cacheUnmapNs
-            sLmInBytes += (
-                emb.size + cosArr.size + sinArr.size + mask.size + noise.size +
-                    (if (engine.usesNpuResidentCache) PMAX else 0)
-                ).toLong() * Float.SIZE_BYTES
+            if (BuildConfig.DEBUG) {
+                sLmIn += prepareNs + run.inputNs
+                sLmRun += run.runNs
+                sLmRead += run.readNs
+                sLmOutputMap += run.outputMapNs
+                sLmCacheMap += run.cacheMapNs
+                sLmCacheCopy += run.cacheCopyNs
+                sLmCacheUnmap += run.cacheUnmapNs
+                sLmInBytes += (
+                    emb.size + cosArr.size + sinArr.size + mask.size + noise.size +
+                        (if (engine.usesNpuResidentCache) PMAX else 0)
+                    ).toLong() * Float.SIZE_BYTES
+            }
         } else {
-            val t0 = System.nanoTime()
+            val t0 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             ropeFill(pos)
             engine.lmIn[0].writeFloat(emb)
             engine.lmIn[1].writeFloat(cosArr)
@@ -291,16 +301,18 @@ class PocketTtsSession internal constructor(
             engine.lmIn[4].writeFloat(pk)
             engine.lmIn[5].writeFloat(pv)
             engine.lmIn[6].writeFloat(noise)
-            val t1 = System.nanoTime()
+            val t1 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             engine.runLm(engine.lmIn, engine.lmOut)
-            val t2 = System.nanoTime()
+            val t2 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             out = engine.lmOut[0].readFloat()
-            val t3 = System.nanoTime()
-            sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2
-            sLmInBytes += (
-                emb.size + cosArr.size + sinArr.size + mask.size +
-                    pk.size + pv.size + noise.size
-                ).toLong() * Float.SIZE_BYTES
+            val t3 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
+            if (BuildConfig.DEBUG) {
+                sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2
+                sLmInBytes += (
+                    emb.size + cosArr.size + sinArr.size + mask.size +
+                        pk.size + pv.size + noise.size
+                    ).toLong() * Float.SIZE_BYTES
+            }
         }
         val eos = out[0]
         val latent = out.copyOfRange(1, 1 + LDIM)
@@ -313,9 +325,11 @@ class PocketTtsSession internal constructor(
         }
         for (h in 0 until NH) mask[h * (PMAX + 1) + pos] = 0f
         pos++
-        sLmSteps++
-        sLmInv++
-        sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
+        if (BuildConfig.DEBUG) {
+            sLmSteps++
+            sLmInv++
+            sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
+        }
         return latent to eos
     }
 
@@ -331,7 +345,7 @@ class PocketTtsSession internal constructor(
     ): Pair<Array<FloatArray>, FloatArray> {
         val n = steps
         check(pos + n <= PMAX) { "multi-step KV cache overflow at $pos + $n" }
-        val t0 = System.nanoTime()
+        val t0 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         java.util.Arrays.fill(msWrite, 0f)
         for (i in 0 until n) {
             ropeFill(pos + i)
@@ -353,9 +367,9 @@ class PocketTtsSession internal constructor(
         ins[5].writeFloat(pk)
         ins[6].writeFloat(pv)
         ins[7].writeFloat(msNoise)
-        val t1 = System.nanoTime()
+        val t1 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         model.run(ins, outs)
-        val t2 = System.nanoTime()
+        val t2 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         val out = outs[0].readFloat()
         val eos = FloatArray(n)
         val lats = Array(n) { FloatArray(LDIM) }
@@ -381,13 +395,15 @@ class PocketTtsSession internal constructor(
             for (i in 0 until n) mask[base + pos + i] = 0f
         }
         pos += n
-        val t3 = System.nanoTime()
-        sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2; sLmSteps += n; sLmInv++
-        sLmInBytes += (
-            PocketTts.H + 2 * n * HD + n * (PMAX + 1) + n * PMAX +
-                2 * G * PMAX * HD + n * LDIM
-            ).toLong() * Float.SIZE_BYTES
-        sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
+        if (BuildConfig.DEBUG) {
+            val t3 = System.nanoTime()
+            sLmIn += t1 - t0; sLmRun += t2 - t1; sLmRead += t3 - t2; sLmSteps += n; sLmInv++
+            sLmInBytes += (
+                PocketTts.H + 2 * n * HD + n * (PMAX + 1) + n * PMAX +
+                    2 * G * PMAX * HD + n * LDIM
+                ).toLong() * Float.SIZE_BYTES
+            sLmOutBytes += out.size.toLong() * Float.SIZE_BYTES
+        }
         return lats to eos
     }
 
@@ -406,7 +422,9 @@ class PocketTtsSession internal constructor(
             val ids = engine.tokenizer.encode(prepared)
             val latents = generateChunk(ids, framesAfterEos = eosGuess + 2)
             frames += latents.size
-            sPrompt += ids.size; sFrames += latents.size; sChunks++
+            if (BuildConfig.DEBUG) {
+                sPrompt += ids.size; sFrames += latents.size; sChunks++
+            }
             if (latents.isNotEmpty()) audio.add(decode(latents))
         }
         val out = applyShaping(concat(audio))
@@ -440,7 +458,9 @@ class PocketTtsSession internal constructor(
             val (prepared, eosGuess) = prepareTextPrompt(chunk)
             val ids = engine.tokenizer.encode(prepared)
             val dec = StreamDecoder { c ->
-                if (sFirstChunk < 0) sFirstChunk = (System.nanoTime() - t0) / 1_000_000
+                if (BuildConfig.DEBUG && sFirstChunk < 0) {
+                    sFirstChunk = (System.nanoTime() - t0) / 1_000_000
+                }
                 val shaped = stretcher.push(c)
                 if (shaped.isNotEmpty()) {
                     all.add(shaped)
@@ -454,7 +474,9 @@ class PocketTtsSession internal constructor(
             dec.flush()
             codecTail = if (engine.codecContinuity) dec.tail() else null
             frames += lats.size
-            sPrompt += ids.size; sFrames += lats.size; sChunks++
+            if (BuildConfig.DEBUG) {
+                sPrompt += ids.size; sFrames += lats.size; sChunks++
+            }
         }
         engine.rememberCodecTail(codecTail)
         val tail = stretcher.finish()
@@ -463,12 +485,14 @@ class PocketTtsSession internal constructor(
             onChunk(tail)
         }
         val totalMs = (System.nanoTime() - t0) / 1_000_000
-        android.util.Log.i(
-            "PocketTTSTime",
-            "stream done: ${totalMs}ms textChunks=${textChunks.size} frames=$frames " +
-                "firstAudio=${sFirstChunk}ms lm=${sLmRun / 1_000_000}ms " +
-                "decTx=${sDecTx / 1_000_000}ms seanet=${sSeanet / 1_000_000}ms",
-        )
+        if (BuildConfig.DEBUG) {
+            android.util.Log.i(
+                "PocketTTSTime",
+                "stream done: ${totalMs}ms textChunks=${textChunks.size} frames=$frames " +
+                    "firstAudio=${sFirstChunk}ms lm=${sLmRun / 1_000_000}ms " +
+                    "decTx=${sDecTx / 1_000_000}ms seanet=${sSeanet / 1_000_000}ms",
+            )
+        }
         TtsResult(concat(all), frames, totalMs, snapshotProfile())
     }
 
@@ -664,7 +688,7 @@ class PocketTtsSession internal constructor(
 
     /** Mimi decode: overlapped dec_tx blocks -> one-shot SEANet window. */
     private fun decode(latents: List<FloatArray>): FloatArray {
-        val tDec = System.nanoTime()
+        val tDec = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         val t = minOf(latents.size, PocketTts.DEC_FRAMES)
         val feat = engine.decFeat
         val blk = engine.decBlk
@@ -701,12 +725,14 @@ class PocketTtsSession internal constructor(
             kept += n - PocketTts.F_HOP
         }
 
-        val tSeanet = System.nanoTime()
+        val tSeanet = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         engine.deconlyIn[0].writeFloat(feat)
         engine.deconly.run(engine.deconlyIn, engine.deconlyOut)
         val wav = engine.deconlyOut[0].readFloat()
-        sDecTx += tSeanet - tDec
-        sSeanet += System.nanoTime() - tSeanet
+        if (BuildConfig.DEBUG) {
+            sDecTx += tSeanet - tDec
+            sSeanet += System.nanoTime() - tSeanet
+        }
         return FloatArray(t * PocketTts.SPF) { wav[it].coerceIn(-1f, 1f) }
     }
 
@@ -832,10 +858,10 @@ class PocketTtsSession internal constructor(
                 System.arraycopy(src, 0, blk, (1 + f) * LDIM, LDIM)
             }
             engine.dectxIn[0].writeFloat(blk)
-            val t0 = System.nanoTime()
+            val t0 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             engine.dectx.run(engine.dectxIn, engine.dectxOut)
             val out = engine.dectxOut[0].readFloat()
-            sDecTx += System.nanoTime() - t0
+            if (BuildConfig.DEBUG) sDecTx += System.nanoTime() - t0
             val drop = if (start == 0) 0 else PocketTts.F_HOP
             val keepN = minOf(PocketTts.F_BLK, size - start) - drop
             val at = featBase + (start + drop) * PocketTts.UPS
@@ -864,15 +890,15 @@ class PocketTtsSession internal constructor(
                 System.arraycopy(feat, c * PocketTts.S_DEC + start, win, c * w, avail)
             }
             ins[0].writeFloat(win)
-            val t0 = System.nanoTime()
+            val t0 = if (BuildConfig.DEBUG) System.nanoTime() else 0L
             model.run(ins, outs)
             val wav = outs[0].readFloat()
-            sSeanet += System.nanoTime() - t0
+            if (BuildConfig.DEBUG) sSeanet += System.nanoTime() - t0
             val keep = minOf(start + w, featPos) - emitted
             val off = (emitted - start) * PocketTts.SPP
             val out = FloatArray(keep * PocketTts.SPP) { wav[off + it].coerceIn(-1f, 1f) }
             emitted += keep
-            sAudioChunks++
+            if (BuildConfig.DEBUG) sAudioChunks++
             onChunk(out)
         }
     }
@@ -901,27 +927,31 @@ class PocketTtsSession internal constructor(
         sFirstChunk = -1; sAudioChunks = 0
     }
 
-    private fun snapshotProfile() = TtsProfile(
-        lmSteps = sLmSteps,
-        promptSteps = sPrompt,
-        genFrames = sFrames,
-        lmInMs = sLmIn / 1_000_000,
-        lmRunMs = sLmRun / 1_000_000,
-        lmReadMs = sLmRead / 1_000_000,
-        decTxMs = sDecTx / 1_000_000,
-        seanetMs = sSeanet / 1_000_000,
-        chunks = sChunks,
-        lmInvocations = sLmInv,
-        lmInBytes = sLmInBytes,
-        lmOutBytes = sLmOutBytes,
-        firstChunkMs = sFirstChunk,
-        audioChunks = sAudioChunks,
-        lmOutputMapMs = sLmOutputMap / 1_000_000,
-        lmCacheMapMs = sLmCacheMap / 1_000_000,
-        lmCacheCopyMs = sLmCacheCopy / 1_000_000,
-        lmCacheUnmapMs = sLmCacheUnmap / 1_000_000,
-        lmBufferTypes = engine.npuSliceBufferTypes?.joinToString() ?: "",
-    )
+    private fun snapshotProfile(): TtsProfile = if (!BuildConfig.DEBUG) {
+        TtsProfile(0, 0, 0, 0, 0, 0, 0, 0, 0, firstChunkMs = -1)
+    } else {
+        TtsProfile(
+            lmSteps = sLmSteps,
+            promptSteps = sPrompt,
+            genFrames = sFrames,
+            lmInMs = sLmIn / 1_000_000,
+            lmRunMs = sLmRun / 1_000_000,
+            lmReadMs = sLmRead / 1_000_000,
+            decTxMs = sDecTx / 1_000_000,
+            seanetMs = sSeanet / 1_000_000,
+            chunks = sChunks,
+            lmInvocations = sLmInv,
+            lmInBytes = sLmInBytes,
+            lmOutBytes = sLmOutBytes,
+            firstChunkMs = sFirstChunk,
+            audioChunks = sAudioChunks,
+            lmOutputMapMs = sLmOutputMap / 1_000_000,
+            lmCacheMapMs = sLmCacheMap / 1_000_000,
+            lmCacheCopyMs = sLmCacheCopy / 1_000_000,
+            lmCacheUnmapMs = sLmCacheUnmap / 1_000_000,
+            lmBufferTypes = engine.npuSliceBufferTypes?.joinToString() ?: "",
+        )
+    }
 
     // ---- text preparation (ports of pocket_tts.models.tts_model) ----------
 
