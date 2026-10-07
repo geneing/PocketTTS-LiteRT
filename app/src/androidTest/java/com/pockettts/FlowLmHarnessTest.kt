@@ -62,6 +62,8 @@ class FlowLmHarnessTest {
         val readMs: Double,
         val cacheCopyMs: Double,
         val firstRunMs: Double,
+        val firstSyncMs: Double,
+        val steadySyncMs: Double,
     )
 
     private data class Metrics(val corr: Double, val mad: Double, val msd: Double)
@@ -783,6 +785,49 @@ class FlowLmHarnessTest {
         return key.contains("cpu") || key.contains("gpu") || key.contains("tpu") || key.contains("display")
     }
 
+    /** Opt-in startup probe for LiteRT's public GPU program-cache controls. */
+    @Test
+    fun gpuProgramCacheColdWarm() {
+        val graph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "pt_flowlm_fused_fp16.tflite"
+        val graphFile = File(modelDir, graph)
+        assertTrue("missing GPU graph $graphFile", graphFile.isFile)
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-gpu-program-cache")
+                ?: File(context.filesDir, "flowlm-gpu-program-cache"),
+            "startup-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+        val tokenIds = SpTokenizer(File(modelDir, PocketTts.TOKENIZER)).encode("Hello there.")
+        val voice = readVoice(File(modelDir, PocketTts.voiceFile("alba")))
+        val embed = File(modelDir, PocketTts.EMBED).readBytes()
+        val lines = mutableListOf(
+            "FlowLM GPU program cache cold/warm startup",
+            "graph=$graph sha256=${sha256(graphFile)} device=${Build.MODEL}/${Build.DEVICE}",
+            "api=LiteRT Kotlin 2.2.0 GpuOptions(serializationDir,modelCacheKey,serializeProgramCache)",
+            "tokens=${tokenIds.size} voice=alba requestedBackend=GPU",
+        )
+        val runs = mutableListOf<Run>()
+        for (pair in 1..2) {
+            val cacheDir = File(runDir, "cache-$pair").apply { mkdirs() }
+            for (phase in listOf("cold", "warm")) {
+                val run = runPrompt(Accel.GPU, graph, tokenIds, embed, voice, null, cacheDir)
+                runs += run
+                val files = cacheDir.walkTopDown().filter { it.isFile }.toList()
+                lines += "$pair-$phase loadMs=${run.loadMs} firstSyncMs=${run.firstSyncMs} " +
+                    "steadySyncMs=${run.steadySyncMs} firstDispatchMs=${run.firstRunMs} " +
+                    "inputMs=${run.inputMs} runMs=${run.runMs} readMs=${run.readMs} " +
+                    "cacheFiles=${files.size} cacheBytes=${files.sumOf { it.length() }}"
+            }
+        }
+        for (i in 1 until runs.size) {
+            val m = metrics(runs[0].output, runs[i].output)
+            lines += "outputParity run0-vs-run$i corr=${m.corr} mad=${m.mad} msd=${m.msd}"
+            assertTrue("program-cache run output changed: $m", m.corr > 0.9999)
+        }
+        File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
+        lines.forEach { Log.i(TAG, it) }
+    }
+
     private fun runPrompt(
         backend: Accel,
         graph: String,
@@ -790,6 +835,7 @@ class FlowLmHarnessTest {
         embedBytes: ByteArray,
         voice: VoiceState,
         environment: Environment?,
+        programCacheDir: File? = null,
     ): Run {
         check(backend != Accel.NPU || environment != null) { "NPU environment is unavailable" }
         val path = File(modelDir, graph)
@@ -802,6 +848,12 @@ class FlowLmHarnessTest {
         val options = CompiledModel.Options(accelerator)
         if (backend == Accel.GPU32) {
             options.gpuOptions = CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
+        } else if (backend == Accel.GPU && programCacheDir != null) {
+            options.gpuOptions = CompiledModel.GpuOptions(
+                serializationDir = programCacheDir.absolutePath,
+                modelCacheKey = graph,
+                serializeProgramCache = true,
+            )
         }
         val loadStart = System.nanoTime()
         val model = CompiledModel.create(path.absolutePath, options, if (backend == Accel.NPU) environment else null)
@@ -832,6 +884,9 @@ class FlowLmHarnessTest {
                 var readNs = 0L
                 var cacheCopyNs = 0L
                 var firstRunNs = 0L
+                var firstSyncNs = 0L
+                var steadySyncNs = 0L
+                var syncSteps = 0
                 for (id in tokenIds) {
                     val embedding = FloatArray(PocketTts.H)
                     var offset = id * PocketTts.H * Short.SIZE_BYTES
@@ -857,6 +912,8 @@ class FlowLmHarnessTest {
                     val readStarted = System.nanoTime()
                     val values = output.single().readFloat()
                     readNs += System.nanoTime() - readStarted
+                    val syncNs = System.nanoTime() - started
+                    if (syncSteps++ == 0) firstSyncNs = syncNs else steadySyncNs += syncNs
                     check(values.size == outputPerToken) {
                         "FlowLM output width changed: expected $outputPerToken, got ${values.size}"
                     }
@@ -877,7 +934,8 @@ class FlowLmHarnessTest {
                 }
                 return Run(backend, graph, all, tokenIds.size, loadMs,
                     inputNs / 1e6, runNs / 1e6, readNs / 1e6, cacheCopyNs / 1e6,
-                    firstRunNs / 1e6)
+                    firstRunNs / 1e6, firstSyncNs / 1e6,
+                    steadySyncNs / (syncSteps - 1).coerceAtLeast(1) / 1e6)
             } finally {
                 input.forEach { it.close() }
                 output.forEach { it.close() }
