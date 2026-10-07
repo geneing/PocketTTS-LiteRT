@@ -222,21 +222,30 @@ struct Runner {
       if (i == 4) cache_types_ok = opencl;
       if (i == 5) cache_types_ok = cache_types_ok && opencl;
       if (i == 4 || i == 5) {
-        if (elements(input_type(i).layout) * sizeof(float) != kCacheBytes) {
+        const Layout layout = input_type(i).layout;
+        if (layout.rank != 4 || layout.has_strides ||
+            layout.dimensions[0] != 1 || layout.dimensions[1] != kCapacity ||
+            layout.dimensions[2] != kGroups || layout.dimensions[3] != kHeadDim) {
           throw std::runtime_error("cache input shape differs from [1,512,96,64]");
         }
         size_t bytes = 0;
         checked(a.req_size(requirements[i], &bytes), "cache requirement size");
-        if (bytes < kCacheBytes) throw std::runtime_error("cache requirement too small");
+        if (bytes != kCacheBytes) throw std::runtime_error("cache requirement size changed");
       }
     }
     Handle output_req = nullptr;
     checked(a.output_req(compiled, 0, 0, &output_req), "output requirements");
     details += "\n" + requirement(output_req, "output0", nullptr);
+    size_t output_req_bytes = 0;
+    checked(a.req_size(output_req, &output_req_bytes), "output requirement size");
+    if (output_req_bytes != kOutput * sizeof(float)) {
+      throw std::runtime_error("packed output requirement size changed");
+    }
     Layout output_layout{};
     checked(a.output_layouts(compiled, 0, 1, &output_layout, false), "output layout");
-    if (elements(output_layout) != kOutput) {
-      throw std::runtime_error("packed output size differs from 12321 floats");
+    if (output_layout.rank != 2 || output_layout.has_strides ||
+        output_layout.dimensions[0] != 1 || output_layout.dimensions[1] != kOutput) {
+      throw std::runtime_error("packed output shape differs from [1,12321]");
     }
     details += std::string("\ncacheOpenClPackedSupported=") +
                (cache_types_ok ? "true" : "false");
@@ -269,12 +278,13 @@ struct Runner {
     for (const auto [name, buffer, expected] : {
              std::tuple<const char*, opencl::Mem, size_t>{"cacheK", cache_k, kCacheBytes},
              {"cacheV", cache_v, kCacheBytes},
-             {"output", output_mem, kOutput * sizeof(float)}}) {
+             // Pixel 10 OpenCL rounds the 49,284-byte packed output to 49,296.
+             {"output", output_mem, 49296}}) {
       size_t actual = 0;
       checked(cl.get_mem_info(buffer, opencl::kMemSize, sizeof(actual),
                               &actual, nullptr), "clGetMemObjectInfo size");
       details += "\n" + std::string(name) + " clMemBytes=" + std::to_string(actual);
-      if (actual < expected) throw std::runtime_error(std::string(name) + " cl_mem too small");
+      if (actual != expected) throw std::runtime_error(std::string(name) + " cl_mem size changed");
     }
     opencl::Context context = nullptr;
     checked(cl.get_mem_info(cache_k, opencl::kMemContext, sizeof(context),
