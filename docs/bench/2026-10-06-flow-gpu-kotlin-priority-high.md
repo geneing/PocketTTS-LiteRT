@@ -87,6 +87,27 @@ priority win. Both priority modes are about **2.25×** slower than CPU dyn8,
 and both stop six frames before the reference. Retain HIGH only as an opt-in
 diagnostic; do not enable it as a production default.
 
+## API and cache applicability
+
+The earlier AHardwareBuffer candidate stopped at a device gate:
+`LiteRtEnvironmentSupportsAhwbClInterop=false` on this Pixel. The supported
+native cache experiment therefore used persistent `OpenClBufferPacked`
+type-14 K/V buffers, allocated with public LiteRT tensor-buffer requirements,
+and reused the same OpenCL queue for small per-step row copies. It remained
+about 2.5× slower than CPU dyn8 because output synchronization dominated.
+This Kotlin priority probe uses the ordinary host K/V path and is separate
+from that native cache experiment.
+
+The pinned LiteRT 2.2.0 public Kotlin `CompiledModel.Options` exposes GPU
+priority and the GPU serialization/program-cache controls, which were used
+in separate opt-in probes. It does not expose
+`ExternalWeightScopedFileDescriptor` or
+`MemoryPlanningStrategy.PREALLOCATED_STATIC_POOL`. The native runner already
+preallocates and reuses its input/output tensor buffers, while
+`CompiledModel.create` loads a model file path. There is no evidence from
+these runs that either unavailable Kotlin feature would address the measured
+per-token GPU read/sync cost.
+
 ## Reproduction and artifacts
 
 ```text
