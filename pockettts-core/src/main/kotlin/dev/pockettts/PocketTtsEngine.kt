@@ -169,6 +169,16 @@ class PocketTtsEngine(
     internal val usesNpuResidentCache: Boolean = config.npuResidentCache
     internal val usesNpuSliceCache: Boolean = config.npuSliceCache
     internal val usesNpuPositionMajorCache: Boolean = config.npuPositionMajorCache
+    internal val usesGpuOpenClCache: Boolean = config.gpuOpenClCache
+    private val gpuOpenClRunner: GpuOpenClLmRunner? = if (usesGpuOpenClCache) {
+        val started = System.nanoTime()
+        GpuOpenClLmRunner(models.store.file(lmGraphName)).also {
+            check(it.ready) { "GPU OpenCL packed cache requirements failed: ${it.details}" }
+            loadMs["lm_opencl"] = (System.nanoTime() - started) / 1_000_000
+            android.util.Log.i("PocketTTSTime", it.details)
+        }
+    } else null
+    val gpuOpenClDetails: String? get() = gpuOpenClRunner?.details
     private val positionMajorSeedK: FloatArray? = if (usesNpuPositionMajorCache) {
         FloatArray(PocketTts.G * PocketTts.PMAX * PocketTts.HD)
     } else null
@@ -372,6 +382,26 @@ class PocketTtsEngine(
         )
     }
 
+    /** Native GPU caches are reseeded for every utterance under the engine lock. */
+    internal fun resetGpuOpenClCache(k: FloatArray, v: FloatArray): Long {
+        val started = System.nanoTime()
+        requireNotNull(gpuOpenClRunner).seed(k, v)
+        return System.nanoTime() - started
+    }
+
+    internal fun runGpuOpenClLm(
+        emb: FloatArray, cos: FloatArray, sin: FloatArray, mask: FloatArray,
+        noise: FloatArray, position: Int,
+    ): ResidentLmStepRun {
+        val result = requireNotNull(gpuOpenClRunner).step(emb, cos, sin, mask, noise, position)
+        val t = result.timingsNs
+        check(result.packed.size == 1 + PocketTts.LDIM)
+        return ResidentLmStepRun(
+            result.packed, t[0], t[1], t[2] + t[3] + t[4] + t[5],
+            t[2], t[3], t[4], t[5],
+        )
+    }
+
     internal val lmMsIn = lmMs?.createInputBuffers()
     internal val lmMsOut = lmMs?.createOutputBuffers()
     internal val dectxIn = dectx.createInputBuffers()
@@ -514,6 +544,7 @@ class PocketTtsEngine(
 
     override fun close() {
         executor.shutdownNow()
+        gpuOpenClRunner?.close()
         listOf(
             lmIn, lmOut, lmResidentIn, lmResidentOut, lmMsIn, lmMsOut, dectxIn, dectxOut, deconlyIn, deconlyOut,
             deconlyWIn, deconlyWOut, prefillIn, prefillOut,

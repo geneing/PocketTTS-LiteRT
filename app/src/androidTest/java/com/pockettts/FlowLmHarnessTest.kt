@@ -74,6 +74,7 @@ class FlowLmHarnessTest {
         val pssAfterRunKb: Long,
         val wav: File,
         val energy: EnergyProbe?,
+        val nativeDetails: String? = null,
     )
 
     private data class EnergyProbe(
@@ -509,6 +510,7 @@ class FlowLmHarnessTest {
     /** Opt-in long speech comparison of the fused GPU FlowLM and shipped CPU int8. */
     @Test
     fun gpuSpeechPair() {
+        val openClCache = args.getString("gpuOpenClCache")?.toBooleanStrictOrNull() ?: false
         val gpuGraph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
             ?: "pt_flowlm_fused_fp16.tflite"
         val referenceGraph = args.getString("referenceGraph")?.trim()?.takeIf { it.isNotEmpty() }
@@ -554,11 +556,15 @@ class FlowLmHarnessTest {
                     lmGraph = if (isGpu) gpuGraph else referenceGraph,
                     noiseSeed = seed,
                     gpuCache = gpuProgramCache,
+                    gpuOpenClCache = isGpu && openClCache,
                 ),
             )
             try {
                 val load = engine.loadMs.toMap()
                 val backends = engine.runtimeAccelerators
+                if (isGpu && openClCache) {
+                    Log.i(TAG, "gpuOpenClDetails=${engine.gpuOpenClDetails}")
+                }
                 assertTrue("$arm LM silently fell back: $backends", backends["lm"] == placement.lm)
                 val warmup = engine.stream("A short warmup sentence.", voice) {}
                 assertTrue("$arm warmup produced no audio", warmup.audio.isNotEmpty())
@@ -598,7 +604,8 @@ class FlowLmHarnessTest {
                 } else null
                 val wav = File(runDir, "$arm.wav")
                 Wav.write(wav, result.audio)
-                return SpeechProbe(result, load, backends, pssBefore, pssAfter, wav, energy)
+                return SpeechProbe(result, load, backends, pssBefore, pssAfter, wav, energy,
+                    engine.gpuOpenClDetails)
             } finally {
                 engine.close()
             }
@@ -615,14 +622,16 @@ class FlowLmHarnessTest {
             "FlowLM fused GPU speech pair",
             "device=${Build.MODEL}/${Build.DEVICE} android=${Build.VERSION.RELEASE} fingerprint=${Build.FINGERPRINT}",
             "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
-            "gpuGraph=$gpuGraph sha256=${sha256(File(modelDir, gpuGraph))} gpuProgramCache=$gpuProgramCache",
+            "gpuGraph=$gpuGraph sha256=${sha256(File(modelDir, gpuGraph))} gpuProgramCache=$gpuProgramCache openClCache=$openClCache",
             "referenceGraph=$referenceGraph sha256=${sha256(File(modelDir, referenceGraph))}",
             "powerMonitors=${monitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
             "gpuPlacement=${gpu.backends} loadMs=${gpu.loadMs} pssKb=${gpu.pssBeforeRunKb}->${gpu.pssAfterRunKb}",
+            "gpuOpenClDetails=${gpu.nativeDetails ?: "disabled"}",
             "cpuPlacement=${cpu.backends} loadMs=${cpu.loadMs} pssKb=${cpu.pssBeforeRunKb}->${cpu.pssAfterRunKb}",
             "gpu frames=${gpu.result.frames} audioSeconds=${gpu.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${gpu.result.ms} firstAudioMs=${gpu.result.profile.firstChunkMs}",
             "cpu frames=${cpu.result.frames} audioSeconds=${cpu.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${cpu.result.ms} firstAudioMs=${cpu.result.profile.firstChunkMs}",
             "gpu lmMs inputCopy/run/read=${gpu.result.profile.lmInMs}/${gpu.result.profile.lmRunMs}/${gpu.result.profile.lmReadMs} steps=${gpu.result.profile.lmSteps} invocations=${gpu.result.profile.lmInvocations} hostBytesIn=${gpu.result.profile.lmInBytes} hostBytesOut=${gpu.result.profile.lmOutBytes}",
+            "gpu nativeMs outputLock/cacheQueueGap/copyEnqueue/copyWait=${gpu.result.profile.lmOutputMapMs}/${gpu.result.profile.lmCacheMapMs}/${gpu.result.profile.lmCacheCopyMs}/${gpu.result.profile.lmCacheUnmapMs}",
             "cpu lmMs inputCopy/run/read=${cpu.result.profile.lmInMs}/${cpu.result.profile.lmRunMs}/${cpu.result.profile.lmReadMs} steps=${cpu.result.profile.lmSteps} invocations=${cpu.result.profile.lmInvocations} hostBytesIn=${cpu.result.profile.lmInBytes} hostBytesOut=${cpu.result.profile.lmOutBytes}",
             "gpu mimiMs dectx/seanet=${gpu.result.profile.decTxMs}/${gpu.result.profile.seanetMs}",
             "cpu mimiMs dectx/seanet=${cpu.result.profile.decTxMs}/${cpu.result.profile.seanetMs}",

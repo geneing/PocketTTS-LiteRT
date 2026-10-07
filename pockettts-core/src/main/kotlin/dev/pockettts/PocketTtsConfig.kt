@@ -74,6 +74,8 @@ class PocketTtsConfig(
     val npuPositionMajorCache: Boolean = false,
     /** Check every patched row against the graph output; adds synchronization overhead. */
     val verifyNpuSliceRows: Boolean = false,
+    /** Opt-in GPU FlowLM with position-major K/V in persistent OpenCL packed buffers. */
+    val gpuOpenClCache: Boolean = false,
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }
@@ -95,6 +97,12 @@ class PocketTtsConfig(
         }
         require(!verifyNpuSliceRows || npuSliceCache) {
             "row verification requires NPU slice cache"
+        }
+        if (gpuOpenClCache) {
+            require(placement.lm == Accel.GPU) { "OpenCL cache requires lm:GPU" }
+            require(lmGraph != null) { "OpenCL cache requires its position-major lmGraph" }
+            require(lmSteps == 1 && !usePrefill) { "OpenCL cache requires single-step FlowLM" }
+            require(!npuResidentCache && !npuSliceCache) { "select one cache protocol" }
         }
     }
 

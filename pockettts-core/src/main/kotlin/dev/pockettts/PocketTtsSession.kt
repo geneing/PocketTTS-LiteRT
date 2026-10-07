@@ -138,6 +138,9 @@ class PocketTtsSession internal constructor(
         } else if (engine.usesNpuSliceCache) {
             sLmIn += engine.resetNpuSliceCache(pk, pv)
             sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
+        } else if (engine.usesGpuOpenClCache) {
+            sLmIn += engine.resetGpuOpenClCache(pk, pv)
+            sLmInBytes += (pk.size + pv.size).toLong() * Float.SIZE_BYTES
         }
     }
 
@@ -260,14 +263,14 @@ class PocketTtsSession internal constructor(
     private fun step(emb: FloatArray, noise: FloatArray): Pair<FloatArray, Float> {
         check(pos < PMAX) { "KV cache overflow at $pos" }
         val out: FloatArray
-        if (engine.usesNpuResidentCache || engine.usesNpuSliceCache) {
+        if (engine.usesNpuResidentCache || engine.usesNpuSliceCache || engine.usesGpuOpenClCache) {
             val prepareStart = System.nanoTime()
             ropeFill(pos)
             val prepareNs = System.nanoTime() - prepareStart
-            val run = if (engine.usesNpuResidentCache) {
-                engine.runNpuResidentLm(emb, cosArr, sinArr, mask, noise, pos)
-            } else {
-                engine.runNpuSliceLm(emb, cosArr, sinArr, mask, noise, pos)
+            val run = when {
+                engine.usesNpuResidentCache -> engine.runNpuResidentLm(emb, cosArr, sinArr, mask, noise, pos)
+                engine.usesNpuSliceCache -> engine.runNpuSliceLm(emb, cosArr, sinArr, mask, noise, pos)
+                else -> engine.runGpuOpenClLm(emb, cosArr, sinArr, mask, noise, pos)
             }
             out = run.control
             sLmIn += prepareNs + run.inputNs
@@ -304,7 +307,7 @@ class PocketTtsSession internal constructor(
         }
         val eos = out[0]
         val latent = out.copyOfRange(1, 1 + LDIM)
-        if (!engine.usesNpuResidentCache && !engine.usesNpuSliceCache) {
+        if (!engine.usesNpuResidentCache && !engine.usesNpuSliceCache && !engine.usesGpuOpenClCache) {
             val kvBase = 1 + LDIM
             for (g in 0 until G) {
                 System.arraycopy(out, kvBase + g * HD, pk, g * PMAX * HD + pos * HD, HD)
