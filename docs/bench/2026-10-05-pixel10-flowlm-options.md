@@ -73,6 +73,7 @@ Each option has its own branch and bench report. Device tests are run serially b
 | 11. G5 FP16 `half` truncation | `codex/flowlm-g5-half-truncation` | Existing position-major FP16 graph compiled with AOT `--truncation half` | Two long Alba pairs averaged 32.066 / 24.782 s NPU/CPU (`1.294x`); both emitted only 750/759 frames. Similar to default FP16 NPU speed and fails completion; see [candidate report](2026-10-06-flow-g5-fp16-half-truncation-candidate.md) |
 | 12. G5 static W8/A16 | `codex/flowlm-g5-static-w8a16` | Calibrated AEQ W8/A16; all-op, FC-only, and selective FFN variants preserve float32 I/O | Selective FFN12 compiled 694/694 ops in one partition. Two long pairs averaged 32.575 / 24.488 s NPU/CPU (`1.330x`), output 769/759 frames (10 extra); first audio 1.599/1.128 s. Still misses parity; speech completeness/listening unverified. See [initial report](2026-10-06-flow-g5-static-w8a16-candidate.md) and [selective/AOT/Pixel report](2026-10-06-flow-g5-selective-w8a16-candidate.md) |
 | 13. G5 dynamic INT8 + `HIGH_PERFORMANCE` | `codex/flowlm-g5-high-performance` | Existing position-major W8/float AOT artifact with native `performance_mode=3` | Two long Alba pairs averaged 51.919 / 24.793 s NPU/CPU (`2.094x`), 753/759 frames. About 2% faster than default-mode INT8, still fails speed and completion; details in [runtime report](2026-10-06-g5-high-performance.md) |
+| 14. G5 FFN12 W8/A16 + `HIGH_PERFORMANCE` | `codex/flowlm-ffn12-high-performance` | Integrated selective W8/A16 quantizer and native G5 performance mode; opt-in | Two long pairs averaged 30.472 / 24.881 s NPU/CPU (`1.225x`), 769/759 frames; first audio 1.346/1.132 s. Best current FFN12 combination but still 5.59 s slower and emits 0.80 s extra audio; see [candidate report](2026-10-06-g5-high-performance.md) |
 
 ### Option 6: CPU thread tuning
 
@@ -234,6 +235,19 @@ text completeness remain unverified. The single-repeat energy subtraction was
 noisy and does not support an energy claim. It still misses speed parity.
 Initial all-op and FC-only details are in the [W8/A16 report](2026-10-06-flow-g5-static-w8a16-candidate.md);
 selective coverage, drift, AOT, and Pixel measurements are in the [FFN report](2026-10-06-flow-g5-selective-w8a16-candidate.md).
+
+### Option 14: selective FFN12 W8/A16 with HIGH_PERFORMANCE
+
+The combined branch `codex/flowlm-ffn12-high-performance` integrates the
+selective FFN12 W8/A16 quantizer with the native Google Tensor
+`performance_mode=3` runner; the opt-in remains disabled by default. Across two
+long Alba orders the NPU averaged 30.472 s versus 24.881 s on CPU (1.225x),
+with 769 versus 759 frames. First audio averaged 1.346 versus 1.132 s. The NPU
+graph-run stage was faster (14.351 versus 15.014 s), but output readback, cache
+patching and Mimi stages left the full pipeline 5.591 s slower. The candidate
+made 0.80 s more audio than CPU; waveform correlation 0.0724 is diagnostic,
+and listening/spoken-text completeness remain unverified. Detailed stages,
+energy caveats and reproduction args are in the [HIGH_PERFORMANCE report](2026-10-06-g5-high-performance.md).
 
 ### How other runtimes manage KV state
 

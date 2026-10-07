@@ -84,6 +84,64 @@ include the raw stage, energy, PSS, quality, and output-file records. The
 corresponding device directories are under
 `/sdcard/Android/data/com.pockettts/files/flowlm-npu-slice-position-major/`.
 
+## Selective FFN12 static W8/A16 with HIGH_PERFORMANCE
+
+The separately compiled selective FFN12 static W8/A16 AOT graph was already
+installed on Pixel 10 serial `57220DLCR002R6`; the device file's SHA-256
+matched `183a71a2475e6fb68ab626788f8f2189a85d9fb661bcca8c8637e19ce2906d12`.
+The installed app and test runner supported the native opt-in, so neither was
+reinstalled. Both orders used the same long Alba utterance, seed 42,
+position-major persistent AHWB cache, one energy repeat, and the CPU dynamic
+INT8 FlowLM reference. The reports confirm `g5HighPerformance=true` and the
+intended graph SHA. No production default or candidate graph was changed.
+
+| Order | NPU | CPU | NPU / CPU | Frames NPU / CPU | First audio NPU / CPU | LM graph run NPU / CPU | Thermal |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| NPU then CPU | 30.549 s | 24.788 s | 1.232x | 769 / 759 | 1.131 / 1.114 s | 14.290 / 15.123 s | 0 |
+| CPU then NPU | 30.395 s | 24.973 s | 1.217x | 769 / 759 | 1.560 / 1.150 s | 14.411 / 14.904 s | 0 |
+| Mean | 30.472 s | 24.881 s | 1.225x | 769 / 759 | 1.346 / 1.132 s | 14.351 / 15.014 s | 0 |
+
+The candidate generated 61.52 s of audio, ten frames or 0.80 s longer than
+the CPU reference's 60.72 s. NPU LM input/run/read averaged
+1.282 / 14.351 / 2.381 s, versus CPU's 2.319 / 15.014 / 0.128 s.
+The native cache output-map/cache-map/row-copy/unmap components averaged
+0.114 / 0.109 / 1.841 / 0.094 s and reported AHWB buffer type 2.
+Mimi decoder transformer and SEANet averaged 3.577 / 4.703 s on the NPU-LM
+arm versus 1.751 / 4.494 s on the CPU-LM arm. Thus the faster NPU LM graph
+run did not yield end-to-end speed parity.
+
+The duration-scaled audio-only subtraction reports incremental TPU/1 energy
+of 10.522 and 10.651 J for the two NPU arms, versus 1.471 and 1.361 J for
+their CPU arms. CPU/0 was 0.809 and 0.579 J for NPU, versus 11.468 and
+10.723 J for CPU; GPU/0 was 5.170 and 5.223 J for NPU, versus 4.997 and
+4.747 J for CPU. These are overlapping monitor domains, not additive
+system-energy totals. The raw reports contain all measured rails and PSS.
+
+Waveform correlation was 0.0724285 and 0.0724297, lag 0, with SNR about
+0.02284 dB, high-band error about 0.03271 dB, reference HNR about 0.795 dB,
+and candidate HNR about 0.368 dB. Listening/intelligibility was not assessed.
+The paired latency, extra frames, and low waveform correlation do not
+establish speed or output parity for this combination.
+
+The direct instrumentation arguments were:
+
+```text
+-e class com.pockettts.FlowLmHarnessTest#npuResidentCacheSpeechPair
+-e workload long -e voice alba -e seed 42 -e energyRepeats 1
+-e order npu-cpu   # repeat with cpu-npu
+-e npuResidentCache false -e npuSliceCache true
+-e npuPositionMajorCache true -e verifyNpuSliceRows false
+-e g5HighPerformance true
+-e npuGraph pt_flowlm_fused_st16_ffn12_contiguous_no_truncation.tflite
+```
+
+The ignored local artifact directories are
+`build/st16-ffn12-highperf/speech-20261006-165516-416/` and
+`build/st16-ffn12-highperf/speech-20261006-165953-920/` in this worktree.
+Each contains `report.txt`, `npu.wav`, and `cpu.wav`. The matching device
+directories have the same `speech-*` suffix under
+`/sdcard/Android/data/com.pockettts/files/flowlm-npu-slice-position-major/`.
+
 ## Native API and opt-in path
 
 The pinned `litert-2.2.0.aar` exports `LiteRtCreateOpaqueOptions`,
