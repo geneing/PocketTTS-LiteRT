@@ -55,7 +55,11 @@ class FlowLmHarnessTest {
         val output: FloatArray,
         val tokenCount: Int,
         val loadMs: Double,
+        val inputMs: Double,
         val runMs: Double,
+        val readMs: Double,
+        val cacheCopyMs: Double,
+        val firstRunMs: Double,
     )
 
     private data class Metrics(val corr: Double, val mad: Double, val msd: Double)
@@ -121,6 +125,7 @@ class FlowLmHarnessTest {
         lines += "text=$text"
         lines += "voice=$voice"
         lines += "graph=$baseGraph"
+        lines += "graphSha256=${File(modelDir, baseGraph).takeIf { it.isFile }?.let { sha256(it) } ?: "missing"}"
         lines += "tokens=${tokenIds.size} ids=${tokenIds.joinToString(",")}"
         lines += "output=one fused output vector per prompt token; zero noise; voice KV prefix=${voiceState.length} tokens"
 
@@ -154,8 +159,10 @@ class FlowLmHarnessTest {
             writeFloats(File(runDir, "cpu-reference.f32le"), reference.output)
             lines += String.format(
                 Locale.US,
-                "CPU reference: graph=%s load=%.2f ms run=%.2f ms values=%d saved=cpu-reference.f32le",
-                reference.graph, reference.loadMs, reference.runMs, reference.output.size,
+                "CPU reference: graph=%s sha256=%s load=%.2f ms input=%.2f ms run=%.2f ms read=%.2f ms cacheCopy=%.2f ms firstRun=%.2f ms values=%d saved=cpu-reference.f32le",
+                reference.graph, sha256(File(modelDir, reference.graph)), reference.loadMs,
+                reference.inputMs, reference.runMs, reference.readMs, reference.cacheCopyMs,
+                reference.firstRunMs, reference.output.size,
             )
             for ((backend, result) in candidates) {
                 val file = "${backend.name.lowercase(Locale.ROOT)}-candidate.f32le"
@@ -164,8 +171,10 @@ class FlowLmHarnessTest {
                     val m = metrics(reference.output, result.output)
                     lines += String.format(
                         Locale.US,
-                        "%s candidate: graph=%s load=%.2f ms run=%.2f ms corr=%.8f mean_abs_diff=%.8g mean_square_diff=%.8g saved=%s",
-                        backend, result.graph, result.loadMs, result.runMs, m.corr, m.mad, m.msd, file,
+                        "%s candidate: graph=%s sha256=%s load=%.2f ms input=%.2f ms run=%.2f ms read=%.2f ms cacheCopy=%.2f ms firstRun=%.2f ms corr=%.8f mean_abs_diff=%.8g mean_square_diff=%.8g saved=%s",
+                        backend, result.graph, sha256(File(modelDir, result.graph)), result.loadMs,
+                        result.inputMs, result.runMs, result.readMs, result.cacheCopyMs,
+                        result.firstRunMs, m.corr, m.mad, m.msd, file,
                     )
                 } catch (t: Throwable) {
                     lines += "$backend candidate comparison failed: ${t.message}; output saved=$file"
@@ -178,6 +187,10 @@ class FlowLmHarnessTest {
             report.lines().forEach { Log.i(TAG, it) }
             Log.i(TAG, "saved FlowLM probe files to ${runDir.absolutePath}")
             assertTrue("CPU fp16 reference produced no output", reference.output.isNotEmpty())
+            if (args.getString("requireCandidates")?.toBooleanStrictOrNull() == true) {
+                assertTrue("requested backends failed: ${backends.filter { it !in candidates }}; report=$runDir",
+                    backends.all { it in candidates })
+            }
         } finally {
             environment?.close()
         }
@@ -357,6 +370,136 @@ class FlowLmHarnessTest {
         lines.forEach { Log.i(TAG, it) }
         assertTrue("candidate run did not use NPU placement: ${candidate.backends}", candidate.backends["lm"] == Accel.NPU)
         assertTrue("NPU run produced no FlowLM frames", candidate.result.frames > 0)
+    }
+
+    /** Opt-in long speech comparison of the fused GPU FlowLM and shipped CPU int8. */
+    @Test
+    fun gpuSpeechPair() {
+        val gpuGraph = args.getString("gpuGraph")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: "pt_flowlm_fused_fp16.tflite"
+        val referenceGraph = args.getString("referenceGraph")?.trim()?.takeIf { it.isNotEmpty() }
+            ?: PocketTts.LM
+        val order = args.getString("order")?.trim()?.lowercase(Locale.ROOT) ?: "gpu-cpu"
+        require(order == "gpu-cpu" || order == "cpu-gpu") { "order must be gpu-cpu or cpu-gpu" }
+        val workload = args.getString("workload")?.trim()?.lowercase(Locale.ROOT) ?: "long"
+        val defaultText = when (workload) {
+            "short" -> RESIDENT_TEXT
+            "long" -> LONG_TEXT
+            else -> error("workload must be short or long")
+        }
+        val text = args.getString("text")?.trim().orEmpty().ifEmpty { defaultText }
+        val voice = args.getString("voice")?.trim()?.takeIf { it.isNotEmpty() } ?: "alba"
+        val seed = args.getString("seed")?.toLongOrNull() ?: 42L
+        val energyRepeats = args.getString("energyRepeats")?.toIntOrNull()?.coerceAtLeast(1) ?: 1
+        val models = PocketTtsModels.default(context)
+        assertTrue("missing GPU graph $gpuGraph", models.store.exists(gpuGraph))
+        assertTrue("missing CPU graph $referenceGraph", models.store.exists(referenceGraph))
+
+        val health = if (Build.VERSION.SDK_INT >= 35) {
+            context.getSystemService(SystemHealthManager::class.java)
+        } else null
+        val monitors = health?.let { supportedMonitors(it).filter { p -> p.name.isRelevantPowerDomain() } }
+            .orEmpty()
+        val runDir = File(
+            context.getExternalFilesDir("flowlm-gpu") ?: File(context.filesDir, "flowlm-gpu"),
+            "speech-${SimpleDateFormat("yyyyMMdd-HHmmss-SSS", Locale.US).format(Date())}",
+        ).apply { mkdirs() }
+        val gpuProgramCache = File(context.cacheDir, "flowlm_gpu_program_cache").apply { mkdirs() }
+        val thermalBefore = context.getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1
+
+        fun runArm(arm: String): SpeechProbe {
+            val isGpu = arm == "gpu"
+            // The decoder path is identical in both arms. CPU dec_tx avoids the
+            // process-global NPU dispatch setup after the GPU LM has loaded.
+            val placement = Placement(if (isGpu) Accel.GPU else Accel.CPU, Accel.CPU, Accel.GPU)
+            val engine = PocketTtsEngine(
+                context,
+                PocketTtsConfig(
+                    models = models,
+                    placement = placement,
+                    lmGraph = if (isGpu) gpuGraph else referenceGraph,
+                    noiseSeed = seed,
+                    gpuCache = gpuProgramCache,
+                ),
+            )
+            try {
+                val load = engine.loadMs.toMap()
+                val backends = engine.runtimeAccelerators
+                assertTrue("$arm LM silently fell back: $backends", backends["lm"] == placement.lm)
+                val warmup = engine.stream("A short warmup sentence.", voice) {}
+                assertTrue("$arm warmup produced no audio", warmup.audio.isNotEmpty())
+                val baseline = engine.stream(text, voice) {}
+                assertTrue("$arm baseline produced no audio", baseline.audio.isNotEmpty())
+                val audioOnly = if (health != null && monitors.isNotEmpty()) {
+                    measurePlayback(health, monitors, baseline.audio, energyRepeats)
+                } else null
+                val powerBefore = if (health != null && monitors.isNotEmpty()) {
+                    powerSnapshot(health, monitors)
+                } else null
+                val pssBefore = Debug.getPss().toLong()
+                val started = SystemClock.elapsedRealtime()
+                var result = baseline
+                repeat(energyRepeats) {
+                    result = engine.stream(text, voice) {}
+                    assertTrue("$arm measured run produced no audio", result.audio.isNotEmpty())
+                }
+                val elapsed = SystemClock.elapsedRealtime() - started
+                val pssAfter = Debug.getPss().toLong()
+                val powerAfter = if (health != null && monitors.isNotEmpty()) {
+                    powerSnapshot(health, monitors)
+                } else null
+                val energy = if (audioOnly != null && powerBefore != null && powerAfter != null) {
+                    val synthesisJoules = deltaJoules(powerBefore, powerAfter)
+                    val scale = elapsed.toDouble() / audioOnly.elapsedMs.coerceAtLeast(1)
+                    EnergyProbe(
+                        synthesisElapsedMs = elapsed,
+                        audioOnlyElapsedMs = audioOnly.elapsedMs,
+                        repetitions = energyRepeats,
+                        synthesisJoules = synthesisJoules,
+                        audioOnlyJoules = audioOnly.joules,
+                        incrementalJoules = synthesisJoules.mapValues { (name, value) ->
+                            value - (audioOnly.joules[name] ?: 0.0) * scale
+                        },
+                    )
+                } else null
+                val wav = File(runDir, "$arm.wav")
+                Wav.write(wav, result.audio)
+                return SpeechProbe(result, load, backends, pssBefore, pssAfter, wav, energy)
+            } finally {
+                engine.close()
+            }
+        }
+
+        val arms = if (order == "gpu-cpu") listOf("gpu", "cpu") else listOf("cpu", "gpu")
+        val probes = LinkedHashMap<String, SpeechProbe>()
+        for (arm in arms) probes[arm] = runArm(arm)
+        val gpu = requireNotNull(probes["gpu"])
+        val cpu = requireNotNull(probes["cpu"])
+        val quality = AudioQuality.compare(cpu.result.audio, gpu.result.audio)
+        val thermalAfter = context.getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1
+        val lines = mutableListOf(
+            "FlowLM fused GPU speech pair",
+            "device=${Build.MODEL}/${Build.DEVICE} android=${Build.VERSION.RELEASE} fingerprint=${Build.FINGERPRINT}",
+            "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
+            "gpuGraph=$gpuGraph sha256=${sha256(File(modelDir, gpuGraph))} gpuProgramCache=$gpuProgramCache",
+            "referenceGraph=$referenceGraph sha256=${sha256(File(modelDir, referenceGraph))}",
+            "powerMonitors=${monitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
+            "gpuPlacement=${gpu.backends} loadMs=${gpu.loadMs} pssKb=${gpu.pssBeforeRunKb}->${gpu.pssAfterRunKb}",
+            "cpuPlacement=${cpu.backends} loadMs=${cpu.loadMs} pssKb=${cpu.pssBeforeRunKb}->${cpu.pssAfterRunKb}",
+            "gpu frames=${gpu.result.frames} audioSeconds=${gpu.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${gpu.result.ms} firstAudioMs=${gpu.result.profile.firstChunkMs}",
+            "cpu frames=${cpu.result.frames} audioSeconds=${cpu.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${cpu.result.ms} firstAudioMs=${cpu.result.profile.firstChunkMs}",
+            "gpu lmMs inputCopy/run/read=${gpu.result.profile.lmInMs}/${gpu.result.profile.lmRunMs}/${gpu.result.profile.lmReadMs} steps=${gpu.result.profile.lmSteps} invocations=${gpu.result.profile.lmInvocations} hostBytesIn=${gpu.result.profile.lmInBytes} hostBytesOut=${gpu.result.profile.lmOutBytes}",
+            "cpu lmMs inputCopy/run/read=${cpu.result.profile.lmInMs}/${cpu.result.profile.lmRunMs}/${cpu.result.profile.lmReadMs} steps=${cpu.result.profile.lmSteps} invocations=${cpu.result.profile.lmInvocations} hostBytesIn=${cpu.result.profile.lmInBytes} hostBytesOut=${cpu.result.profile.lmOutBytes}",
+            "gpu mimiMs dectx/seanet=${gpu.result.profile.decTxMs}/${gpu.result.profile.seanetMs}",
+            "cpu mimiMs dectx/seanet=${cpu.result.profile.decTxMs}/${cpu.result.profile.seanetMs}",
+            "waveform corr=${quality.corr} lag=${quality.lag} snrDb=${quality.snrDb} highBandErrDb=${quality.highBandErrDb} refHnrDb=${quality.refHnrDb} gpuHnrDb=${quality.candHnrDb}",
+            "thermalStatus=$thermalBefore->$thermalAfter gpuWav=${gpu.wav.absolutePath} cpuWav=${cpu.wav.absolutePath}",
+        )
+        gpu.energy?.let { lines += energyLine("gpu", it, gpu.result.audio.size) }
+        cpu.energy?.let { lines += energyLine("cpu", it, cpu.result.audio.size) }
+        File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
+        lines.forEach { Log.i(TAG, it) }
+        assertTrue("GPU run produced no FlowLM frames", gpu.result.frames > 0)
     }
 
     private fun supportedMonitors(manager: SystemHealthManager): List<PowerMonitor> {
@@ -541,7 +684,11 @@ class FlowLmHarnessTest {
                 val outputPerToken = 1 + PocketTts.LDIM + 2 * PocketTts.G * PocketTts.HD
                 val all = FloatArray(tokenIds.size * outputPerToken)
                 var outputOffset = 0
-                var elapsed = 0L
+                var inputNs = 0L
+                var runNs = 0L
+                var readNs = 0L
+                var cacheCopyNs = 0L
+                var firstRunNs = 0L
                 for (id in tokenIds) {
                     val embedding = FloatArray(PocketTts.H)
                     var offset = id * PocketTts.H * Short.SIZE_BYTES
@@ -550,6 +697,7 @@ class FlowLmHarnessTest {
                         offset += Short.SIZE_BYTES
                     }
                     rope(pos, cosine, sine)
+                    val inputStarted = System.nanoTime()
                     input[0].writeFloat(embedding)
                     input[1].writeFloat(cosine)
                     input[2].writeFloat(sine)
@@ -557,16 +705,22 @@ class FlowLmHarnessTest {
                     input[4].writeFloat(pk)
                     input[5].writeFloat(pv)
                     input[6].writeFloat(zeroNoise)
+                    inputNs += System.nanoTime() - inputStarted
                     val started = System.nanoTime()
                     if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
-                    elapsed += System.nanoTime() - started
+                    val ran = System.nanoTime() - started
+                    if (firstRunNs == 0L) firstRunNs = ran
+                    runNs += ran
+                    val readStarted = System.nanoTime()
                     val values = output.single().readFloat()
+                    readNs += System.nanoTime() - readStarted
                     check(values.size == outputPerToken) {
                         "FlowLM output width changed: expected $outputPerToken, got ${values.size}"
                     }
                     System.arraycopy(values, 0, all, outputOffset, values.size)
                     outputOffset += values.size
 
+                    val copyStarted = System.nanoTime()
                     val kvStart = 1 + PocketTts.LDIM
                     for (g in 0 until PocketTts.G) {
                         System.arraycopy(values, kvStart + g * PocketTts.HD, pk,
@@ -576,8 +730,11 @@ class FlowLmHarnessTest {
                     }
                     for (h in 0 until PocketTts.NH) mask[h * (PocketTts.PMAX + 1) + pos] = 0f
                     pos++
+                    cacheCopyNs += System.nanoTime() - copyStarted
                 }
-                return Run(backend, graph, all, tokenIds.size, loadMs, elapsed / 1e6)
+                return Run(backend, graph, all, tokenIds.size, loadMs,
+                    inputNs / 1e6, runNs / 1e6, readNs / 1e6, cacheCopyNs / 1e6,
+                    firstRunNs / 1e6)
             } finally {
                 input.forEach { it.close() }
                 output.forEach { it.close() }
