@@ -27,6 +27,12 @@ struct Layout {
   uint32_t strides[8];
 };
 struct RankedType { int element_type; Layout layout; };
+struct Any {
+  int type;
+  union { bool bool_value; int64_t int_value; double real_value;
+          const char* str_value; const void* ptr_value; };
+};
+static_assert(sizeof(void*) != 8 || sizeof(Any) == 16);
 static_assert(sizeof(Layout) == 68);
 static_assert(offsetof(Layout, dimensions) == 4);
 static_assert(offsetof(Layout, strides) == 36);
@@ -35,6 +41,8 @@ static_assert(offsetof(RankedType, layout) == 4);
 
 using CreateEnvironment = Status (*)(int, const void*, Handle*);
 using DestroyEnvironment = void (*)(Handle);
+using GetEnvironmentOptions = Status (*)(Handle, Handle*);
+using GetEnvironmentOptionsValue = Status (*)(Handle, int, Any*);
 using SupportsAhwbClInterop = Status (*)(Handle, bool*);
 using CreateModelFromFile = Status (*)(Handle, const char*, Handle*);
 using DestroyModel = void (*)(Handle);

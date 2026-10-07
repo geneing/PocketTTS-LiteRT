@@ -12,6 +12,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 namespace {
@@ -47,6 +48,8 @@ struct Api {
   void* library = nullptr;
   CreateEnvironment create_env = nullptr;
   DestroyEnvironment destroy_env = nullptr;
+  GetEnvironmentOptions get_env_options = nullptr;
+  GetEnvironmentOptionsValue get_env_value = nullptr;
   CreateModelFromFile create_model = nullptr;
   DestroyModel destroy_model = nullptr;
   CreateOptions create_options = nullptr;
@@ -81,6 +84,8 @@ const Api& api() {
     if (!x.member) throw std::runtime_error(std::string("missing public symbol ") + name)
     RESOLVE(create_env, "LiteRtCreateEnvironment");
     RESOLVE(destroy_env, "LiteRtDestroyEnvironment");
+    RESOLVE(get_env_options, "LiteRtGetEnvironmentOptions");
+    RESOLVE(get_env_value, "LiteRtGetEnvironmentOptionsValue");
     RESOLVE(create_model, "LiteRtCreateModelFromFile");
     RESOLVE(destroy_model, "LiteRtDestroyModel");
     RESOLVE(create_options, "LiteRtCreateOptions");
@@ -113,6 +118,7 @@ struct ClApi {
   void* library = nullptr;
   opencl::GetMemObjectInfo get_mem_info = nullptr;
   opencl::GetContextInfo get_context_info = nullptr;
+  opencl::GetCommandQueueInfo get_queue_info = nullptr;
   opencl::CreateCommandQueue create_queue = nullptr;
   opencl::ReleaseCommandQueue release_queue = nullptr;
   opencl::EnqueueReadBuffer read = nullptr;
@@ -131,6 +137,7 @@ const ClApi& cl_api() {
     if (!x.member) throw std::runtime_error(std::string("missing OpenCL symbol ") + name)
     RESOLVE(get_mem_info, "clGetMemObjectInfo");
     RESOLVE(get_context_info, "clGetContextInfo");
+    RESOLVE(get_queue_info, "clGetCommandQueueInfo");
     RESOLVE(create_queue, "clCreateCommandQueue");
     RESOLVE(release_queue, "clReleaseCommandQueue");
     RESOLVE(read, "clEnqueueReadBuffer");
@@ -160,7 +167,7 @@ struct Runner {
   std::array<Handle, kInputs> inputs{};
   Handle output = nullptr;
   const ClApi& cl = cl_api();
-  opencl::Queue queue = nullptr;
+  opencl::Queue queue = nullptr;  // borrowed from LiteRT environment
   opencl::Mem cache_k = nullptr, cache_v = nullptr, output_mem = nullptr;
   bool cache_types_ok = false;
   std::string details;
@@ -168,7 +175,6 @@ struct Runner {
   ~Runner() {
     if (output) a.destroy_buffer(output);
     for (auto& input : inputs) if (input) a.destroy_buffer(input);
-    if (queue) cl.release_queue(queue);
     if (compiled) a.destroy_compiled(compiled);
     if (options) a.destroy_options(options);
     if (model) a.destroy_model(model);
@@ -260,23 +266,37 @@ struct Runner {
     checked(a.opencl_memory(inputs[4], &cache_k), "get cache K cl_mem");
     checked(a.opencl_memory(inputs[5], &cache_v), "get cache V cl_mem");
     checked(a.opencl_memory(output, &output_mem), "get output cl_mem");
+    for (const auto [name, buffer, expected] : {
+             std::tuple<const char*, opencl::Mem, size_t>{"cacheK", cache_k, kCacheBytes},
+             {"cacheV", cache_v, kCacheBytes},
+             {"output", output_mem, kOutput * sizeof(float)}}) {
+      size_t actual = 0;
+      checked(cl.get_mem_info(buffer, opencl::kMemSize, sizeof(actual),
+                              &actual, nullptr), "clGetMemObjectInfo size");
+      details += "\n" + std::string(name) + " clMemBytes=" + std::to_string(actual);
+      if (actual < expected) throw std::runtime_error(std::string(name) + " cl_mem too small");
+    }
     opencl::Context context = nullptr;
     checked(cl.get_mem_info(cache_k, opencl::kMemContext, sizeof(context),
                             &context, nullptr), "clGetMemObjectInfo context");
-    size_t device_bytes = 0;
-    checked(cl.get_context_info(context, opencl::kContextDevices, 0, nullptr,
-                                &device_bytes), "clGetContextInfo devices size");
-    if (device_bytes < sizeof(opencl::Device)) {
-      throw std::runtime_error("OpenCL context has no device");
+    Handle env_options = nullptr;
+    checked(a.get_env_options(env, &env_options), "get environment options");
+    Any option{};
+    const Status queue_status = a.get_env_value(env_options, 5, &option);
+    if (queue_status != kOk || option.type != 2 || option.int_value == 0) {
+      details += "\nLiteRT OpenCL command queue unavailable status=" +
+                 std::to_string(queue_status) + " anyType=" + std::to_string(option.type);
+      return;
     }
-    std::vector<opencl::Device> devices(device_bytes / sizeof(opencl::Device));
-    checked(cl.get_context_info(context, opencl::kContextDevices, device_bytes,
-                                devices.data(), nullptr), "clGetContextInfo devices");
-    opencl::Int error = 0;
-    queue = cl.create_queue(context, devices[0], 0, &error);
-    checked(error, "clCreateCommandQueue");
-    if (!queue) throw std::runtime_error("clCreateCommandQueue returned null");
-    details += "\nclMem=true queue=ownSameContext synchronousRun=true";
+    queue = reinterpret_cast<opencl::Queue>(
+        static_cast<intptr_t>(option.int_value));
+    opencl::Context queue_context = nullptr;
+    checked(cl.get_queue_info(queue, opencl::kQueueContext, sizeof(queue_context),
+                              &queue_context, nullptr), "clGetCommandQueueInfo context");
+    if (queue_context != context) {
+      throw std::runtime_error("LiteRT queue differs from cache cl_mem context");
+    }
+    details += "\nclMem=true queue=borrowedLiteRT sameContext=true";
   }
 
   bool ready() const { return cache_types_ok && queue && cache_k && cache_v && output_mem; }
