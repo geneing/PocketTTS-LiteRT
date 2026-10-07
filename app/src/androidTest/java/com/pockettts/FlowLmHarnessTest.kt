@@ -491,6 +491,36 @@ class FlowLmHarnessTest {
                 for (h in 0 until PocketTts.NH) mask[h * (PocketTts.PMAX + 1) + pos] = 0f
                 pos++
             }
+            // The speech path reads only 33 control floats; validate that the
+            // narrower OpenCL read sees the same chained GPU output.
+            gpu.seed(voice.k, voice.v)
+            mask.fill(PocketTts.MASK_NEG)
+            for (h in 0 until PocketTts.NH) {
+                val base = h * (PocketTts.PMAX + 1)
+                for (p in 0 until voice.length) mask[base + p] = 0f
+                mask[base + PocketTts.PMAX] = 0f
+            }
+            pos = voice.length
+            var maxControlDelta = 0f
+            val controlTimings = LongArray(6)
+            for ((step, id) in tokenIds.withIndex()) {
+                val embedding = FloatArray(PocketTts.H)
+                var offset = id * PocketTts.H * Short.SIZE_BYTES
+                for (i in embedding.indices) {
+                    embedding[i] = Half.toFloat(embed.getShort(offset))
+                    offset += Short.SIZE_BYTES
+                }
+                rope(pos, cos, sin)
+                val control = gpu.step(embedding, cos, sin, mask, noise, pos)
+                assertTrue("control-only output width changed", control.packed.size == 33)
+                for (i in 0 until 33) {
+                    maxControlDelta = maxOf(maxControlDelta,
+                        kotlin.math.abs(control.packed[i] - result[step * width + i]))
+                }
+                for (i in controlTimings.indices) controlTimings[i] += control.timingsNs[i]
+                for (h in 0 until PocketTts.NH) mask[h * (PocketTts.PMAX + 1) + pos] = 0f
+                pos++
+            }
             val reference = runPrompt(
                 Accel.CPU, "pt_flowlm_fused_fp16.tflite", tokenIds,
                 File(modelDir, PocketTts.EMBED).readBytes(), voice, null,
@@ -500,10 +530,13 @@ class FlowLmHarnessTest {
             writeFloats(File(runDir, "cpu-fp16.f32le"), reference.output)
             lines += "tokens=${tokenIds.size} voicePrefix=${voice.length} values=${result.size}"
             lines += "timingsMs input/run/read/cacheMap/cacheCopy/cacheUnmap=${timings.joinToString("/") { String.format(Locale.US, "%.3f", it / 1e6) }}"
+            lines += "controlOnlyMaxDelta=$maxControlDelta controlOnlyTimingsMs=${controlTimings.joinToString("/") { String.format(Locale.US, "%.3f", it / 1e6) }}"
             lines += "cpuFp16 corr=${m.corr} mad=${m.mad} msd=${m.msd}"
             File(runDir, "report.txt").writeText(lines.joinToString("\n", postfix = "\n"))
             lines.forEach { Log.i(TAG, it) }
             assertTrue("OpenCL GPU output disagrees with CPU FP16: $m", m.corr > 0.999)
+            assertTrue("control-only GPU output disagrees with full read: $maxControlDelta",
+                maxControlDelta < 0.01f)
         }
     }
 
@@ -631,7 +664,7 @@ class FlowLmHarnessTest {
             "gpu frames=${gpu.result.frames} audioSeconds=${gpu.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${gpu.result.ms} firstAudioMs=${gpu.result.profile.firstChunkMs}",
             "cpu frames=${cpu.result.frames} audioSeconds=${cpu.result.audio.size.toDouble() / PocketTts.SAMPLE_RATE} inferenceMs=${cpu.result.ms} firstAudioMs=${cpu.result.profile.firstChunkMs}",
             "gpu lmMs inputCopy/run/read=${gpu.result.profile.lmInMs}/${gpu.result.profile.lmRunMs}/${gpu.result.profile.lmReadMs} steps=${gpu.result.profile.lmSteps} invocations=${gpu.result.profile.lmInvocations} hostBytesIn=${gpu.result.profile.lmInBytes} hostBytesOut=${gpu.result.profile.lmOutBytes}",
-            "gpu nativeMs outputLock/cacheQueueGap/copyEnqueue/copyWait=${gpu.result.profile.lmOutputMapMs}/${gpu.result.profile.lmCacheMapMs}/${gpu.result.profile.lmCacheCopyMs}/${gpu.result.profile.lmCacheUnmapMs}",
+            "gpu nativeMs outputSyncRead/cacheQueueGap/copyEnqueue/copyWait=${gpu.result.profile.lmOutputMapMs}/${gpu.result.profile.lmCacheMapMs}/${gpu.result.profile.lmCacheCopyMs}/${gpu.result.profile.lmCacheUnmapMs}",
             "cpu lmMs inputCopy/run/read=${cpu.result.profile.lmInMs}/${cpu.result.profile.lmRunMs}/${cpu.result.profile.lmReadMs} steps=${cpu.result.profile.lmSteps} invocations=${cpu.result.profile.lmInvocations} hostBytesIn=${cpu.result.profile.lmInBytes} hostBytesOut=${cpu.result.profile.lmOutBytes}",
             "gpu mimiMs dectx/seanet=${gpu.result.profile.decTxMs}/${gpu.result.profile.seanetMs}",
             "cpu mimiMs dectx/seanet=${cpu.result.profile.decTxMs}/${cpu.result.profile.seanetMs}",
@@ -990,4 +1023,5 @@ class FlowLmHarnessTest {
         """.trimIndent().replace('\n', ' ')
     }
 }
+
 

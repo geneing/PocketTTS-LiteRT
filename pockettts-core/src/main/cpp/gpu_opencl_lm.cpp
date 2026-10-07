@@ -379,15 +379,13 @@ struct Runner {
     checked(a.run(compiled, 0, kInputs, inputs.data(), 1, &output), "GPU step");
     const int64_t t2 = now_ns();
     std::array<float, kOutput> values{};
-    // The GPU delegate can leave work in flight after LiteRtRunCompiledModel.
-    // LiteRT's public buffer lock synchronizes that producer before our queue
-    // reads from the same cl_mem. Only the requested control/verification bytes
-    // are copied to JNI, though LiteRT currently maps the packed output whole.
-    void* mapped = nullptr;
-    checked(a.lock(output, &mapped, kRead), "lock/synchronize GPU output");
+    // Run may return before the delegate finishes. This blocking read is
+    // enqueued on LiteRT's own in-order OpenCL queue, after its graph kernels;
+    // it waits for the result without mapping the whole 49 KB output.
     const size_t read_bytes = (full_output ? kOutput : kControl) * sizeof(float);
-    std::memcpy(values.data(), mapped, read_bytes);
-    checked(a.unlock(output), "unlock GPU output");
+    checked(cl.read(queue, output_mem, opencl::kTrue, 0, read_bytes,
+                    values.data(), 0, nullptr, nullptr),
+            "clEnqueueReadBuffer GPU output");
     const int64_t t3 = now_ns();
     const int64_t copy_start = now_ns();
     const size_t row_bytes = kRow * sizeof(float);
