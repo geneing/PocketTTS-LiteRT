@@ -74,6 +74,8 @@ class PocketTtsConfig(
     val npuPositionMajorCache: Boolean = false,
     /** Check every patched row against the graph output; adds synchronization overhead. */
     val verifyNpuSliceRows: Boolean = false,
+    /** Experimental Google Tensor HIGH_PERFORMANCE mode on the NPU slice path. */
+    val g5HighPerformance: Boolean = false,
 ) {
     init {
         require(voices.isNotEmpty()) { "a config needs at least one voice" }
@@ -95,6 +97,9 @@ class PocketTtsConfig(
         }
         require(!verifyNpuSliceRows || npuSliceCache) {
             "row verification requires NPU slice cache"
+        }
+        require(!g5HighPerformance || npuSliceCache) {
+            "G5 high performance requires NPU slice cache"
         }
     }
 

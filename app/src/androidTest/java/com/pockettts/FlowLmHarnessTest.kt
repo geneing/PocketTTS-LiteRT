@@ -20,6 +20,7 @@ import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel
 import com.google.ai.edge.litert.Environment
 import dev.pockettts.Accel
+import dev.pockettts.G5PerformanceModel
 import dev.pockettts.PocketTts
 import dev.pockettts.PocketTtsConfig
 import dev.pockettts.PocketTtsEngine
@@ -199,6 +200,8 @@ class FlowLmHarnessTest {
             ?.toBooleanStrictOrNull() ?: false
         val verifyNpuSliceRows = args.getString("verifyNpuSliceRows")
             ?.toBooleanStrictOrNull() ?: false
+        val g5HighPerformance = args.getString("g5HighPerformance")
+            ?.toBooleanStrictOrNull() ?: false
         require(!(npuResidentCache && npuSliceCache)) {
             "select either npuResidentCache or npuSliceCache"
         }
@@ -269,6 +272,7 @@ class FlowLmHarnessTest {
                     npuSliceCache = isNpu && npuSliceCache,
                     npuPositionMajorCache = isNpu && npuPositionMajorCache,
                     verifyNpuSliceRows = isNpu && verifyNpuSliceRows,
+                    g5HighPerformance = isNpu && g5HighPerformance,
                 ),
             )
             try {
@@ -330,7 +334,7 @@ class FlowLmHarnessTest {
             "fingerprint=${android.os.Build.FINGERPRINT}",
             "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
             "powerMonitors=${relevantMonitors.joinToString { it.name }} method=duration-scaled audio-only playback subtraction",
-            "candidateGraph=$npuGraph cacheMode=$cacheMode npuPositionMajorCache=$npuPositionMajorCache verifyNpuSliceRows=$verifyNpuSliceRows sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
+            "candidateGraph=$npuGraph cacheMode=$cacheMode npuPositionMajorCache=$npuPositionMajorCache verifyNpuSliceRows=$verifyNpuSliceRows g5HighPerformance=$g5HighPerformance sha256=$graphSha aotPartitionReport=${args.getString("aotReport") ?: "not supplied to harness"}",
             "referenceGraph=$referenceGraph placement=lm:CPU dectx:NPU dec:GPU",
             "candidatePlacement=${candidate.backends} loadMs=${candidate.loadMs} pssKb=${candidate.pssBeforeRunKb}->${candidate.pssAfterRunKb}",
             "referencePlacement=${reference.backends} loadMs=${reference.loadMs} pssKb=${reference.pssBeforeRunKb}->${reference.pssAfterRunKb}",
@@ -519,6 +523,11 @@ class FlowLmHarnessTest {
         }
         val loadStart = System.nanoTime()
         val model = CompiledModel.create(path.absolutePath, options, if (backend == Accel.NPU) environment else null)
+        val highPerformance = if (backend == Accel.NPU &&
+            args.getString("g5HighPerformance")?.toBooleanStrictOrNull() == true
+        ) {
+            G5PerformanceModel.create(requireNotNull(environment), path.absolutePath)
+        } else null
         val loadMs = (System.nanoTime() - loadStart) / 1e6
         try {
             val stepInput = runCatching { model.createInputBuffers(1) }.getOrNull()
@@ -558,7 +567,9 @@ class FlowLmHarnessTest {
                     input[5].writeFloat(pv)
                     input[6].writeFloat(zeroNoise)
                     val started = System.nanoTime()
-                    if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
+                    if (highPerformance != null) {
+                        highPerformance.run(input, output, if (stepInput != null) 1 else 0)
+                    } else if (stepInput != null) model.run(input, output, 1) else model.run(input, output)
                     elapsed += System.nanoTime() - started
                     val values = output.single().readFloat()
                     check(values.size == outputPerToken) {
@@ -583,6 +594,7 @@ class FlowLmHarnessTest {
                 output.forEach { it.close() }
             }
         } finally {
+            highPerformance?.close()
             model.close()
         }
     }
