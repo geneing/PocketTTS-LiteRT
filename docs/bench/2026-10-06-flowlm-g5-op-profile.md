@@ -15,13 +15,14 @@ expose this collection path.
 
 ## Runtime results
 
-The driver returned the same two metrics at detail levels 0, 1, and 2:
+The driver returned the same two metrics at detail levels 0 through 3:
 
 | Detail level | Graph executions | `hardware_execution_time_us` | Other metric |
 |---:|---:|---:|---|
 | 0 | 26 | 249,807 | `number_of_graph_executions=26` |
 | 1 | 26 | 252,603 | `number_of_graph_executions=26` |
 | 2 | 26 | 249,342 | `number_of_graph_executions=26` |
+| 3 | 26 | 253,956 | `number_of_graph_executions=26` |
 
 That is about 9.6 ms of reported hardware time per graph execution. For the
 detail-0 run, the end-to-end NPU synthesis took 889 ms versus 621 ms on the CPU
@@ -56,7 +57,7 @@ the dispatch boundary, not the operators inside the compiled Tensor program.
 The SouthBound interface also leaves metric names and detail-level behavior to
 the vendor ([pinned interface](https://raw.githubusercontent.com/google-ai-edge/LiteRT/v2.2.0/litert/vendors/google_tensor/dispatch/sb_api.h)).
 The Pixel 10 dispatch driver did not return per-operator identifiers or times
-at levels 0-2.
+at levels 0-3.
 
 The existing paired long-run measurements in
 [`2026-10-06-g5-high-performance.md`](2026-10-06-g5-high-performance.md)
