@@ -6,7 +6,7 @@
     {
       "name": "base",
       "zip": "pockettts-base-2026.09.zip",
-      "sha256": "b1866f39b547781beec5cc26c40609554047b7b41782629fe607e1badcfb9407",
+      "sha256": "f63986589d6c254094c5a110de01d54ff69bb456ea5597a29b03a516a5adf222",
       "bytes": 81410030,
       "files": [
         "pt_embed_f16.bin",
@@ -30,19 +30,20 @@
     {
       "name": "lm-int8",
       "zip": "pockettts-lm-int8-2026.09.zip",
-      "sha256": "6190386ca6dd97a7aff6a4956f8cf98537adfe589a71e4aed1f7c49c8a8c94a2",
+      "sha256": "87adeb7849f78dbe2ed34dae574fd3cd05e47a8be017b53f437f24e0c78537fe",
       "bytes": 87504448,
       "files": [
         "pt_flowlm_fused_dyn8_all.tflite"
       ]
     },
     {
-      "name": "npu-g5",
-      "zip": "pockettts-npu-g5-2026.09.zip",
-      "sha256": "787d16bd69c265508180ef83c4df1a1c06507607c5bb0aab33736e9738a65b8f",
-      "bytes": 16468108,
+      "name": "npu-g6",
+      "zip": "pockettts-npu-g6-2026.09.zip",
+      "sha256": "4ca3aa99b272874a3c0b508ac5cdb5fa3d8e1bc341de36238d3623712f253d0b",
+      "bytes": 174823390,
       "files": [
-        "pt_mimi_dec_tx_fp16_g5.tflite"
+        "pt_flowlm_fused_dyn8_all_contiguous_jit.tflite",
+        "pt_flowlm_fused_dyn8_all_contiguous_half_g6.tflite"
       ]
     },
     {
@@ -60,8 +61,8 @@
     {
       "name": "lm-multistep",
       "zip": "pockettts-lm-multistep-2026.09.zip",
-      "sha256": "PENDING",
-      "bytes": 0,
+      "sha256": "2806faca8de1fa1764495642ea0c7059a523df4b303e0aaa22781378d0f97ab1",
+      "bytes": 339863250,
       "files": [
         "pt_flowlm_ms4_fp16.tflite",
         "pt_flowlm_ms8_fp16.tflite"

@@ -2,11 +2,14 @@
 #
 # Reproduce the best measured Pocket TTS configuration in one run.
 #
-# The configuration (Pixel 10 / Tensor G5, 3.2x real-time -- docs/streaming.md):
+# The configuration (Pixel 11 / Tensor G6, ~0.85x real-time -- docs/pixel11-g6.md):
 #
 #   flow-LM   pt_flowlm_fused_dyn8_all.tflite   CPU  dynamic-range int8 weights
-#   dec_tx    pt_mimi_dec_tx_fp16_g5.tflite     Tensor G5 NPU (AOT-compiled)
+#   dec_tx    pt_mimi_dec_tx_fp16.tflite        CPU  (no G6 AOT graph)
 #   SEANet    pt_mimi_deconly_w512_fp16.tflite  GPU, sliding 512-position window
+#
+# The NPU is opt-in: ship `pt_flowlm_fused_dyn8_all_contiguous_jit.tflite` and
+# write `lm` into force_npu.txt; the 2.3.2 runtime JIT-compiles it on device.
 #
 # Usage:
 #   scripts/reproduce_best.sh [stage ...]
@@ -16,8 +19,8 @@
 #   build   export the base graphs + host assets      build_pockettts.py all
 #   quant   export the int8 flow-LM                   PT_QUANT=dyn8_all
 #   stream  export the sliding-window SEANet decoders build_pockettts.py stream
-#   aot     AOT-compile dec_tx for the Tensor G5 NPU  aot_tensor_g5.py
-#   shim    fetch libLiteRtDispatch_GoogleTensor.so   fetch_google_tensor_dispatch.sh
+#   aot     AOT-compile the FlowLM for the Google Tensor NPU  aot_tensor_npu.py
+#   shim    NPU dispatch comes from the Maven AAR (no-op)   fetch_google_tensor_dispatch.sh
 #   push    push every file the app loads to the device
 #   apk     ./gradlew :app:installDebug
 #
@@ -26,7 +29,7 @@
 #
 # Environment (all optional):
 #   PT_VENV      conversion venv        default ~/pockettts-conv/.venv
-#   PT_AOT_VENV  AOT venv               default ~/pockettts-aot/.venv
+#   PT_AOT_VENV  AOT venv               default ~/pockettts-aot-g6/.venv
 #   PT_REFS      pocket-tts clone       default <repo>/references/pocket-tts
 #   PT_OUT       where graphs are written   default scripts/out
 #   PT_QUANT     int8 variant to build  default dyn8_all
@@ -41,7 +44,7 @@ REPO="$ROOT"
 OUT="${PT_OUT:-$ROOT/scripts/out}"
 REFS="${PT_REFS:-$REPO/references/pocket-tts}"
 VENV="${PT_VENV:-$HOME/pockettts-conv/.venv}"
-AOT_VENV="${PT_AOT_VENV:-$HOME/pockettts-aot/.venv}"
+AOT_VENV="${PT_AOT_VENV:-$HOME/pockettts-aot-g6/.venv}"
 ADB="${ADB:-adb}"
 QUANT="${PT_QUANT:-dyn8_all}"
 
@@ -56,7 +59,7 @@ warn() { printf 'WARN: %s\n' "$*" >&2; }
 # with PocketTtsSynthesizer's constants and install_to_device.sh.
 BEST_FILES=(
   pt_flowlm_fused_dyn8_all.tflite
-  pt_mimi_dec_tx_fp16_g5.tflite
+  pt_mimi_dec_tx_fp16.tflite
   pt_mimi_deconly_w512_fp16.tflite
   pt_mimi_deconly_fp16.tflite
   pt_embed_f16.bin
@@ -123,14 +126,17 @@ stage_stream() {
 }
 
 stage_aot() {
-  say "aot: dec_tx for the Tensor G5 NPU"
+  say "aot: FlowLM for the Google Tensor NPU (record only on G6)"
   if [ ! -x "$AOT_VENV/bin/python" ]; then
-    warn "no AOT venv at $AOT_VENV -- skipping, dec_tx will run on CPU"
+    warn "no AOT venv at $AOT_VENV -- skipping the NPU artifacts"
     return 0
   fi
-  # Only the decoder transformer is worth compiling: the SEANet body fails in
-  # the backend compiler and the flow-LM is faster on CPU than on the NPU.
-  "$AOT_VENV/bin/python" "$ROOT/scripts/aot_tensor_g5.py" pt_mimi_dec_tx_fp16
+  # G6: dec_tx aborts in the 2.3.0 compiler and no AOT artifact loads on the
+  # public 2.3.x runtime. Keep the FlowLM compile as a reproducible record; the
+  # app's working NPU path is the on-device JIT graph instead.
+  "$AOT_VENV/bin/python" "$ROOT/scripts/aot_tensor_npu.py" \
+    pt_flowlm_fused_dyn8_all_contiguous --soc g6 --truncation half || \
+    warn "G6 AOT failed; the app does not use it"
 }
 
 stage_shim() {
@@ -163,9 +169,8 @@ stage_summary() {
   echo
   if [ "$missing" = 0 ]; then
     echo "all present. run the app and it picks this configuration automatically:"
-    echo "  the flow-LM prefers the int8 graph, dec_tx the _g5 graph when the"
-    echo "  dispatch shim is installed, and SEANet streams through the 512-position"
-    echo "  window graph on the GPU."
+    echo "  int8 flow-LM and dec_tx on CPU, SEANet on the GPU. Add force_npu.txt"
+    echo "  with 'lm' to try the on-device JIT NPU graph."
     echo "  scripts/reproduce_best.sh push apk     # to get it onto a phone"
   else
     warn "some artifacts are missing -- see the stage output above"

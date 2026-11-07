@@ -681,14 +681,17 @@ def stage_fused(model):
     fp16 = to_fp16(p, os.path.join(OUT, "pt_flowlm_fused_fp16.tflite"))
     opcheck(fp16, "flowlm_fused_fp16")
 
-    # The step signature, on the fp16 file that actually ships.
+    # The step signature, on the fp16 file that actually ships. A named
+    # signature is laid out before the default one, so with the opt-in prefill
+    # the step is index 1; without it, index 0.
+    step_idx = 1 if P > 0 else 0
     c, s = rope_cos_sin_deint(off0)
     with torch.no_grad():
         ref = fused(bos_in.view(1, 1, -1), torch.from_numpy(c).view(1, 1, 1, HD),
                     torch.from_numpy(s).view(1, 1, 1, HD),
                     torch.from_numpy(make_mask(off0)), pk, pv, noises[0])
     outs = run_signature(
-        fp16, None,
+        fp16, step_idx,
         (bos_in.view(1, 1, -1).numpy(), c.reshape(1, 1, 1, HD),
          s.reshape(1, 1, 1, HD), make_mask(off0), pk.numpy(), pv.numpy(),
          noises[0].numpy()),

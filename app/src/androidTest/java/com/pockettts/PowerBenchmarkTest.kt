@@ -418,7 +418,7 @@ class PowerBenchmarkTest {
         assumeTrue("Google Tensor dispatch library is unavailable", dispatchLibrary.isFile)
 
         val candidateGraph = FP16_FLOWLM_NO_TRUNCATION_GRAPH
-        val compiledCandidateGraph = PocketTts.g5Variant(candidateGraph)
+        val compiledCandidateGraph = PocketTts.npuVariant(candidateGraph)
         assumeTrue("missing CPU fp16 Flow-LM graph: $FP16_FLOWLM_GRAPH", models.store.exists(FP16_FLOWLM_GRAPH))
         assumeTrue("missing no-truncation Tensor G5 graph: $compiledCandidateGraph", models.store.exists(compiledCandidateGraph))
 

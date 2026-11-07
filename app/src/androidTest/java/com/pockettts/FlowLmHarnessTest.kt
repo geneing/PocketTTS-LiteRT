@@ -136,7 +136,7 @@ class FlowLmHarnessTest {
         val candidates = LinkedHashMap<Accel, Run>()
         try {
             for (backend in backends) {
-                val graph = if (backend == Accel.NPU) PocketTts.g5Variant(baseGraph) else baseGraph
+                val graph = if (backend == Accel.NPU) PocketTts.npuVariant(baseGraph) else baseGraph
                 val result = try {
                     runPrompt(backend, graph, tokenIds, embed, voiceState, environment)
                 } catch (t: Throwable) {
@@ -227,7 +227,7 @@ class FlowLmHarnessTest {
         val npuBase = args.getString("npuGraph")?.trim()?.takeIf { it.isNotEmpty() }
             ?: args.getString("residentGraph")?.trim()?.takeIf { it.isNotEmpty() }
             ?: defaultNpuGraph
-        val npuGraph = PocketTts.g5Variant(npuBase)
+        val npuGraph = PocketTts.npuVariant(npuBase)
         val referenceGraph = args.getString("referenceGraph")?.trim()
             ?.ifEmpty { PocketTts.LM } ?: PocketTts.LM
         val workload = args.getString("workload")?.trim()?.lowercase(Locale.ROOT) ?: "short"
@@ -264,9 +264,11 @@ class FlowLmHarnessTest {
         fun runArm(arm: String): SpeechProbe {
             val isNpu = arm == "npu"
             val placement = if (isNpu) {
-                Placement(Accel.NPU, Accel.NPU, Accel.GPU)
+                // G6 has no AOT decoder-transformer graph (the 2.3.0 compiler
+                // crashes on it), so keep dec_tx on CPU in both arms.
+                Placement(Accel.NPU, Accel.CPU, Accel.GPU)
             } else {
-                Placement(Accel.CPU, Accel.NPU, Accel.GPU)
+                Placement(Accel.CPU, Accel.CPU, Accel.GPU)
             }
             val graph = if (isNpu) npuBase else referenceGraph
             val engine = PocketTtsEngine(
@@ -343,7 +345,7 @@ class FlowLmHarnessTest {
         val graphSha = sha256(graphFile)
         val thermal = context.getSystemService(PowerManager::class.java)?.currentThermalStatus ?: -1
         val lines = mutableListOf(
-            "FlowLM Tensor G5 NPU speech pair",
+            "FlowLM Tensor NPU speech pair",
             "device=${android.os.Build.MODEL}/${android.os.Build.DEVICE} android=${android.os.Build.VERSION.RELEASE}",
             "fingerprint=${android.os.Build.FINGERPRINT}",
             "order=$order workload=$workload seed=$seed voice=$voice energyRepeats=$energyRepeats text=$text",
@@ -716,7 +718,8 @@ class FlowLmHarnessTest {
         const val REFERENCE_GRAPH = "pt_flowlm_fused_fp16.tflite"
         const val DEFAULT_TEXT = "Hello world. This is a FlowLM text probe."
         const val DEFAULT_RESIDENT_GRAPH = "pt_flowlm_fused_fp16_resident_no_truncation.tflite"
-        const val DEFAULT_NPU_NONRESIDENT_GRAPH = "pt_flowlm_fused_fp16_no_truncation.tflite"
+        const val DEFAULT_NPU_NONRESIDENT_GRAPH =
+            "pt_flowlm_fused_dyn8_all_contiguous_half.tflite"
         const val RESIDENT_TEXT = "Hello there, how are you?"
         val LONG_TEXT = """
             Each spring, a small group of neighbors meets at the public library to plan a weekend repair fair. They bring lamps with loose switches, radios that have gone quiet, bicycles with stubborn brakes, and kitchen tools that only need a little attention. Before the doors open, volunteers arrange the tables by task and place a handwritten sign beside every box of spare parts. A retired engineer shows the children how to trace a simple circuit, while a local baker sets out warm bread and explains how patient practice can turn a difficult recipe into an ordinary part of the day.

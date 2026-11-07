@@ -20,7 +20,12 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
+    kotlinOptions {
+        jvmTarget = "17"
+        // LiteRT 2.3.0's litert-api is built with Kotlin 2.4 metadata; this
+        // pinned compiler reads it fine once the version gate is bypassed.
+        freeCompilerArgs += "-Xskip-metadata-version-check"
+    }
     packaging {
         jniLibs {
             // The NPU dispatch shim is dlopen'ed by absolute path out of the
@@ -38,9 +43,9 @@ android {
     }
 }
 dependencies {
-    // The reusable engine (brings litert 2.2.0 transitively) and the TTS engine
-    // service. 2.2.0: latest on Google Maven (2.1.6 pinned earlier for Mali;
-    // 2.1.5+ accepts the KV-step FULLY_CONNECTED weight shapes).
+    // The reusable engine (brings litert 2.3.2 and the Google Tensor NPU +
+    // GPU runtimes transitively) and the TTS engine service. 2.3.2 is the
+    // runtime/dispatch pair that works on Pixel 11 / Tensor G6.
     implementation(project(":pockettts-core"))
     implementation(project(":pockettts-service"))
     implementation("androidx.core:core-ktx:1.15.0")

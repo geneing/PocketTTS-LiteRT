@@ -8,7 +8,7 @@ import java.io.File
 
 /**
  * Where one graph runs: GPU (fp16), GPU at fp32 compute, CPU (XNNPACK), or the
- * Google Tensor NPU (an AOT-compiled `*_g5.tflite` variant).
+ * Google Tensor NPU (AOT-compiled `*_g6.tflite` or on-device-JIT `*_jit.tflite`).
  */
 enum class Accel(val tag: String) {
     GPU("GPU"),
@@ -20,7 +20,7 @@ enum class Accel(val tag: String) {
 /**
  * Per-graph accelerator choice. Every graph is placed independently; the best
  * split is device-specific (Mali/Adreno win with the flow-LM on GPU, PowerVR
- * loses badly there, Tensor G5 wins with the decoder transformer on the NPU).
+ * loses badly there, a Tensor NPU wins with the decoder transformer on the NPU).
  */
 data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
     val label: String get() = "lm:${lm.tag} dectx:${dectx.tag} dec:${deconly.tag}"
@@ -92,29 +92,36 @@ data class Placement(val lm: Accel, val dectx: Accel, val deconly: Accel) {
             val userCpu = keys("force_cpu.txt")
             val fp32 = keys("force_fp32.txt")
             val forceGpu = keys("force_gpu.txt")
+            val forceNpu = keys("force_npu.txt")
             val powerVr = renderer().contains("PowerVR", ignoreCase = true)
+            // Pixel 11 / Tensor G6 reports PowerVR here too, but the SoC is the
+            // durable signal: the NPU choice should not depend on the GPU name.
+            val googleTensor = android.os.Build.SOC_MODEL?.startsWith("Tensor") == true
+            val tensorOrPowerVr = googleTensor || powerVr
             val hasGoogleTensorDispatch = File(
                 context.applicationInfo.nativeLibraryDir,
                 "libLiteRtDispatch_GoogleTensor.so",
             ).exists()
 
-            // Prefer the measured static W8/A16 graph on Tensor G5 when its AOT
-            // file and dispatch library are installed. Preserve the force files
-            // as explicit developer overrides.
-            val useNpuFlowLm = powerVr && flowLmNpuAvailable && hasGoogleTensorDispatch
+            // The Tensor NPU is an explicit opt-in on G6: on-device JIT works,
+            // but its measured LM stage is slower than the CPU int8 graph and
+            // the compiler has no working AOT path for this release pair. The
+            // force file keeps the experiment one adb push away.
+            val useNpuFlowLm = "lm" in forceNpu &&
+                tensorOrPowerVr && flowLmNpuAvailable && hasGoogleTensorDispatch
             val lm = when {
                 "lm" in userCpu -> Accel.CPU
                 "lm" in fp32 -> Accel.GPU32
                 "lm" in forceGpu -> Accel.GPU
                 useNpuFlowLm -> Accel.NPU
-                powerVr -> Accel.CPU
+                tensorOrPowerVr -> Accel.CPU
                 else -> Accel.GPU
             }
             // The Mimi decoder transformer defaults to CPU: its GPU output is
-            // audibly degraded. The Tensor G5 NPU is both faster and accurate,
+            // audibly degraded. The Google Tensor NPU is both faster and accurate,
             // opted into only when the AOT graph and dispatch shim are present.
-            val npuDectx = powerVr && "dectx" !in userCpu &&
-                File(modelDir, PocketTts.g5Variant(PocketTts.DEC_TX)).exists() &&
+            val npuDectx = "dectx" in forceNpu && tensorOrPowerVr && "dectx" !in userCpu &&
+                File(modelDir, PocketTts.npuVariant(PocketTts.DEC_TX)).exists() &&
                 hasGoogleTensorDispatch
             val dectx = when {
                 npuDectx -> Accel.NPU

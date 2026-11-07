@@ -65,6 +65,26 @@ triple matters: `to_fp16` uses the 0.8.x `ai_edge_quantizer` API, and 0.9.x
 `litert-torch` requires it. `litert-converter` is unpinned (`0.3.*` via
 litert-torch) and is the one dependency that drifts.
 
+### AOT environment (Google Tensor NPU)
+
+The AOT path is separate: `ai-edge-litert==2.3.0` +
+`ai-edge-litert-sdk-google-tensor==2.3.0`, built against the supplied
+`litert_plugin_compiler.tar.gz`:
+
+```bash
+uv venv --python 3.10 ~/pockettts-aot-g6/.venv
+GOOGLE_TENSOR_SDK_BETA=$PWD/litert_plugin_compiler.tar.gz \
+  uv pip install --python ~/pockettts-aot-g6/.venv/bin/python \
+  ai-edge-litert==2.3.0 ai-edge-litert-sdk-google-tensor==2.3.0
+```
+
+`scripts/aot_tensor_npu.py` defaults to `--soc g6` and writes `*_g6.tflite`
+(`--soc g5` keeps the Pixel 10 path). On Tensor G6 the compiler aborts on
+`pt_mimi_dec_tx` and on the fp16 fused graph, and no AOT artifact it produces
+loads on the public 2.3.x runtime. The working NPU path is on-device JIT: ship
+`pt_flowlm_fused_dyn8_all_contiguous_jit.tflite` and let the 2.3.2 NPU runtime
+compile it. See `docs/pixel11-g6.md`; the app keeps CPU as the default.
+
 ## What it downloads
 
 Cached under `~/.cache/huggingface/hub`; nothing is committed.
@@ -89,7 +109,9 @@ to an invalid value or clear `~/.cache/huggingface/hub/models--kyutai--pocket-tt
 | `pt_flowlm_step{,_fp16}.tflite` | one AR step, packed-KV I/O (reference; not loaded by the app) |
 | `pt_flow_head{,_fp16}.tflite` | flow head alone (reference; not loaded by the app) |
 | `pt_flowlm_fused.tflite` | step + head fused, fp32 reference |
-| `pt_flowlm_fused_dyn8_all.tflite` | the same graph dynamic-range int8 — **the app's LM**; also carries a head-less batched `prefill` signature sharing the backbone's weight buffers, but the app does **not** use it: on this graph the batched rows do not reproduce the per-token step (uncorrelated audio, short prompts truncated), so `usePrefill` is off and each prompt is one fused step per token |
+| `pt_flowlm_fused_dyn8_all.tflite` | the same graph dynamic-range int8 — **the app's CPU LM**; also carries a head-less batched `prefill` signature sharing the backbone's weight buffers, but the app does **not** use it: on this graph the batched rows do not reproduce the per-token step (uncorrelated audio, short prompts truncated), so `usePrefill` is off and each prompt is one fused step per token |
+| `pt_flowlm_fused_dyn8_all_contiguous_jit.tflite` | position-major dynamic int8 source used by the opt-in Tensor NPU path; the 2.3.2 runtime JIT-compiles it on device (`force_npu.txt`) |
+| `*_g6.tflite` | AOT artifacts from `aot_tensor_npu.py`; compiled, but they do not load on the public 2.3.x runtime (kept for record/future SDK) |
 | `pt_flowlm_fused_fp16.tflite` | fp16 sibling of the fp32 graph, kept for quantizer comparison only — not packed, not loaded |
 | `pt_flowlm_prefill{N}{,_fp16}.tflite` | standalone head-less batched prefill (`build_pockettts.py prefill`, `PT_PREFILL_TOKENS`) — a diagnostic for the prefill math; not packed, and nothing loads it (the app prefills per token) |
 | `pt_mimi_dec_tx{,_fp16}.tflite` | Mimi decoder transformer block (app runs CPU) |
@@ -179,7 +201,7 @@ gap); `TtsServiceInstrumentedTest` drives the real framework client.
 To distribute models instead, `scripts/pack_models.py` builds the stored zips and
 fills `models.json`; upload them as a `models-<version>` GitHub release, which
 `ReleaseModelSource` then downloads on demand (variants: `base`, `lm-int8`,
-`npu-g5`; `lm-quant-variants` and `lm-multistep` are declared in `models.json` but
+`npu-g6`; `lm-quant-variants` and `lm-multistep` are declared in `models.json` but
 still `PENDING`, so the packer exits 1 with warnings).
 `scripts/serve_models.py` + `adb reverse` tests that path locally.
 

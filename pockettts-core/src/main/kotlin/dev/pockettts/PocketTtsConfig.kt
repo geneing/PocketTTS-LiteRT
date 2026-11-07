@@ -113,25 +113,28 @@ class PocketTtsConfig(
 
         /**
          * The device policy: adb-pushed models first, GitHub release fallback,
-         * and [Placement.default] for the accelerator split. On Tensor G5,
-         * select the tuned FlowLM AOT graph with the persistent position-major
-         * cache and HIGH_PERFORMANCE mode when that graph is installed.
+         * and [Placement.default] for the accelerator split. A Tensor NPU is an
+         * explicit opt-in (`force_npu.txt`); its graph is the on-device-JIT
+         * `_jit` source, because AOT artifacts do not load on the 2.3.x runtime.
          */
         fun default(
             context: Context,
             models: PocketTtsModels = PocketTtsModels.default(context),
         ): PocketTtsConfig {
             val dir = context.getExternalFilesDir(null) ?: context.filesDir
-            val npuLmGraphInstalled = models.store.exists(PocketTts.LM_G5_HIGH_PERFORMANCE)
+            val npuLmGraphInstalled = models.store.exists(PocketTts.npuVariant(PocketTts.LM_NPU))
             val placement = Placement.default(context, dir, npuLmGraphInstalled)
             val useNpuFlowLm = placement.lm == Accel.NPU
             return PocketTtsConfig(
                 models = models,
                 placement = placement,
-                lmGraph = PocketTts.LM_G5_HIGH_PERFORMANCE.takeIf { useNpuFlowLm },
+                lmGraph = PocketTts.LM_NPU.takeIf { useNpuFlowLm },
                 npuSliceCache = useNpuFlowLm,
                 npuPositionMajorCache = useNpuFlowLm,
-                g5HighPerformance = useNpuFlowLm,
+                // The native HIGH_PERFORMANCE bridge pins the LiteRT 2.2.0 C++
+                // handle layout; keep it an explicit opt-in until revalidated on
+                // the 2.3.x runtime.
+                g5HighPerformance = false,
             )
         }
     }

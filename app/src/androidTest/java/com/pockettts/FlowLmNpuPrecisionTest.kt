@@ -144,18 +144,18 @@ class FlowLmNpuPrecisionTest {
         ))
         try {
             // Load NPU first: LiteRT dispatch settings are process-global.
-            val npuStep = runGraph("pt_flowlm_step_fp16_no_truncation_g5.tflite", Accelerator.NPU, x.step, env)
+            val npuStep = runGraph("pt_flowlm_step_fp16_no_truncation_g6.tflite", Accelerator.NPU, x.step, env)
             val cpuStep = runGraph("pt_flowlm_step_fp16.tflite", Accelerator.CPU, x.step, null)
             assertEquals(4, cpuStep.size)
             for (i in cpuStep.indices) compare("backbone output[$i]", cpuStep[i], npuStep[i])
 
             val cond = cpuStep.single { it.size == PocketTts.H }
             val headArgs = listOf(cond, x.noise)
-            val npuHead = runGraph("pt_flow_head_fp16_no_truncation_g5.tflite", Accelerator.NPU, headArgs, env)
+            val npuHead = runGraph("pt_flow_head_fp16_no_truncation_g6.tflite", Accelerator.NPU, headArgs, env)
             val cpuHead = runGraph("pt_flow_head_fp16.tflite", Accelerator.CPU, headArgs, null)
             compare("head latent with identical CPU cond", cpuHead.single(), npuHead.single())
 
-            val npuFused = runGraph("pt_flowlm_fused_fp16_no_truncation_g5.tflite", Accelerator.NPU, x.fused, env).single()
+            val npuFused = runGraph("pt_flowlm_fused_fp16_no_truncation_g6.tflite", Accelerator.NPU, x.fused, env).single()
             val cpuFused = runGraph("pt_flowlm_fused_fp16.tflite", Accelerator.CPU, x.fused, null).single()
             val kv = PocketTts.G * PocketTts.HD
             compare("fused eos", cpuFused.copyOfRange(0, 1), npuFused.copyOfRange(0, 1))

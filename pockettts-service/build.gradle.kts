@@ -14,7 +14,11 @@ android {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
     }
-    kotlinOptions { jvmTarget = "17" }
+    kotlinOptions {
+        jvmTarget = "17"
+        // LiteRT 2.3.0's litert-api is built with Kotlin 2.4 metadata.
+        freeCompilerArgs += "-Xskip-metadata-version-check"
+    }
 }
 
 dependencies {

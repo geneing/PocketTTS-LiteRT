@@ -51,9 +51,14 @@ object PocketTts {
      */
     const val LM = "pt_flowlm_fused_dyn8_all.tflite"
 
-    /** Compiled static W8/A16 FlowLM AOT graph used by the Tensor G5 default. */
-    const val LM_G5_HIGH_PERFORMANCE =
-        "pt_flowlm_fused_st16_ffn12_contiguous_no_truncation_g5.tflite"
+    /**
+     * Position-major FlowLM graph for a Google Tensor NPU. Tensor G6 (Pixel 11)
+     * compiles it on device: the public 2.3.x runtime cannot load an AOT file
+     * produced by the available 2.3.0 compiler SDK, but it ships a JIT compiler
+     * plugin and caches the result under the app's cache dir. `_jit` therefore
+     * means "hand this source graph to the NPU accelerator as-is".
+     */
+    const val LM_NPU = "pt_flowlm_fused_dyn8_all_contiguous_jit.tflite"
 
     /**
      * Name `litert_torch` gives the fused graph's default signature. The
@@ -84,9 +89,17 @@ object PocketTts {
 
     const val DEC_TX = "pt_mimi_dec_tx_fp16.tflite"
 
-    /** AOT-compiled Tensor G5 graph (NPU placement); accepts base or compiled names. */
-    fun g5Variant(name: String) =
-        if (name.endsWith("_g5.tflite")) name else name.replace(".tflite", "_g5.tflite")
+    /** AOT-compiled Google Tensor NPU graph; accepts base, compiled or JIT names. */
+    fun npuVariant(name: String) = when {
+        name.endsWith("$NPU_SUFFIX.tflite") || name.endsWith("$JIT_SUFFIX.tflite") -> name
+        else -> name.replace(".tflite", "$NPU_SUFFIX.tflite")
+    }
+
+    /** AOT target suffix: Pixel 11 / Tensor G6 (compiled by `aot_tensor_npu.py`). */
+    const val NPU_SUFFIX = "_g6"
+
+    /** Suffix marking a graph the Tensor NPU accelerator compiles on device. */
+    const val JIT_SUFFIX = "_jit"
 
     /** One-shot SEANet decoder. */
     const val DECONLY = "pt_mimi_deconly_fp16.tflite"

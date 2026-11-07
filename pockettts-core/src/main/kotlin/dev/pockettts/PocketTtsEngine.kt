@@ -78,7 +78,7 @@ class PocketTtsEngine(
     }
 
     private fun load(name: String, key: String, accel: Accel): CompiledModel {
-        val file = if (accel == Accel.NPU) PocketTts.g5Variant(name) else name
+        val file = if (accel == Accel.NPU) PocketTts.npuVariant(name) else name
         val p = models.store.file(file).absolutePath
         val t = if (BuildConfig.DEBUG) System.nanoTime() else 0L
         var actualAccel = accel
@@ -127,7 +127,7 @@ class PocketTtsEngine(
 
     internal val lm: CompiledModel = load(lmGraphName, "lm", placement.lm)
     private val highPerformanceLm: G5PerformanceModel? = if (config.g5HighPerformance) {
-        val graph = PocketTts.g5Variant(lmGraphName)
+        val graph = PocketTts.npuVariant(lmGraphName)
         G5PerformanceModel.create(npuEnv(), models.store.file(graph).absolutePath).also {
             if (BuildConfig.DEBUG) {
                 android.util.Log.i("PocketTTS", "G5 HIGH_PERFORMANCE active for $graph")
@@ -566,13 +566,13 @@ class PocketTtsEngine(
         fun requiredFiles(config: PocketTtsConfig): List<String> {
             val f = LinkedHashSet<String>()
             val lm = config.lmGraph ?: PocketTts.LM
-            f += if (config.placement.lm == Accel.NPU) PocketTts.g5Variant(lm) else lm
+            f += if (config.placement.lm == Accel.NPU) PocketTts.npuVariant(lm) else lm
             if (config.lmSteps > 1) {
                 val ms = PocketTts.msGraph(config.lmSteps)
-                f += if (config.placement.lm == Accel.NPU) PocketTts.g5Variant(ms) else ms
+                f += if (config.placement.lm == Accel.NPU) PocketTts.npuVariant(ms) else ms
             }
             if (config.placement.dectx == Accel.NPU) {
-                f += PocketTts.g5Variant(PocketTts.DEC_TX)
+                f += PocketTts.npuVariant(PocketTts.DEC_TX)
             }
             f += PocketTts.DEC_TX
             f += PocketTts.DECONLY
